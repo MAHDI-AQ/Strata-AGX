@@ -645,6 +645,13 @@ target_link_libraries(test_moe_group_unit PRIVATE strata_prefill strata_engine)
   target_include_directories(shared_expert_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(shared_expert_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME shared_expert_parity COMMAND shared_expert_parity --selftest)
+  # the split / batched verify-window kernels (from eddoursul's fork), bitwise vs the kernels they replace; CUDA only
+  if(STRATA_ENABLE_CUDA)
+    add_executable(verify_parity src/kernels/verify_parity.cpp)
+    target_include_directories(verify_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(verify_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME verify_parity COMMAND verify_parity --selftest)
+  endif()
 
   add_executable(gr_parity src/kernels/gr_parity.cpp)
   target_include_directories(gr_parity PRIVATE ${_strata_gpu_include_directories})
