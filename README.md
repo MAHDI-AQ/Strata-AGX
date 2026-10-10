@@ -92,7 +92,7 @@ Evaluated on `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` (IQ3_XXS, 125B MoE wi
 
 *Note: Upstream Strata natively supports 262,144 context in single-stream mode; Strata AGX accelerates this single-stream decode path via fused GDN recurrence and Split-K FMHA.*
 
-*Note on the prefill row: the 3,450.2 tok/s figure is the single-request path at `--prefill auto` (16,384-token chunks); the concurrent serving path chunks via `--concurrent-prefill` — raised from ≤4096 to **12,288** in `v0.1.38-agx.1.1.5` (+15.7% on the 128K-class solo prompt probe, −18% on the 2×254K parallel battery).*
+*Note on the prefill row: the 3,450.2 tok/s figure is measured on the single-request path at `--prefill auto` (16,384-token chunks); the concurrent serving path utilizes `--concurrent-prefill 2048` (right-sized down from 5120/12288) to reclaim VRAM into the resident expert pool while keeping prompt chunk execution bounded.*
 
 ---
 
@@ -116,7 +116,7 @@ Evaluated on `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` (IQ3_XXS, 125B MoE wi
 | Concurrency ($C$) | Serving Mode | Aggregate Throughput | Per-Slot Decode | Cold Prefill (62k) | Warm TTFT (Cached) | VRAM Expert Residency |
 |---|---|---:|---:|---:|---:|---:|
 | **$C=1$** | Dedicated Solo | **105.0 – 120.4 tok/s** | 105.0 – 120.4 tok/s | ~11.0 s (~5,631 tok/s) | 24 – 35 ms | 84.4% (20,739 / 24,576 slots) |
-| **$C=2$** | Dual Continuous | **82.1 – 98.4 tok/s** | 41.0 – 52.5 tok/s | ~19.7 s (~3,180 tok/s) | 24 – 35 ms | **70.2% (17,254 / 24,576 slots)** |
+| **$C=2$** | Dual Continuous | **165.0 – 186.9 tok/s peak** *(82.1 – 98.4 sustained steady-state)* | 87.0 – 99.5 tok/s peak | ~19.7 s (~3,180 tok/s) | 24 – 35 ms | **70.2% (17,254 / 24,576 slots)** |
 
 > [!NOTE]
 > **Active Production Guarantee:** $C=2$ is the optimal operating sweet-spot on Dual 24GB RTX 4090s. It guarantees non-blocking multi-agent serving with dedicated 5k prefill workspaces while maintaining 70.2% resident MoE experts in VRAM, eliminating PCIe expert thrashing.
