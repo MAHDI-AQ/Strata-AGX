@@ -38,7 +38,7 @@ Upstream Strata demonstrated that 125B MoE architectures (like Qwen 3.8 Flash Ne
 On 2026-10-10, Strata AGX landed the **Universal KV Caching Overhaul**, the **32k Reasoning Uncap**, and the multi-GPU kernel stabilization battery:
 
 - **Universal KV Caching & LCP Partial Rollback:** Implemented intra-slot Longest Common Prefix ($K = \operatorname{LCP}$) partial prefix rollback ($K \ge 256$), zero-copy truncating history and re-hydrating without re-prefill. Cross-session tool prompts (11k+ tokens) drop from 8.8s to **0.17s TTFT** (50x speedup), with full Tree-of-Thought rollback support.
-- **L2 Host-RAM HiCache & L3 NVMe DirectStorage:** Inactive multi-session snapshot deadweight eliminated from VRAM (`STRATA_RADIX_VRAM_MIB: 0`), routing multi-session prefix caching to L2 Host-RAM (64 slots @ 26 GB/s PCIe DMA) and L3 NVMe (`O_DIRECT` @ 3.2 GB/s physical direct I/O). Freed 1.38 GiB of VRAM is reallocated into `--expert-cache auto` (+700 resident expert slots on CUDA 1).
+- **L2 Host-RAM HiCache & L3 NVMe DirectStorage:** Inactive multi-session snapshot deadweight eliminated from VRAM (`STRATA_RADIX_VRAM_MIB: 0`), routing multi-session prefix caching to L2 Host-RAM (64 slots @ 10–12 GB/s physical PCIe 4.0 x8 DMA) and L3 NVMe (`O_DIRECT` @ 3.2 GB/s physical direct I/O). Freed 1.38 GiB of VRAM is reallocated into `--expert-cache auto` (+700 resident expert slots on CUDA 1).
 - **Driver Lock Inversion & Deadlock Elimination:** Added strict bypass guards in `radix_tree.cpp` preventing unbudgeted device allocations and asynchronous `cudaFree` driver stalls. Enforced `admitted_this_round` exclusions across all passes (Pass 1, Pass 2, Pass 3, and Fallback), permanently resolving scheduler queue loop deadlocks.
 - **Deep Reasoning Uncapped to 32k:** Raised default thinking ceiling to **32,768 tokens** and lowered reserve floor to 32 tokens, allowing complex multi-turn coding agents (Qwen 3.8 / DeepSeek) to reason through extensive chains-of-thought without premature cutoffs. Added `reasoning_budget_tokens` request override support.
 - **Multi-GPU Pipelined Layer Split Hardening:** Enforced `cudaHostAllocMapped | cudaHostAllocPortable` across all unified group and expert pointer buffers, eliminating multi-GPU layer split memory access faults (`copy_i32: an illegal memory access` / Xid 31).
@@ -68,7 +68,7 @@ Engine identity: `0.1.39-agx.1.2.0` @ tag `v0.1.39-agx.1.2.0` (git tree verified
 
 All measurements below were conducted directly on physical hardware running real multi-turn completions:
 
-- **Rig:** Dual NVIDIA GeForce RTX 4090 24GB (PCIe 4.0 x16 / x8)
+- **Rig:** Dual NVIDIA GeForce RTX 4090 24GB (PCIe 4.0 x8 / x8 bifurcation)
   - *Clocks:* Core Offset **+150 MHz** (~2,800 MHz boost) · GDDR6X Memory Offset **+1000 MHz** (11.5 GHz effective / ~1,104 GB/s per GPU)
 - **CPU:** AMD Ryzen 9 5950X (16-Core / 32-Thread)
 - **RAM:** 96 GB DDR4-3200 (32+16+32+16 dual-channel 4-DIMM layout)
