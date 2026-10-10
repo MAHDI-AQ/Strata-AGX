@@ -13,9 +13,9 @@ Upstream Strata demonstrated that 125B MoE architectures (like Qwen 3.8 Flash Ne
 
 ### Key Additions Over Upstream
 
-1. **Continuous Multi-Agent Concurrency ($C=1$ to $C=5$):**
+1. **Continuous Multi-Agent Concurrency ($C=2$ on IQ3_XXS / up to $C=5$ on Q1 Coder):**
    - Replaced coarse round-based batching with token-level continuous micro-scheduling (Orca / vLLM v1 model).
-   - Lockless dynamic slot recycling (< 5 µs overhead) upon stream completion.
+   - Lockless dynamic slot recycling (sub-millisecond turnaround) upon stream completion.
    - Uniform agent slots at full context: $C$ concurrent streams at up to 262,144 tokens each; additional requests queue and are admitted as slots free (standard continuous-batching admission).
 2. **Dynamic RadixTree KV Cache & 3-Tier Storage:**
    - Zero-copy prefix sharing across branching subagent sessions.
@@ -110,9 +110,20 @@ Evaluated on `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` (IQ3_XXS, 125B MoE wi
 | **$C=5$** | Full Concurrency (Burst) | **220.04 tok/s** | 59.4 – 68.7 tok/s | 5,355.4 tok/s | 100.0% |
 | **$C=5$** | Sustained Sweet Spot (11.5 GHz) | **253.92 tok/s** | 59.2 – 63.2 tok/s | 5,124.2 tok/s | 100.0% |
 
-#### B. Retired Tiered Heterogeneous Swarm — Qwen 3.8 Flash Next `IQ3_XXS` (852K Virtual Context)
+#### B. Production Serving Posture — Qwen 3.8 Flash Next `IQ3_XXS` ($C=2$, Dual-Agent Concurrency)
+*Measured on active production release `v0.1.40-agx.2.1.0` (Dual RTX 4090 24GB @ PCIe 4.0 x8, Ryzen 9 5950X, 96GB RAM):*
+
+| Concurrency ($C$) | Serving Mode | Aggregate Throughput | Per-Slot Decode | Cold Prefill (62k) | Warm TTFT (Cached) | VRAM Expert Residency |
+|---|---|---:|---:|---:|---:|---:|
+| **$C=1$** | Dedicated Solo | **105.0 – 120.4 tok/s** | 105.0 – 120.4 tok/s | ~11.0 s (~5,631 tok/s) | 24 – 35 ms | 84.4% (20,739 / 24,576 slots) |
+| **$C=2$** | Dual Continuous | **82.1 – 98.4 tok/s** | 41.0 – 52.5 tok/s | ~19.7 s (~3,180 tok/s) | 24 – 35 ms | **70.2% (17,254 / 24,576 slots)** |
+
+> [!NOTE]
+> **Active Production Guarantee:** $C=2$ is the optimal operating sweet-spot on Dual 24GB RTX 4090s. It guarantees non-blocking multi-agent serving with dedicated 5k prefill workspaces while maintaining 70.2% resident MoE experts in VRAM, eliminating PCIe expert thrashing.
+
+#### C. Retired Tiered Heterogeneous Swarm — Qwen 3.8 Flash Next `IQ3_XXS` (852K Virtual Context)
 *Historical (`v0.1.38-agx.1.0.5`): the tiered auxiliary-slot experiment was removed from the engine on 2026-10-06 as a regression source (it collapsed prefill under load even with no aux traffic). Tool/aux traffic now flows through the standard pool + queue; these figures document the retired build.*
-*Evaluated with 3 Primary slots @ 262K context + 1 Aux slot @ 65K context = **851,968 tokens context** (66.6% VRAM residency; 33.4% streamed dynamically from host DDR4 over PCIe 4.0):*
+*Evaluated with 3 Primary slots @ 262K context + 1 Aux slot @ 65K context = **851,968 tokens context** (66.6% VRAM residency; 33.4% streamed dynamically from host DDR4 over PCIe 4.0 x8):*
 
 | Stream / Role | Context Allocation | Measured Decode Speed | Step Latency | Turnaround / Wall Time | MTP Acceptance |
 |---|---|---:|---:|---:|---:|
@@ -132,7 +143,7 @@ Evaluated side-by-side on the exact same Dual RTX 4090 rig:
 
 | Capability / Benchmark Metric | Vanilla Upstream Strata (v0.1.38) | Strata AGX (`v0.1.38-agx.1.0.5`) | Empirical Difference |
 |---|---|---|---|
-| **Multi-Agent Scheduling** | **$C=1$ FIFO Serialization** *(Incoming requests wait for active generation to finish)* | **$C=1$ to $C=5$ Continuous Micro-Scheduling** *(Iteration-level dynamic slot recycling)* | Concurrent multi-agent execution |
+| **Multi-Agent Scheduling** | **$C=1$ FIFO Serialization** *(Incoming requests wait for active generation to finish)* | **Continuous Micro-Scheduling ($C=2$ on IQ3_XXS / $C=5$ on Q1)** *(Iteration-level dynamic slot recycling)* | Concurrent multi-agent execution |
 | **Auxiliary Request Turnaround** | >15.0 – 22.0 s *(HoL blocking behind active agent output)* | **2.07 s** *(Sub-15ms preemptive queue insertion)* | **86.2% latency reduction** for agent tool calls |
 | **Total Concurrent Virtual Context** | 262,144 tokens *(Single slot only)* | **851,968 tokens** *(3× 262K primary + 1× 65K aux)* | **3.25× total concurrent active context** |
 | **Prefix Caching & Tree Branching** | Static per-request buffer; cross-GPU parking unsupported | **Dynamic RadixTree** with zero-copy prefix sharing & L2/L3 parking | Zero redundant prefill tokens on agent conversation forks |
