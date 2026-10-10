@@ -33,7 +33,7 @@ Upstream Strata demonstrated that 125B MoE architectures (like Qwen 3.8 Flash Ne
 > **Attribution & Upstream Boundary:**
 > This repository is a standalone research fork. We credit **Niko1221** and the 15+ community contributors who created Strata. See [**`ATTRIBUTION.md`**](ATTRIBUTION.md) for full contributor credits. All commits are maintained modularly for upstream cherry-picking.
 
-### Latest Line — `v0.1.40-agx.2.1.0` (Universal KV Caching Overhaul, Deep CoT Uncap & Stability Pack)
+### Latest Line — `v0.1.40-agx.2.2.0` (Universal KV Caching Overhaul, Deep CoT Uncap & Stability Pack)
 
 On 2026-10-10, Strata AGX landed the **Universal KV Caching Overhaul**, the **32k Reasoning Uncap**, and the multi-GPU kernel stabilization battery:
 
@@ -45,7 +45,7 @@ On 2026-10-10, Strata AGX landed the **Universal KV Caching Overhaul**, the **32
 - **Dual-Slot Real-Time Monitoring & LAN Dashboard:** Model state card upgraded to two dedicated slot telemetry monitors (Slot 0 and Slot 1) tracking real-time status (`thinking`, `answering`, `tool_call`), exact context fill percentage, and per-slot decode throughput. Fully accessible across LAN at `http://<server-ip>:8096/monitor` and embedded in GPUStack.
 - **Eager CSTOP & Sub-Threshold Sampler Clamping:** Reclamation of canceled requests on disconnect in under 500ms; sub-threshold temperatures (< 1e-4) clamped strictly to greedy argmax in both CUDA kernels and server frontend.
 
-Engine identity: `0.1.40-agx.2.1.0` @ tag `v0.1.40-agx.2.1.0` (git tree verified).
+Engine identity: `0.1.40-agx.2.2.0` @ tag `v0.1.40-agx.2.2.0` (git tree verified).
 
 ### Previous Milestone — `v0.1.39-agx.2.0.0` (Upstream 0.1.39b Merged Baseline & Stability Pack)
 
@@ -111,7 +111,7 @@ Evaluated on `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` (IQ3_XXS, 125B MoE wi
 | **$C=5$** | Sustained Sweet Spot (11.5 GHz) | **253.92 tok/s** | 59.2 – 63.2 tok/s | 5,124.2 tok/s | 100.0% |
 
 #### B. Production Serving Posture — Qwen 3.8 Flash Next `IQ3_XXS` ($C=2$, Dual-Agent Concurrency)
-*Measured on active production release `v0.1.40-agx.2.1.0` (Dual RTX 4090 24GB @ PCIe 4.0 x8, Ryzen 9 5950X, 96GB RAM):*
+*Measured on active production release `v0.1.40-agx.2.2.0` (Dual RTX 4090 24GB @ PCIe 4.0 x8, Ryzen 9 5950X, 96GB RAM):*
 
 | Concurrency ($C$) | Serving Mode | Aggregate Throughput | Per-Slot Decode | Cold Prefill (62k) | Warm TTFT (Cached) | VRAM Expert Residency |
 |---|---|---:|---:|---:|---:|---:|
