@@ -177,10 +177,10 @@ Verify that all custom SM89 kernels and RadixTree implementations match referenc
 python3 -m serve.server --port 8096 --host 0.0.0.0
 ```
 
-### Reference Concurrent-Serving Posture (3 × 262K slots)
+### Reference Concurrent-Serving Posture (Dual-4090 2 × 262K Slots)
 ```bash
-python3 serve/server.py --engine strata --config q3-xxs-3x262k/config.json --port 8096
-# config highlights: 3 slots × 262,144-token context, --concurrent-prefill 12288,
+python3 serve/server.py --engine strata --config configs/q3-xxs-dual-4090-serving.json --port 8096
+# config highlights: 2 slots × 262,144-token context ($C=2$), --concurrent-prefill 2048,
 # --kv q4_0, dynamic RadixTree L1/L2/L3 (VRAM → host RAM → NVMe)
 ```
 
