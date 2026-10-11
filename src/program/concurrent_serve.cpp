@@ -260,6 +260,7 @@ struct ConcurrentServe::Impl {
         int64_t saved_prefix = 0;
         bool prompt_snap_done = false;   // P18 L1: the prompt-end snapshot was captured this admission
         std::shared_ptr<core::RadixNode> radix_node = nullptr;
+        std::string cache_tier = "Fresh";
         std::vector<int32_t> saved_consumed;
         ~Slot() {
             // TODO(C4 run-side): free under OnDevice(last stage / stage device) once stages can be non-zero.
@@ -830,8 +831,9 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         if (ipc::ShmProducer::instance()->is_active()) {
             ipc::ShmProducer::instance()->write_progress(s.request.id, read0 + n, (int64_t) s.request.tokens.size());
         }
-        std::printf("R %llu PP %lld %zu\n", (unsigned long long) s.request.id, (long long) (read0 + n),
-                    s.request.tokens.size());
+        const double chunk_rate = chunk_ms > 0 ? (n / (chunk_ms / 1000.0)) : 0.0;
+        std::printf("R %llu PP %lld %zu %.1f %.1f %s\n", (unsigned long long) s.request.id, (long long) (read0 + n),
+                    s.request.tokens.size(), chunk_ms, chunk_rate, s.cache_tier.c_str());
         std::fflush(stdout);
         // R2 (STRATA_PLE_PREFETCH, default off; a no-op without the env): this slot still has prompt left, so
         // its next run() call will want the next chunk's PLE rows - gather them on a thread now, while the
@@ -1076,9 +1078,9 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         // P4: the trailing field is reused_prefix_tokens (server.py _parse_done maps it to
         // `reused`/cached_tokens). Live retention fills it with the tokens this request resumed;
         // 0 = the request read its whole prompt (fresh admission - all of today's traffic).
-        std::printf("R %llu DONE %lld %zu %.1f %.1f %s %lld %lld %lld\n", (unsigned long long) s.request.id,
+        std::printf("R %llu DONE %lld %zu %.1f %.1f %s %lld %lld %lld %s\n", (unsigned long long) s.request.id,
                     (long long) s.generated, s.request.tokens.size(), s.prompt_ms.load(), decode, reason,
-                    (long long) s.accepted, (long long) s.offered, (long long) s.reused_prefix);
+                    (long long) s.accepted, (long long) s.offered, (long long) s.reused_prefix, s.cache_tier.c_str());
         std::fflush(stdout);
         if (defer_snapshot) {
             pending_snapshots.push_back(&s);   // flushed with its snapshot at a safe point
@@ -1541,7 +1543,8 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             if (s.radix_node && s.radix_node != radix_parent) radix_tree.release(s.radix_node);
             s.radix_node = radix_parent;
             radix_tree.acquire(s.radix_node);
-            std::fprintf(stderr, "strata-agx concurrent: radix-tree fork: slot forks %lld tokens from RadixNode #%lld (%s)\n", (long long) reused, (long long) radix_parent->id, radix_parent->has_device_snapshot() ? "VRAM" : "Host-RAM HiCache L2");
+            s.cache_tier = radix_parent->has_device_snapshot() ? "VRAM" : "Host";
+            std::fprintf(stderr, "strata-agx concurrent: radix-tree fork: slot forks %lld tokens from RadixNode #%lld (%s)\n", (long long) reused, (long long) radix_parent->id, s.cache_tier.c_str());
         } else if (parent != nullptr) {
             // SPRINT 1: Cross-slot or self-slot prefix fork from snapshot
             s.consumed.assign(parent->saved_consumed.begin(), parent->saved_consumed.begin() + reused);
@@ -1569,6 +1572,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 }
                 s.draft->kv_restore(reused);
             }
+            s.cache_tier = "VRAM";
             std::fprintf(stderr, "strata-agx concurrent: snapshot fork: slot forks %lld tokens from %s (saved=%lld)\n",
                          (long long) reused, (parent == &s ? "self" : "parent"), (long long) parent->saved_prefix);
         } else {
@@ -1577,6 +1581,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 s.consumed.resize((size_t) reused);
             }
             s.draft->kv_restore(reused);
+            s.cache_tier = reused > 0 ? "Intra" : "Fresh";
             std::fprintf(stderr, "strata-agx concurrent: live retention: slot resumes %lld tokens (truncated)\n", (long long) reused);
         }
         s.draft->set_prompt_len((int64_t) s.request.tokens.size());

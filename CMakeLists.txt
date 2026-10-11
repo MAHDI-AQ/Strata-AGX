@@ -8,14 +8,14 @@
 # below refuses anything older: silently building for a pre-Ampere arch would produce a binary that runs
 # and is wrong about its own performance, which is the worst of both outcomes.
 cmake_minimum_required(VERSION 3.24)
-project(strata-agx VERSION 0.1.38 LANGUAGES CXX)
+project(strata-agx VERSION 0.1.40 LANGUAGES CXX)
 option(STRATA_BUILD_CONCURRENCY_TESTS "Build CPU-only request scheduling tests" OFF)
 
 # Keep runtime assert() live: strips -DNDEBUG from the Release-class flags and builds the
 # asserts-liveness sentinel (tests/core/asserts_active_check.cpp). Default OFF: the shipping
 # Release class is unchanged.
 option(STRATA_ENABLE_ASSERTS "Keep runtime assert() active (strips -DNDEBUG from the Release-class flags)" OFF)
-set(STRATA_AGX_VERSION "0.1.38-agx.1.1.5")
+set(STRATA_AGX_VERSION "0.1.40-agx.2.5.1")
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
 add_compile_definitions(STRATA_AGX_VERSION="${STRATA_AGX_VERSION}")
 

@@ -49,7 +49,7 @@ from typing import Iterator, Protocol
 from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
-STRATA_AGX_VERSION = "0.1.39-agx.1.2.0"
+STRATA_AGX_VERSION = "0.1.40-agx.2.5.1"
 
 def get_git_commit() -> str:
     commit = os.environ.get("STRATA_COMMIT")
@@ -668,6 +668,8 @@ class StrataEngine:
                      "decode_ms": float(f[4]), "finish": f[5]}
         if len(f) >= 9:                                   # the conversation cache's fields (engine 0.1.3+)
             self.last.update(drafts_accepted=int(f[6]), drafts_offered=int(f[7]), reused=int(f[8]))
+        if len(f) >= 10 and not f[9].isdigit():           # trailing cache_tier from concurrent engine
+            self.last.update(cache_tier=f[9])
         if len(f) >= 11:                                  # decode hit rate fields
             self.last.update(hits=int(f[9]), lookups=int(f[10]))
         if len(f) >= 14:                                  # the expert tiers (engine 0.1.31+): RAM / file blobs, file MB
@@ -770,9 +772,14 @@ class StrataEngine:
                     if number not in self._shared_queue_wait:
                         self._shared_queue_wait[number] = round((time.monotonic() - sent_at) * 1000.0, 2)
                     fields = line.split()
-                    pr = (int(fields[1]), int(fields[2]))
-                    self.progress = pr                       # this reader's value (unchanged)
-                    self._shared_progress[number] = pr       # /metrics snapshot; lock-free (see progress)
+                    read_tokens = int(fields[1])
+                    total_tokens = int(fields[2])
+                    chunk_ms = float(fields[3]) if len(fields) > 3 else 0.0
+                    chunk_rate = float(fields[4]) if len(fields) > 4 else 0.0
+                    cache_tier = fields[5] if len(fields) > 5 else "None"
+                    pr = (read_tokens, total_tokens, chunk_rate, cache_tier)
+                    self.progress = (read_tokens, total_tokens)
+                    self._shared_progress[number] = pr
                     yield None
                 elif line.startswith("DONE "):
                     self._parse_done(line)
@@ -1898,8 +1905,14 @@ class Service:
         label = f"[strata-agx request {request_id}]" if request_id is not None else "[strata-agx]"
         el = now - s.get("started", now)
         if s.get("first_token") is None:
-            pr = getattr(self.engine, "progress", None) if self.concurrency == 1 else None
-            done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{s.get('prompt_tokens', 0):,}"   # as read (#29)
+            pr = self.engine._shared_progress.get(request_id) if (hasattr(self.engine, "_shared_progress") and request_id) else getattr(self.engine, "progress", None)
+            done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{s.get('prompt_tokens', 0):,}"
+            slot_id = s.get("slot_id")
+            if slot_id is not None and slot_id in self.slots_state:
+                p_rate = pr[2] if (pr and len(pr) > 2) else None
+                c_tier = pr[3] if (pr and len(pr) > 3) else "Fresh"
+                p_read = pr[0] if pr else 0
+                self.slots_state[slot_id].update(status="reading", prompt_read=p_read, prefill_tok_s=p_rate, cache_tier=c_tier)
             print(f"{label} reading the prompt: {done} tokens, {el:.0f} s so far", flush=True)
         else:
             rate = s["generated"] / max(1e-6, now - s["first_token"])
@@ -2102,7 +2115,21 @@ class Service:
                             self.live_requests.pop(request_id, None)
                             if "slot_id" in locals() and slot_id is not None:
                                 self.available_slots.add(slot_id)
-                                self.slots_state[slot_id] = {"id": slot_id, "status": "idle", "request_id": None, "phase": None, "prompt_tokens": 0, "generated": 0, "max_tokens": 0, "tok_s": None, "started": None}
+                                prev_slot = self.slots_state.get(slot_id, {})
+                                last_info = {
+                                    "request_id": request_id,
+                                    "prompt_tokens": seen,
+                                    "output_tokens": n,
+                                    "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1) if n and last.get("generated") and last.get("decode_ms") else None,
+                                    "reused": last.get("reused", 0),
+                                    "cache_tier": last.get("cache_tier", prev_slot.get("cache_tier", "Fresh")),
+                                    "duration_s": round(time.time() - started, 1)
+                                }
+                                self.slots_state[slot_id] = {
+                                    "id": slot_id, "status": "idle", "request_id": None, "phase": None,
+                                    "prompt_tokens": 0, "generated": 0, "max_tokens": 0, "tok_s": None, "started": None,
+                                    "cache_tier": last_info["cache_tier"], "last_request": last_info
+                                }
                         if not self.live_requests:
                             self.status["busy"] = False
                             self.status.pop("tail", None)

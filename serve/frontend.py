@@ -708,7 +708,14 @@ class OutputParser:
         if self.ss == "str":
             tail += '"'
         elif self.ss == "raw":
-            tail += json.dumps(self.buf[self.sp:].strip("\n"))
+            raw_val = self.buf[self.sp:].strip("\n")
+            if raw_val:
+                try:
+                    tail += json.dumps(json.loads(raw_val))
+                except ValueError:
+                    tail += json.dumps(raw_val)
+            else:
+                tail += '""'
         tail += "}"
         out.append(Event("tool_args", tail, call=self.scall))
         self.ss = "done"

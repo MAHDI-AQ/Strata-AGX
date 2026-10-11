@@ -179,14 +179,23 @@ function setPill(state, text) {
 function render(m) {
   const live = m.live || {}, hw = m.hardware || {}, st = m.hardware_static || {}, eng = m.engine || {}, h = m.history || {};
   const last = (m.requests || [])[0];
-  // the header pill
-  if (live.state === "reading") {
-    const pct = live.prompt_total ? Math.round((100 * live.prompt_read) / live.prompt_total) : null;
-    setPill("reading", pct != null ? `Reading prompt · ${pct}%` : "Reading prompt");
-  } else if (live.state === "generating") {
-    setPill("generating", `Generating · ${fmt(live.tok_s, 1)} tok/s`);
+  // the header pill (multi-slot aware)
+  const slotsList = m.slots || [];
+  const s0 = slotsList.find(s => s.id === 0) || {};
+  const s1 = slotsList.find(s => s.id === 1) || {};
+  const anyGen = s0.status === "generating" || s1.status === "generating";
+  const anyRead = s0.status === "reading" || s1.status === "reading";
+  if (anyGen) {
+    const s0Txt = s0.status === "generating" ? `${fmt(s0.tok_s || 0, 1)} t/s` : (s0.status || "idle");
+    const s1Txt = s1.status === "generating" ? `${fmt(s1.tok_s || 0, 1)} t/s` : (s1.status || "idle");
+    setPill("generating", `Active · S0: ${s0Txt} · S1: ${s1Txt}`);
+  } else if (anyRead) {
+    const rSlot = s0.status === "reading" ? s0 : s1;
+    const tier = rSlot.cache_tier ? `[${rSlot.cache_tier}] ` : "";
+    const pTok = rSlot.prefill_tok_s ? ` · ${fmt(rSlot.prefill_tok_s)} t/s` : "";
+    setPill("reading", `Reading prompt · ${tier}S${rSlot.id || 0}${pTok}`);
   } else {
-    setPill("idle", "Idle");
+    setPill("idle", "Slots Ready · S0: Idle · S1: Idle");
   }
   if (live.queued > 0) setPill("queued", `${live.queued} queued`);
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept, m.slots || []);
@@ -213,20 +222,25 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, slots
     }
     const prog = $(`state-progress-${sId}`);
     let label = "Waiting for a request", detail = "", pct = 0;
+    const slotLast = slot.last_request || (sId === 0 ? last : null);
     if (slot.status === "reading") {
-      label = "Reading prompt";
+      const tierBadge = slot.cache_tier ? `[${slot.cache_tier}] ` : "";
+      label = `Reading prompt ${tierBadge}`;
       if (prog) prog.dataset.tone = "info";
-      pct = slot.max_tokens ? Math.min(100, (100 * (slot.prompt_tokens || 0)) / slot.max_tokens) : 40;
-      detail = `${fmt(slot.prompt_tokens || 0)} prompt tokens`;
+      pct = slot.prompt_tokens ? Math.min(100, (100 * (slot.prompt_read || 0)) / slot.prompt_tokens) : 40;
+      const speedStr = slot.prefill_tok_s ? ` · ${fmt(slot.prefill_tok_s)} tok/s prefill` : "";
+      detail = `${fmt(slot.prompt_read || slot.prompt_tokens || 0)} / ${fmt(slot.prompt_tokens || 0)} tokens${speedStr}`;
     } else if (slot.status === "generating") {
       label = slot.phase ? slot.phase[0].toUpperCase() + slot.phase.slice(1) : "Generating";
       if (prog) delete prog.dataset.tone;
       pct = slot.max_tokens ? Math.min(100, (100 * (slot.generated || 0)) / slot.max_tokens) : 0;
       detail = `${fmt(slot.generated || 0)} tokens${slot.tok_s ? ` · ${fmt(slot.tok_s, 1)} tok/s` : ""}`;
-    } else if (last && sId === 0 && live.state === "idle") {
+    } else if (slotLast) {
       if (prog) delete prog.dataset.tone;
-      label = "Idle (Ready)";
-      detail = `last: ${fmt(last.output_tokens)} tokens${last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}`;
+      const tier = slotLast.cache_tier ? ` (${slotLast.cache_tier})` : "";
+      label = `Idle (Ready)${tier}`;
+      const dTok = slotLast.decode_tok_s ? ` at ${fmt(slotLast.decode_tok_s, 1)} tok/s` : "";
+      detail = `last: ${fmt(slotLast.output_tokens || 0)} tokens${dTok}`;
     } else {
       if (prog) delete prog.dataset.tone;
       label = "Idle (Ready for request)";
@@ -319,8 +333,11 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, slots
       if (slot.status === "generating" && slot.tok_s) {
         speedEl.innerHTML = `<b>${slot.tok_s}</b> tok/s`;
       } else if (slot.status === "reading") {
-        speedEl.innerHTML = `prefill in progress`;
-      } else if (sId === 0 && last && live.state === "idle" && last.decode_tok_s) {
+        const rate = slot.prefill_tok_s ? `<b>${fmt(slot.prefill_tok_s)}</b> t/s` : "prefill in progress";
+        speedEl.innerHTML = `${rate} (${slot.cache_tier || "Fresh"})`;
+      } else if (slot.last_request && slot.last_request.decode_tok_s) {
+        speedEl.textContent = `last: ${slot.last_request.decode_tok_s} t/s`;
+      } else if (sId === 0 && last && last.decode_tok_s) {
         speedEl.textContent = `last: ${last.decode_tok_s} t/s`;
       } else {
         speedEl.textContent = "–";
