@@ -909,14 +909,25 @@ class OutputParser:
                 raw_body = self.buf[len(CALL_START):] if self.buf.startswith(CALL_START) else self.buf
                 call_name = extract_call_name(raw_body)
                 if call_name and call_name in self.schemas:
-                    try:
-                        salvaged_call = parse_tool_call(raw_body, self.schemas.get(call_name))
-                        out.append(Event("tool_call", call=salvaged_call))
-                        self.buf = ""
-                        self._reset_scan()
-                        return out
-                    except Exception:
-                        pass
+                    # CRIT-06: Attempt direct parse, then synthesized closing repair
+                    schema = self.schemas.get(call_name)
+                    candidates = [raw_body]
+                    # Synthesize missing closing braces / XML tags for truncated stream
+                    if "<function=" in raw_body and "</function>" not in raw_body:
+                        candidates.append(raw_body + "\n</function>")
+                    trimmed = raw_body.strip()
+                    if trimmed.startswith("{") and not trimmed.endswith("}"):
+                        candidates.append(trimmed + "}")
+                    for cand in candidates:
+                        try:
+                            salvaged_call = parse_tool_call(cand, schema)
+                            if salvaged_call:
+                                out.append(Event("tool_call", call=salvaged_call))
+                                self.buf = ""
+                                self._reset_scan()
+                                return out
+                        except Exception:
+                            continue
             # an unfinished call inside the reasoning (#804) is reasoning text, never a call
             kind = {"reasoning": "reasoning", "rcall": "reasoning", "content": "content"}.get(self.state, "content")
             text = self.buf if self.state != "call" else CALL_START + self.buf

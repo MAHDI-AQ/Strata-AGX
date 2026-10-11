@@ -1259,12 +1259,18 @@ size_t RadixTree::evict_lru_locked(size_t max_snapshots, size_t min_free_vram_mi
         }
         if (cached_host_snapshots_ > 0) --cached_host_snapshots_;
 
-        // Only prune topological edge if it has zero children, zero ref_count, and no snapshots
-        if (host_victim->children.empty() && host_victim->ref_count == 0 && !host_victim->has_snapshot()) {
-            if (auto p = host_victim->parent.lock()) {
-                if (!host_victim->edge_tokens.empty()) {
-                    p->children.erase(host_victim->edge_tokens[0]);
-                    --node_count_;
+        // CRIT-04: Free NVMe disk payload before removing topological edge
+        if (host_victim->children.empty() && host_victim->ref_count == 0) {
+            if (host_victim->is_l3_offloaded && nvme_tier_) {
+                host_victim->free_nvme(*nvme_tier_);
+                if (cached_nvme_snapshots_ > 0) --cached_nvme_snapshots_;
+            }
+            if (!host_victim->has_snapshot()) {
+                if (auto p = host_victim->parent.lock()) {
+                    if (!host_victim->edge_tokens.empty()) {
+                        p->children.erase(host_victim->edge_tokens[0]);
+                        --node_count_;
+                    }
                 }
             }
         }
@@ -1648,7 +1654,8 @@ bool RadixTree::persist_manifest(const std::string& model_id_hash) {
     if (!nvme_tier_) return false;
 
     std::string manifest_path = nvme_tier_->base_path() + "/radix_manifest.bin";
-    std::ofstream ofs(manifest_path, std::ios::binary);
+    std::string manifest_tmp = manifest_path + ".tmp";
+    std::ofstream ofs(manifest_tmp, std::ios::binary);
     if (!ofs.is_open()) return false;
 
     std::vector<std::shared_ptr<RadixNode>> all_nodes;
@@ -1694,6 +1701,10 @@ bool RadixTree::persist_manifest(const std::string& model_id_hash) {
         }
     }
     ofs.flush();
+    ofs.close();
+    if (::rename(manifest_tmp.c_str(), manifest_path.c_str()) != 0) {
+        return false;
+    }
     return true;
 }
 

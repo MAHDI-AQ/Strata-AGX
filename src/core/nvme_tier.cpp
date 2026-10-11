@@ -122,6 +122,12 @@ bool NVMeStorageTier::write_node_direct(int64_t node_id, const void* data, size_
         ssize_t rc = ::write(fd, p + total_written, write_bytes - total_written);
         if (rc <= 0) {
             ::close(fd);
+            ::unlink(path.c_str()); // CRIT-05: erase corrupted partial file on failure
+            return false;
+        }
+        if ((rc % kDirectBlockAlignment) != 0 && (total_written + rc) < write_bytes) {
+            ::close(fd);
+            ::unlink(path.c_str());
             return false;
         }
         total_written += rc;

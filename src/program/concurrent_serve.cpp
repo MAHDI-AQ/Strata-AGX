@@ -1553,8 +1553,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             }
             if (s.draft) s.draft->kv_restore(reused);
             if (s.radix_node && s.radix_node != radix_parent) radix_tree.release(s.radix_node);
-            s.radix_node = radix_parent;
-            radix_tree.acquire(s.radix_node);
+            s.radix_node = radix_parent; // Already holds ref_count acquired in match_prefix()
             s.cache_tier = radix_parent->has_device_snapshot() ? "VRAM" : "Host";
             std::fprintf(stderr, "strata-agx concurrent: radix-tree fork: slot forks %lld tokens from RadixNode #%lld (%s)\n", (long long) reused, (long long) radix_parent->id, s.cache_tier.c_str());
         } else if (parent != nullptr) {
@@ -1742,9 +1741,14 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 // Both are safe to restore from Host RAM, with remainder tokens prefilled as catch-up.
                 const bool pqp_match = match.node && (match.matched_tokens == match.node->prefix_len || match.matched_tokens % 64 == 0);
                 if (pqp_match && match.matched_tokens >= 256 && match.matched_tokens > best && nmax >= match.matched_tokens) {
+                    if (best_node && best_node != match.node) {
+                        radix_tree.release(best_node);
+                    }
                     best = std::min<int64_t>(match.matched_tokens, nmax);
                     best_node = match.node;
                     pick_q = q;
+                } else if (match.node) {
+                    radix_tree.release(match.node); // Not chosen, release ref_count
                 }
             }
             if (best_node == nullptr || best == 0) break;
@@ -1759,7 +1763,10 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                     }
                 }
             }
-            if (pick_child == nullptr) break;
+            if (pick_child == nullptr) {
+                if (best_node) radix_tree.release(best_node);
+                break;
+            }
 
             auto& s = *pick_child;
             s.request = std::move(pending[pick_q]);
@@ -2275,6 +2282,11 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     if (!pump_check()) return 1;
     for (auto& s : m.slots) if (s->active.load()) finish(*s, "cancel");
     for (const auto& r : pending) error(r.id, "server shutting down");
+    if (nvme_dir_env && *nvme_dir_env) {
+        radix_tree.persist_manifest();
+        std::fprintf(stderr, "strata-agx concurrent: persistent L3 RadixTree manifest saved to NVMe (%zu nodes)\n",
+                     radix_tree.total_nodes());
+    }
     report_profile();
     std::fprintf(stderr, "strata-agx concurrent: target rounds by active batch size: 1=%lld 2=%lld 3=%lld 4=%lld 5=%lld 6=%lld 7=%lld 8=%lld 9=%lld 10=%lld 11=%lld 12=%lld 13=%lld 14=%lld 15=%lld 16=%lld\n",
                  (long long) batch_sizes[1], (long long) batch_sizes[2], (long long) batch_sizes[3], (long long) batch_sizes[4],
