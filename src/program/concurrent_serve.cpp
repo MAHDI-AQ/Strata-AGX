@@ -507,6 +507,19 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         err = "concurrency: no profile-filled expert cache fits; reduce context/concurrency or increase available VRAM";
         return 1;
     }
+    // Sprint 4: Cross-GPU PCIe Mode Configuration (0: Async DMA, 1: Direct P2P, 2: Mapped Kernel)
+    const int configured_pcie_mode = []() {
+        const char* mode_env = std::getenv("STRATA_PCIE_MODE");
+        if (mode_env != nullptr) {
+            if (std::strcmp(mode_env, "dma") == 0 || std::strcmp(mode_env, "0") == 0) return 0;
+            if (std::strcmp(mode_env, "direct") == 0 || std::strcmp(mode_env, "1") == 0) return 1;
+            if (std::strcmp(mode_env, "kernel") == 0 || std::strcmp(mode_env, "2") == 0) return 2;
+        }
+        return 0; // Default to high-throughput asynchronous DMA for Sprint 4 (v0.1.40-agx.3.0.0)
+    }();
+    std::fprintf(stderr, "strata-agx concurrent: cross-GPU PCIe pipeline mode set to %d (%s)\n",
+                 configured_pcie_mode, configured_pcie_mode == 0 ? "Asynchronous DMA" : (configured_pcie_mode == 1 ? "Direct P2P" : "Mapped Kernel"));
+
     // Phase 4: Compute Kernels & MoE Router Acceleration
     {
         const char* disable_env = std::getenv("STRATA_DISABLE_NATIVE_ROUTER");
@@ -539,7 +552,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                          st == 0 ? nullptr : m.hand[st - 1].dev[1], last ? nullptr : m.hand[st].dev[1],
                          st == 0 ? nullptr : m.hand[st - 1].dev[2], last ? nullptr : m.hand[st].dev[2]);
         if (!b.init(*sg.wt, g, *m.slots[0]->stages[st].state, sg.hits, sg.head, std::max(2, c.rows), err, true)) return 1;
-        b.set_pcie_mode(2); // Match the stock Windows-safe kernel-copy path.
+        b.set_pcie_mode(configured_pcie_mode);
         if (!last) b.set_next(&batch[st + 1], user);
     }
     // C4: per-slot per-stage chains, wired like the single-request split path (generate.cpp 3641-3730):
@@ -560,7 +573,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                                                st == 0 ? nullptr : m.hand[st - 1].dev[2],
                                                last ? nullptr : m.hand[st].dev[2]);
             if (!s.stages[st].verify.init(*sg.wt, g, *s.stages[st].state, sg.hits, sg.head, c.window, err)) return 1;
-            s.stages[st].verify.set_pcie_mode(2);
+            s.stages[st].verify.set_pcie_mode(configured_pcie_mode);
             if (!last) s.stages[st].verify.set_next(&s.stages[st + 1].verify, user);   // user = &split_drive
             s.stages[st].prompt.set_stage(sg.lb, last ? -1 : sg.le, last ? nullptr : &s.stages[st + 1].prompt);
             if (!s.stages[st].prompt.init(*sg.wt, g, *s.stages[st].state, source, sg.cache, sg.host_res,
@@ -1490,7 +1503,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                                                st == 0 ? nullptr : m.hand[st - 1].dev[2],
                                                last ? nullptr : m.hand[st].dev[2]);
             if (!s.stages[st].verify.init(*sg.wt, g, *s.stages[st].state, sg.hits, sg.head, c.window, err)) return false;
-            s.stages[st].verify.set_pcie_mode(2);
+            s.stages[st].verify.set_pcie_mode(configured_pcie_mode);
             if (!last) s.stages[st].verify.set_next(&s.stages[st + 1].verify, user);
             s.stages[st].prompt.set_stage(sg.lb, last ? -1 : sg.le, last ? nullptr : &s.stages[st + 1].prompt);
             if (!s.stages[st].prompt.init(*sg.wt, g, *s.stages[st].state, source, sg.cache, sg.host_res,

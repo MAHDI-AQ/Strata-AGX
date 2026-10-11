@@ -206,6 +206,46 @@ __global__ void __launch_bounds__(HD) attn_merge_kernel(const float* __restrict_
     attn[(size_t) h * HD + d] = L > 0.0f ? acc / L : 0.0f;
 }
 
+// Sprint 4: Fused Attention Merge & Sigmoid Gate Kernel
+__global__ void __launch_bounds__(HD) attn_merge_fused_gate_kernel(const float* __restrict__ part_acc,
+                                                                  const float* __restrict__ part_m,
+                                                                  const float* __restrict__ part_l, int n_chunks,
+                                                                  float* __restrict__ attn,
+                                                                  const float* __restrict__ q_full,
+                                                                  float* __restrict__ output_attn32,
+                                                                  long long scratch_stride = 0) {
+    const size_t q_idx = (size_t) blockIdx.y;
+    part_acc += q_idx * (size_t) scratch_stride;
+    part_m += q_idx * (size_t) scratch_stride;
+    part_l += q_idx * (size_t) scratch_stride;
+    const size_t head_offset = q_idx * (size_t) gridDim.x * HD;
+    if (attn != nullptr) attn += head_offset;
+    output_attn32 += head_offset;
+    const size_t qfull_offset = q_idx * (size_t) gridDim.x * 2 * HD;
+
+    const int h = blockIdx.x;                 // global query head
+    const int kvh = h / G, hl = h % G;
+    const int d = threadIdx.x;
+    float M = -FLT_MAX;
+    for (int c = 0; c < n_chunks; ++c) M = fmaxf(M, part_m[(kvh * n_chunks + c) * G + hl]);
+    float L = 0.0f, acc = 0.0f;
+    for (int c = 0; c < n_chunks; ++c) {
+        const int slot = kvh * n_chunks + c;
+        const float m = part_m[slot * G + hl];
+        if (m == -FLT_MAX) continue;
+        const float w = __expf(m - M);
+        L = fmaf(part_l[slot * G + hl], w, L);
+        acc = fmaf(part_acc[((size_t) slot * G + hl) * HD + d], w, acc);
+    }
+    const float raw_attn = L > 0.0f ? acc / L : 0.0f;
+    if (attn != nullptr) attn[(size_t) h * HD + d] = raw_attn;
+
+    // Epilogue Fusion: apply sigmoid gate from q_full directly in registers
+    const float raw_gate = q_full[qfull_offset + (size_t) h * 2 * HD + HD + d];
+    const float sigmoid_val = 1.0f / (1.0f + __expf(-raw_gate));
+    output_attn32[(size_t) h * HD + d] = raw_attn * sigmoid_val;
+}
+
 }  // namespace
 
 void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
@@ -251,6 +291,47 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
 uint64_t qsa_decode_attn_scratch_floats(int64_t cap, const QsaShapes& s) {
     const int64_t chunks = (cap + CHUNK - 1) / CHUNK;
     return (uint64_t) chunks * (uint64_t) s.n_head * (HD + 2) + 64;
+}
+
+void qsa_decode_attn_batch_fused_gate(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                                      int64_t cap, const QsaShapes& s, float* scratch, float* attn,
+                                      const float* q_full, float* output_attn32, int64_t n_q, void* stream) {
+    if (n_q <= 0) return;
+    if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !steps ||
+        !pools.page_table || !q_full || !output_attn32 || n_q > 65535) {
+        std::fprintf(stderr, "qsa_decode_attn_batch_fused_gate: unsupported geometry or missing buffers\n");
+        std::exit(1);
+    }
+    const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
+                        : (pools.k_q != nullptr ? 1 : 0));
+    const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
+    const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
+    float* part_acc = scratch;
+    float* part_m = scratch + (size_t) n_chunks * s.n_head * HD;
+    float* part_l = part_m + (size_t) n_chunks * s.n_head;
+    const float scale = 1.0f / sqrtf((float) HD);
+    const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv, (unsigned) n_q);
+    cudaStream_t st = (cudaStream_t) stream;
+    if (kv_mode == 3)
+        attn_chunk_kernel<3><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
+                                                        scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+    else if (kv_mode == 2)
+        attn_chunk_kernel<2><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
+                                                        scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+    else if (kv_mode == 1)
+        attn_chunk_kernel<1><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
+                                                        scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+    else
+        attn_chunk_kernel<0><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
+                                                        scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+
+    attn_merge_fused_gate_kernel<<<dim3((unsigned) s.n_head, (unsigned) n_q), HD, 0, st>>>(part_acc, part_m, part_l, n_chunks,
+                                                                                             attn, q_full, output_attn32, stride);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "qsa_decode_attn_batch_fused_gate: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
 }
 
 void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* step,

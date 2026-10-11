@@ -43,4 +43,9 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
 void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
 
+/// Sprint 4: Fused QSA Decode Attention + Sigmoid Gate Epilogue (eliminates VRAM scratch round-trip).
+void qsa_decode_attn_batch_fused_gate(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                                      int64_t cap, const QsaShapes& s, float* scratch, float* attn,
+                                      const float* q_full, float* output_attn32, int64_t n_q, void* stream);
+
 }  // namespace strata::kernels
