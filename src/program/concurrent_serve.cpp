@@ -734,8 +734,14 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                         : "prefix-cache off (parking not yet supported on this path)");
     // D1: advertise the sess= wire hint only while retention is on - the off path stays byte-identical
     // (stdout and wire), and the server sends the hint only to an engine that advertises it.
-    std::printf("INFO engine=" STRATA_AGX_VERSION " concurrency=%d batch_rows=%d batch_policy=%s context=%lld kv=%s lookup=%d expert_policy=%s%s\n",
+    int64_t slots_all = 0, mib_all = 0;
+    for (const auto& sg : m.stages) if (sg.cache) {
+        slots_all += sg.cache->slots();
+        mib_all += (sg.cache->bytes() >> 20);
+    }
+    std::printf("INFO engine=" STRATA_AGX_VERSION " concurrency=%d batch_rows=%d batch_policy=%s context=%lld kv=%s lookup=%d expert_policy=%s expert_slots=%lld expert_cache_mib=%lld%s\n",
                 c.requests, c.rows, c.depth ? "depth" : "fair", (long long) c.context, c.kv.c_str(), c.suffix, adaptive ? "adaptive" : "static",
+                (long long) slots_all, (long long) mib_all,
                 retain ? " admission=d1" : "");
     std::printf("READY %lld stop multiplex\n", (long long) c.context);
     // LANE sched-impl P2 (host-loop O1/O2 surface): echo the effective spin posture so the primary's
