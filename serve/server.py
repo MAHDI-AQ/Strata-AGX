@@ -534,7 +534,7 @@ class StrataEngine:
             if len(fields) != 3 or fields[0] != "R" or not fields[1].isdigit():
                 continue
             number, payload = int(fields[1]), fields[2]
-            if getattr(self, "_shm_active", False) and (payload.startswith("T ") or payload.startswith("PP ")):
+            if getattr(self, "_shm_active", False) and payload.startswith("T "):
                 continue
             overflow = False
             with self._channels_lock:
@@ -774,9 +774,10 @@ class StrataEngine:
                     fields = line.split()
                     read_tokens = int(fields[1])
                     total_tokens = int(fields[2])
-                    chunk_ms = float(fields[3]) if len(fields) > 3 else 0.0
-                    chunk_rate = float(fields[4]) if len(fields) > 4 else 0.0
-                    cache_tier = fields[5] if len(fields) > 5 else "None"
+                    old_pr = self._shared_progress.get(number)
+                    chunk_ms = float(fields[3]) if len(fields) > 3 else (old_pr[2] if old_pr else 0.0)
+                    chunk_rate = float(fields[4]) if len(fields) > 4 else (old_pr[2] if old_pr else 0.0)
+                    cache_tier = fields[5] if len(fields) > 5 else (old_pr[3] if old_pr else "Fresh")
                     pr = (read_tokens, total_tokens, chunk_rate, cache_tier)
                     self.progress = (read_tokens, total_tokens)
                     self._shared_progress[number] = pr
@@ -1726,7 +1727,7 @@ class Service:
                 "elapsed_s": round(now - s["started"], 1) if s.get("busy") and s.get("started") else None,
                 "tok_s": round(self._tok_s(), 1) if state == "generating" else None,
                 "tok_s_mean": round(self._tok_s_mean(), 1) if state == "generating" else None,
-                "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if s.get("busy") else None,
+                "prefill_tok_s_mean": (next((sl.get("prefill_tok_s") for sl in self.slots_state.values() if sl.get("status") == "reading" and sl.get("prefill_tok_s")), None) or getattr(self.engine, "prefill_tok_s_mean", None)) if s.get("busy") else None,
                 "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
         if state == "reading" and progress:
             live["prompt_read"], live["prompt_total"] = progress
@@ -2116,12 +2117,17 @@ class Service:
                             if "slot_id" in locals() and slot_id is not None:
                                 self.available_slots.add(slot_id)
                                 prev_slot = self.slots_state.get(slot_id, {})
+                                p_ms = last.get("prompt_ms") or 0.0
+                                p_reused = last.get("reused") or 0
+                                p_fresh = max(0, seen - p_reused)
+                                p_tok_s = round(p_fresh / (p_ms / 1000.0), 1) if (p_ms > 0 and p_fresh > 0) else None
                                 last_info = {
                                     "request_id": request_id,
                                     "prompt_tokens": seen,
                                     "output_tokens": n,
                                     "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1) if n and last.get("generated") and last.get("decode_ms") else None,
-                                    "reused": last.get("reused", 0),
+                                    "prefill_tok_s": p_tok_s,
+                                    "reused": p_reused,
                                     "cache_tier": last.get("cache_tier", prev_slot.get("cache_tier", "Fresh")),
                                     "duration_s": round(time.time() - started, 1)
                                 }

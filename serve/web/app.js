@@ -237,10 +237,11 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, slots
       detail = `${fmt(slot.generated || 0)} tokens${slot.tok_s ? ` · ${fmt(slot.tok_s, 1)} tok/s` : ""}`;
     } else if (slotLast) {
       if (prog) delete prog.dataset.tone;
-      const tier = slotLast.cache_tier ? ` (${slotLast.cache_tier})` : "";
+      const tier = slotLast.cache_tier ? ` [${slotLast.cache_tier}]` : "";
       label = `Idle (Ready)${tier}`;
-      const dTok = slotLast.decode_tok_s ? ` at ${fmt(slotLast.decode_tok_s, 1)} tok/s` : "";
-      detail = `last: ${fmt(slotLast.output_tokens || 0)} tokens${dTok}`;
+      const dTok = slotLast.decode_tok_s ? ` · ${fmt(slotLast.decode_tok_s, 1)} tok/s` : "";
+      const pTok = slotLast.prefill_tok_s ? ` · prefill ${fmt(slotLast.prefill_tok_s)} t/s` : "";
+      detail = `last: ${fmt(slotLast.output_tokens || 0)} tokens${dTok}${pTok}`;
     } else {
       if (prog) delete prog.dataset.tone;
       label = "Idle (Ready for request)";
@@ -301,9 +302,10 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, slots
   for (let sId = 0; sId < 2; sId++) {
     const slot = slots.find(s => s.id === sId) || { id: sId, status: "idle", prompt_tokens: 0, generated: 0 };
     let sUsed = (slot.prompt_tokens || 0) + (slot.generated || 0);
-    // If idle and this slot has a recent request or last request
-    if (slot.status === "idle" && last && sId === 0 && live.state === "idle") {
-      sUsed = (last.prompt_tokens || 0) + (last.output_tokens || 0);
+    // If idle and this slot has a recorded last_request
+    if (slot.status === "idle") {
+      const sL = slot.last_request || (sId === 0 && live.state === "idle" ? last : null);
+      if (sL) sUsed = (sL.prompt_tokens || 0) + (sL.output_tokens || 0);
     }
     const sFrac = ctx ? Math.min(1, sUsed / ctx) : 0;
     const fillEl = $(`ctx-fill-${sId}`);
@@ -335,8 +337,11 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, slots
       } else if (slot.status === "reading") {
         const rate = slot.prefill_tok_s ? `<b>${fmt(slot.prefill_tok_s)}</b> t/s` : "prefill in progress";
         speedEl.innerHTML = `${rate} (${slot.cache_tier || "Fresh"})`;
-      } else if (slot.last_request && slot.last_request.decode_tok_s) {
-        speedEl.textContent = `last: ${slot.last_request.decode_tok_s} t/s`;
+      } else if (slot.last_request) {
+        const sL = slot.last_request;
+        const dStr = sL.decode_tok_s ? `${sL.decode_tok_s} t/s` : "done";
+        const pStr = sL.prefill_tok_s ? ` (prefill: ${sL.prefill_tok_s} t/s)` : ` (${sL.cache_tier || "Fresh"})`;
+        speedEl.textContent = `last: ${dStr}${pStr}`;
       } else if (sId === 0 && last && last.decode_tok_s) {
         speedEl.textContent = `last: ${last.decode_tok_s} t/s`;
       } else {
