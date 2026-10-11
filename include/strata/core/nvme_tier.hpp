@@ -107,6 +107,23 @@ struct AlignedBuffer {
 };
 
 /// Serialized RadixNode snapshot descriptor stored on NVMe L3.
+struct NVMeManifestHeader {
+    uint64_t magic = kNVMeMagic;
+    uint32_t version = kNVMeVersion;
+    uint32_t num_nodes = 0;
+    uint64_t max_node_id = 0;
+    char model_id_hash[64] = {0};
+};
+
+struct NVMeManifestNodeRecord {
+    int64_t node_id = 0;
+    int64_t parent_id = -1;
+    int64_t prefix_len = 0;
+    size_t l3_bytes = 0;
+    uint32_t n_edge_tokens = 0;
+    bool is_l3_offloaded = false;
+};
+
 struct NVMeNodeHeader {
     uint64_t magic = kNVMeMagic;
     uint32_t version = kNVMeVersion;

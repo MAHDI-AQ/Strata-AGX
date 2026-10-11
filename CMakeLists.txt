@@ -15,7 +15,7 @@ option(STRATA_BUILD_CONCURRENCY_TESTS "Build CPU-only request scheduling tests" 
 # asserts-liveness sentinel (tests/core/asserts_active_check.cpp). Default OFF: the shipping
 # Release class is unchanged.
 option(STRATA_ENABLE_ASSERTS "Keep runtime assert() active (strips -DNDEBUG from the Release-class flags)" OFF)
-set(STRATA_AGX_VERSION "0.1.40-agx.2.5.1")
+set(STRATA_AGX_VERSION "0.1.40-agx.2.5.2")
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
 add_compile_definitions(STRATA_AGX_VERSION="${STRATA_AGX_VERSION}")
 

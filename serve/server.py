@@ -49,7 +49,7 @@ from typing import Iterator, Protocol
 from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
-STRATA_AGX_VERSION = "0.1.40-agx.2.5.1"
+STRATA_AGX_VERSION = "0.1.40-agx.2.5.2"
 
 def get_git_commit() -> str:
     commit = os.environ.get("STRATA_COMMIT")
@@ -549,7 +549,7 @@ class StrataEngine:
                                 channel.get_nowait()
                             except queue.Empty:
                                 break
-                        channel.put_nowait("ERR client output queue exceeded 256 events")
+                        channel.put_nowait("ERR client output queue exceeded 65536 events")
                         overflow = True
             if overflow:
                 try:
@@ -734,7 +734,7 @@ class StrataEngine:
     def _generate_multiplex(self, ids, max_new, sampling, cancel, embeddings=None):
         self.last = {}
         self.progress = None
-        channel = queue.Queue(maxsize=256)
+        channel = queue.Queue(maxsize=65536)
         with self._channels_lock:
             self._request_number += 1
             number = self._request_number

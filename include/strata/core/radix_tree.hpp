@@ -288,6 +288,29 @@ public:
         return insert(tokens.data(), tokens.size(), prefix_len, stage_devices, states, R_ptrs, g, streams, safe_no_evict);
     }
 
+    std::shared_ptr<RadixNode> insert_direct_device_to_host(
+        const int32_t* tokens,
+        size_t n,
+        int64_t prefix_len,
+        const std::vector<int>& stage_devices,
+        const std::vector<const SessionState*>& states,
+        const std::vector<const float*>& R_ptrs,
+        const ModelGeometry& g,
+        const std::vector<void*>& streams,
+        bool safe_no_evict = false);
+
+    std::shared_ptr<RadixNode> insert_direct_device_to_host(
+        const std::vector<int32_t>& tokens,
+        int64_t prefix_len,
+        const std::vector<int>& stage_devices,
+        const std::vector<const SessionState*>& states,
+        const std::vector<const float*>& R_ptrs,
+        const ModelGeometry& g,
+        const std::vector<void*>& streams,
+        bool safe_no_evict = false) {
+        return insert_direct_device_to_host(tokens.data(), tokens.size(), prefix_len, stage_devices, states, R_ptrs, g, streams, safe_no_evict);
+    }
+
     void acquire(const std::shared_ptr<RadixNode>& node);
     void release(const std::shared_ptr<RadixNode>& node);
 
@@ -304,6 +327,8 @@ public:
     size_t evict_lru_locked(size_t max_snapshots, size_t min_free_vram_mib = 0);
 
     /// Dynamic KV Fragmentation Compaction (Task 9.3)
+        bool persist_manifest(const std::string& model_id_hash = "");
+    bool restore_manifest(const std::string& model_id_hash = "");
     CompactionStats compact_tree();
 
     void set_nvme_tier(std::shared_ptr<class NVMeStorageTier> nvme) { nvme_tier_ = nvme; }
@@ -318,6 +343,7 @@ public:
     size_t cached_host_snapshot_count() const { return cached_host_snapshots_; }
     size_t cached_nvme_snapshot_count() const { return cached_nvme_snapshots_; }
     size_t total_nodes() const { return node_count_; }
+    size_t host_snapshot_bytes() const;
 
 private:
     mutable std::shared_mutex rw_lock_;
@@ -325,6 +351,8 @@ private:
     std::shared_ptr<class NVMeStorageTier> nvme_tier_;
     size_t max_cached_snapshots_ = 4;
     size_t max_host_snapshots_ = 64;
+    size_t host_ram_budget_ = (size_t) 32ULL << 30;   // 32 GiB calibrated L2 Host-RAM cache ceiling   // 16 GiB safety ceiling for Host RAM snapshots
+    size_t host_snapshot_bytes_locked() const;
     size_t cached_snapshots_ = 0;
     size_t cached_host_snapshots_ = 0;
     size_t cached_nvme_snapshots_ = 0;
@@ -340,6 +368,10 @@ private:
     void collect_unreferenced_leaves(
         const std::shared_ptr<RadixNode>& curr,
         std::vector<std::shared_ptr<RadixNode>>& leaves);
+
+    void collect_unreferenced_host_nodes(
+        const std::shared_ptr<RadixNode>& curr,
+        std::vector<std::shared_ptr<RadixNode>>& nodes);
 };
 
 }  // namespace strata::core

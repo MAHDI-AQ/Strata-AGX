@@ -464,6 +464,10 @@ RadixTree::RadixTree(size_t max_cached_snapshots, size_t max_host_snapshots)
     if (env_l2) {
         max_host_snapshots_ = (size_t) std::strtoul(env_l2, nullptr, 10);
     }
+    const char* env_hg = std::getenv("STRATA_RADIX_HOST_GIB");
+    if (env_hg && *env_hg) {
+        host_ram_budget_ = (size_t) std::strtoul(env_hg, nullptr, 10) << 30;
+    }
     const char* env_vb = std::getenv("STRATA_RADIX_VRAM_MIB");
     if (env_vb && *env_vb) {
         vram_budget_ = (size_t) std::strtoul(env_vb, nullptr, 10) << 20;
@@ -505,6 +509,27 @@ size_t RadixTree::device_snapshot_bytes_locked() const {
 size_t RadixTree::device_snapshot_bytes() const {
     std::shared_lock<std::shared_mutex> lock(rw_lock_);
     return device_snapshot_bytes_locked();
+}
+
+size_t RadixTree::host_snapshot_bytes_locked() const {
+    size_t total = 0;
+    std::vector<std::shared_ptr<RadixNode>> stack;
+    stack.push_back(root_);
+    while (!stack.empty()) {
+        auto node = stack.back();
+        stack.pop_back();
+        if (!node) continue;
+        if (node->has_host_snapshot()) {
+            total += node->total_host_bytes();
+        }
+        for (auto& kv : node->children) stack.push_back(kv.second);
+    }
+    return total;
+}
+
+size_t RadixTree::host_snapshot_bytes() const {
+    std::shared_lock<std::shared_mutex> lock(rw_lock_);
+    return host_snapshot_bytes_locked();
 }
 
 // S26f: evict (LRU, parking to host first) until the budget can hold `need_bytes`.
@@ -564,11 +589,16 @@ RadixMatch RadixTree::match_prefix(const int32_t* tokens, size_t n) const {
                 best = RadixMatch{curr, (int64_t) matched_len};
             }
         } else {
-            // P18: a query that ends INSIDE an edge is NOT fork-usable: the hit node's captured
-            // state covers its full range (past the query end), so reuse would stamp a
-            // post-capture state onto a shallower context (the resume-shape class).  The
-            // full-edge arrivals and the prompt-end (L1) nodes carry every sound lane; record
-            // nothing here (the unusable deeper hit would shadow the valid shallower node).
+            // Mandate 4: PQP-TR Partial Prefix Retrieval
+            // If the query diverges mid-edge (0 < match_edge < edge.size()) and child has a snapshot,
+            // truncate partial edge hits to 64-token page boundaries: M_safe = ((matched_len + match_edge) / 64) * 64.
+            if (child->has_snapshot() && match_edge > 0) {
+                const int64_t total_matched = (int64_t) (matched_len + match_edge);
+                const int64_t M_safe = (total_matched / 64) * 64;
+                if (M_safe >= 256 && (int64_t) n - 1 >= M_safe && M_safe > best.matched_tokens) {
+                    best = RadixMatch{child, M_safe};
+                }
+            }
             break;
         }
     }
@@ -624,11 +654,16 @@ RadixMatch RadixTree::match_prefix(const int64_t* tokens, size_t n) const {
                 best = RadixMatch{curr, (int64_t) matched_len};
             }
         } else {
-            // P18: a query that ends INSIDE an edge is NOT fork-usable: the hit node's captured
-            // state covers its full range (past the query end), so reuse would stamp a
-            // post-capture state onto a shallower context (the resume-shape class).  The
-            // full-edge arrivals and the prompt-end (L1) nodes carry every sound lane; record
-            // nothing here (the unusable deeper hit would shadow the valid shallower node).
+            // Mandate 4: PQP-TR Partial Prefix Retrieval
+            // If the query diverges mid-edge (0 < match_edge < edge.size()) and child has a snapshot,
+            // truncate partial edge hits to 64-token page boundaries: M_safe = ((matched_len + match_edge) / 64) * 64.
+            if (child->has_snapshot() && match_edge > 0) {
+                const int64_t total_matched = (int64_t) (matched_len + match_edge);
+                const int64_t M_safe = (total_matched / 64) * 64;
+                if (M_safe >= 256 && (int64_t) n - 1 >= M_safe && M_safe > best.matched_tokens) {
+                    best = RadixMatch{child, M_safe};
+                }
+            }
             break;
         }
     }
@@ -971,13 +1006,9 @@ bool RadixTree::fork_to_session(
         }
     }
 
-    if (node->has_host_snapshot() && !node->has_device_snapshot()) {
-        node->unpark_to_device();   // P18/P20: an L2-host-parked node restores before the fork
-        if (!node->has_device_snapshot()) {
-            err = "radix_fork: failed to restore host snapshot to device VRAM";
-            return false;
-        }
-    }
+    // Mandate 3: Direct Host-to-Session DMA Fork (Zero-VRAM Restore)
+    // Eliminate intermediate node->unpark_to_device() allocations!
+    // Directly stream from Host PinnedBuffer to child_states over PCIe Gen 4 x16 streams.
 
     const size_t n_stages = stage_devices.size();
     strata::kernels::QsaShapes qs = strata::kernels::qsa_real_shapes();
@@ -1139,6 +1170,20 @@ void RadixTree::collect_unreferenced_leaves(
     }
 }
 
+void RadixTree::collect_unreferenced_host_nodes(
+    const std::shared_ptr<RadixNode>& curr,
+    std::vector<std::shared_ptr<RadixNode>>& nodes) {
+    if (!curr) return;
+    // Decoupled Payload Eviction: Any node (leaf or interior) holding a host snapshot
+    // with ref_count == 0 is eligible for snapshot offload/free without deleting the tree edge.
+    if (curr != root_ && curr->ref_count == 0 && curr->has_host_snapshot()) {
+        nodes.push_back(curr);
+    }
+    for (const auto& kv : curr->children) {
+        collect_unreferenced_host_nodes(kv.second, nodes);
+    }
+}
+
 size_t RadixTree::evict_lru(size_t max_snapshots, size_t min_free_vram_mib) {
     std::unique_lock<std::shared_mutex> lock(rw_lock_);
     return evict_lru_locked(max_snapshots, min_free_vram_mib);
@@ -1183,23 +1228,24 @@ size_t RadixTree::evict_lru_locked(size_t max_snapshots, size_t min_free_vram_mi
         ++evicted;
     }
 
-    // Tier 2: Prune host snapshots when exceeding max_host_snapshots_
-    while (cached_host_snapshots_ > max_host_snapshots_) {
-        std::vector<std::shared_ptr<RadixNode>> leaves;
-        collect_unreferenced_leaves(root_, leaves);
-        if (leaves.empty()) break;
+    // Tier 2: Prune host snapshots when exceeding max_host_snapshots_ or host_ram_budget_
+    // Using Decoupled Payload Eviction: Can evict host snapshots from cold interior nodes
+    // while keeping routing metadata (edge_tokens, child pointers) intact.
+    auto should_evict_host = [&]() -> bool {
+        if (cached_host_snapshots_ > max_host_snapshots_) return true;
+        if (host_ram_budget_ > 0 && host_snapshot_bytes_locked() > host_ram_budget_) return true;
+        return false;
+    };
+    while (cached_host_snapshots_ > 0 && should_evict_host()) {
+        std::vector<std::shared_ptr<RadixNode>> host_nodes;
+        collect_unreferenced_host_nodes(root_, host_nodes);
+        if (host_nodes.empty()) break;
 
-        std::sort(leaves.begin(), leaves.end(), [](const auto& a, const auto& b) {
+        std::sort(host_nodes.begin(), host_nodes.end(), [](const auto& a, const auto& b) {
             return a->last_accessed < b->last_accessed;
         });
 
-        std::shared_ptr<RadixNode> host_victim = nullptr;
-        for (const auto& leaf : leaves) {
-            if (leaf->has_host_snapshot()) {
-                host_victim = leaf;
-                break;
-            }
-        }
+        std::shared_ptr<RadixNode> host_victim = host_nodes.front();
         if (!host_victim) break;
 
         if (nvme_tier_ && host_victim->has_host_snapshot()) {
@@ -1213,6 +1259,7 @@ size_t RadixTree::evict_lru_locked(size_t max_snapshots, size_t min_free_vram_mi
         }
         if (cached_host_snapshots_ > 0) --cached_host_snapshots_;
 
+        // Only prune topological edge if it has zero children, zero ref_count, and no snapshots
         if (host_victim->children.empty() && host_victim->ref_count == 0 && !host_victim->has_snapshot()) {
             if (auto p = host_victim->parent.lock()) {
                 if (!host_victim->edge_tokens.empty()) {
@@ -1334,6 +1381,381 @@ CompactionStats RadixCompactor::compact(RadixTree* tree) {
     total_chains_merged_ += stats.chains_merged;
     total_bytes_reclaimed_ += stats.bytes_reclaimed;
     return stats;
+}
+
+
+std::shared_ptr<RadixNode> RadixTree::insert_direct_device_to_host(
+    const int32_t* tokens,
+    size_t n,
+    int64_t prefix_len,
+    const std::vector<int>& stage_devices,
+    const std::vector<const SessionState*>& states,
+    const std::vector<const float*>& R_ptrs,
+    const ModelGeometry& g,
+    const std::vector<void*>& streams,
+    bool safe_no_evict) {
+
+    if (prefix_len < 256 || (size_t) prefix_len > n ||
+        states.size() != stage_devices.size() || streams.size() != stage_devices.size()) {
+        return nullptr;
+    }
+
+    std::unique_lock<std::shared_mutex> lock(rw_lock_);
+    std::shared_ptr<RadixNode> curr = root_;
+    size_t matched_len = 0;
+
+    while (matched_len < (size_t) prefix_len) {
+        const int32_t next_tok = tokens[matched_len];
+        auto it = curr->children.find(next_tok);
+        if (it == curr->children.end()) {
+            auto new_node = std::make_shared<RadixNode>();
+            new_node->id = next_node_id_++;
+            new_node->prefix_len = (int64_t) prefix_len;
+            new_node->edge_tokens.assign(tokens + matched_len, tokens + prefix_len);
+            new_node->update_chunk_hashes();
+            new_node->parent = curr;
+            new_node->last_accessed = std::chrono::steady_clock::now();
+            curr->children[next_tok] = new_node;
+            ++node_count_;
+            curr = new_node;
+            matched_len = (size_t) prefix_len;
+            break;
+        }
+
+        auto child = it->second;
+        const auto& edge = child->edge_tokens;
+        size_t match_edge = 0;
+        const size_t max_comp = std::min(edge.size(), (size_t) prefix_len - matched_len);
+        while (match_edge < max_comp && edge[match_edge] == tokens[matched_len + match_edge]) {
+            ++match_edge;
+        }
+
+        if (match_edge == edge.size()) {
+            matched_len += edge.size();
+            curr = child;
+        } else {
+            auto split_node = std::make_shared<RadixNode>();
+            split_node->id = next_node_id_++;
+            split_node->prefix_len = curr->prefix_len + (int64_t) match_edge;
+            split_node->edge_tokens.assign(edge.begin(), edge.begin() + match_edge);
+            split_node->update_chunk_hashes();
+            split_node->parent = curr;
+            split_node->last_accessed = std::chrono::steady_clock::now();
+
+            child->edge_tokens.erase(child->edge_tokens.begin(), child->edge_tokens.begin() + match_edge);
+            child->update_chunk_hashes();
+            child->parent = split_node;
+            split_node->children[child->edge_tokens[0]] = child;
+
+            curr->children[next_tok] = split_node;
+            ++node_count_;
+
+            matched_len += match_edge;
+
+            if (matched_len == (size_t) prefix_len) {
+                curr = split_node;
+            } else {
+                auto new_node = std::make_shared<RadixNode>();
+                new_node->id = next_node_id_++;
+                new_node->prefix_len = (int64_t) prefix_len;
+                new_node->edge_tokens.assign(tokens + matched_len, tokens + prefix_len);
+                new_node->update_chunk_hashes();
+                new_node->parent = split_node;
+                new_node->last_accessed = std::chrono::steady_clock::now();
+                split_node->children[tokens[matched_len]] = new_node;
+                ++node_count_;
+                curr = new_node;
+                matched_len = (size_t) prefix_len;
+            }
+            break;
+        }
+    }
+
+    curr->last_accessed = std::chrono::steady_clock::now();
+
+    // Mandate 1 & 2: Direct-to-Host DMA Capture with Zero Persistent VRAM Allocation
+    if (max_host_snapshots_ == 0) {
+        return curr;
+    }
+
+    if (!curr->has_snapshot()) {
+        const size_t n_stages = stage_devices.size();
+        curr->stage_host_snapshots.resize(n_stages);
+
+        strata::kernels::QsaShapes qs = strata::kernels::qsa_real_shapes();
+        qs.n_head = g.n_head;
+        qs.n_head_kv = g.n_head_kv;
+        qs.head_dim = g.head_dim;
+        qs.idx_n_head = g.idx_q_heads;
+        qs.idx_dim = g.idx_key_dim;
+
+        const int64_t pages = (prefix_len + qs.page_size - 1) / qs.page_size;
+        const size_t qsa_rows = (size_t) pages * qs.n_head_kv * qs.page_size;
+
+        for (size_t st = 0; st < n_stages; ++st) {
+            auto& hss = curr->stage_host_snapshots[st];
+            hss.device = stage_devices[st];
+            const core::OnDevice on(hss.device);
+            cudaStream_t cs = (cudaStream_t) streams[st];
+            const auto* s = states[st];
+
+            if (s->gdn_alloc > 0 && s->gdn_state) {
+                const size_t gdn_bytes = (size_t) s->gdn_alloc * core::gdn_state_floats(g) * sizeof(float);
+                hss.gdn_data.resize(gdn_bytes);
+                cudaMemcpyAsync(hss.gdn_data.data(), s->gdn_state, gdn_bytes, cudaMemcpyDeviceToHost, cs);
+            }
+
+            if (s->ple_hist) {
+                const size_t ple_bytes = (size_t) core::ple_hist_bytes();
+                hss.ple_data.resize(ple_bytes);
+                cudaMemcpyAsync(hss.ple_data.data(), s->ple_hist, ple_bytes, cudaMemcpyDeviceToHost, cs);
+                hss.ple_prev_saved[0] = s->ple_prev[0];
+                hss.ple_prev_saved[1] = s->ple_prev[1];
+                hss.ple_token_saved = s->ple_token;
+            }
+
+            const float* src_R = R_ptrs[st] ? R_ptrs[st] : s->block.R;
+            if (src_R) {
+                const size_t R_bytes = (size_t) g.hc * g.n_embd * sizeof(float);
+                hss.R_data.resize(R_bytes);
+                cudaMemcpyAsync(hss.R_data.data(), src_R, R_bytes, cudaMemcpyDeviceToHost, cs);
+            }
+
+            hss.qsa_ord0 = s->qsa_ord0;
+            hss.qsa_alloc = s->qsa_alloc;
+            hss.qsa_slices.resize(s->qsa_alloc);
+
+            for (int64_t j = 0; j < s->qsa_alloc; ++j) {
+                const QsaState& qst = s->qsa_states[s->qsa_ord0 + j];
+                auto& slice = hss.qsa_slices[j];
+
+                if (qst.kv_q4) {
+                    const size_t k_bytes = qsa_rows * strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
+                    const size_t v_bytes = k_bytes;
+                    if (qst.k_q4) {
+                        slice.k_q.resize(k_bytes);
+                        cudaMemcpyAsync(slice.k_q.data(), qst.k_q4, k_bytes, cudaMemcpyDeviceToHost, cs);
+                    }
+                    if (qst.v_q4) {
+                        slice.v_q4.resize(v_bytes);
+                        cudaMemcpyAsync(slice.v_q4.data(), qst.v_q4, v_bytes, cudaMemcpyDeviceToHost, cs);
+                    }
+                } else if (qst.kv_hybrid) {
+                    const size_t k_bytes = qsa_rows * qs.head_dim;
+                    const size_t sc_bytes = qsa_rows * (qs.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
+                    const size_t v_bytes = qsa_rows * strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
+                    if (qst.k_q) {
+                        slice.k_q.resize(k_bytes);
+                        cudaMemcpyAsync(slice.k_q.data(), qst.k_q, k_bytes, cudaMemcpyDeviceToHost, cs);
+                    }
+                    if (qst.k_scale) {
+                        slice.k_scale.resize(sc_bytes);
+                        cudaMemcpyAsync(slice.k_scale.data(), qst.k_scale, sc_bytes, cudaMemcpyDeviceToHost, cs);
+                    }
+                    if (qst.v_q4) {
+                        slice.v_q4.resize(v_bytes);
+                        cudaMemcpyAsync(slice.v_q4.data(), qst.v_q4, v_bytes, cudaMemcpyDeviceToHost, cs);
+                    }
+                } else if (qst.kv_int8) {
+                    const size_t k_bytes = qsa_rows * qs.head_dim;
+                    const size_t sc_bytes = qsa_rows * (qs.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
+                    if (qst.k_q) {
+                        slice.k_q.resize(k_bytes);
+                        cudaMemcpyAsync(slice.k_q.data(), qst.k_q, k_bytes, cudaMemcpyDeviceToHost, cs);
+                    }
+                    if (qst.v_q) {
+                        slice.v_q4.resize(k_bytes);
+                        cudaMemcpyAsync(slice.v_q4.data(), qst.v_q, k_bytes, cudaMemcpyDeviceToHost, cs);
+                    }
+                    if (qst.k_scale) {
+                        slice.k_scale.resize(sc_bytes);
+                        cudaMemcpyAsync(slice.k_scale.data(), qst.k_scale, sc_bytes, cudaMemcpyDeviceToHost, cs);
+                    }
+                    if (qst.v_scale) {
+                        slice.v_scale.resize(sc_bytes);
+                        cudaMemcpyAsync(slice.v_scale.data(), qst.v_scale, sc_bytes, cudaMemcpyDeviceToHost, cs);
+                    }
+                }
+
+                const size_t idx_tail_bytes = (size_t) (qs.idx_block - 1) * qs.idx_dim * sizeof(float);
+                const size_t idx_dead_bytes = (size_t) qs.idx_dim * sizeof(float);
+                if (qst.idx_tail) {
+                    slice.idx_tail.resize(idx_tail_bytes);
+                    cudaMemcpyAsync(slice.idx_tail.data(), qst.idx_tail, idx_tail_bytes, cudaMemcpyDeviceToHost, cs);
+                }
+                if (qst.idx_dead) {
+                    slice.idx_dead.resize(idx_dead_bytes);
+                    cudaMemcpyAsync(slice.idx_dead.data(), qst.idx_dead, idx_dead_bytes, cudaMemcpyDeviceToHost, cs);
+                }
+                if (qst.idx_block_pos) {
+                    slice.has_idx_block_pos = true;
+                    cudaMemcpyAsync(&slice.idx_block_pos_val, qst.idx_block_pos, sizeof(int32_t), cudaMemcpyDeviceToHost, cs);
+                }
+                const int64_t pooled_rows = prefix_len / qs.idx_block;
+                if (pooled_rows > 0 && qst.idx_pooled) {
+                    const size_t idx_pooled_bytes = (size_t) (pooled_rows + 1) * qs.idx_dim * sizeof(float);
+                    slice.idx_pooled.resize(idx_pooled_bytes);
+                    cudaMemcpyAsync(slice.idx_pooled.data(), qst.idx_pooled, (size_t) pooled_rows * qs.idx_dim * sizeof(float), cudaMemcpyDeviceToHost, cs);
+                    cudaMemcpyAsync((char*) slice.idx_pooled.data() + pooled_rows * qs.idx_dim * sizeof(float),
+                                    qst.idx_dead, idx_dead_bytes, cudaMemcpyDeviceToHost, cs);
+                }
+            }
+        }
+        for (size_t st = 0; st < n_stages; ++st) {
+            const core::OnDevice on(stage_devices[st]);
+            cudaStreamSynchronize((cudaStream_t) streams[st]);
+        }
+
+        bool snap_ok = true;
+        for (size_t st = 0; st < n_stages && snap_ok; ++st) {
+            auto& hss = curr->stage_host_snapshots[st];
+            const auto* s = states[st];
+            if (!s) continue;
+            if (s->gdn_alloc > 0 && s->gdn_state && hss.gdn_data.empty()) snap_ok = false;
+            if (s->ple_hist && hss.ple_data.empty()) snap_ok = false;
+            for (int64_t j = 0; j < s->qsa_alloc && snap_ok; ++j) {
+                const QsaState& qst = s->qsa_states[s->qsa_ord0 + j];
+                auto& sl = hss.qsa_slices[j];
+                if ((qst.k_q4 || qst.k_q) && sl.k_q.empty()) snap_ok = false;
+                if ((qst.v_q4 || qst.v_q) && sl.v_q4.empty()) snap_ok = false;
+            }
+        }
+        if (!snap_ok) {
+            for (auto& hss2 : curr->stage_host_snapshots) {
+                hss2.gdn_data.free();
+                hss2.ple_data.free();
+                hss2.R_data.free();
+                hss2.qsa_slices.clear();
+            }
+            curr->stage_host_snapshots.clear();
+            return curr;
+        }
+
+        curr->is_host_parked = true;
+        ++cached_host_snapshots_;
+        evict_lru_locked(max_cached_snapshots_);
+    }
+    return curr;
+}
+
+}  // namespace strata::core
+
+
+namespace strata::core {
+
+bool RadixTree::persist_manifest(const std::string& model_id_hash) {
+    std::shared_lock<std::shared_mutex> lock(rw_lock_);
+    if (!nvme_tier_) return false;
+
+    std::string manifest_path = nvme_tier_->base_path() + "/radix_manifest.bin";
+    std::ofstream ofs(manifest_path, std::ios::binary);
+    if (!ofs.is_open()) return false;
+
+    std::vector<std::shared_ptr<RadixNode>> all_nodes;
+    std::vector<std::shared_ptr<RadixNode>> stack;
+    stack.push_back(root_);
+    while (!stack.empty()) {
+        auto node = stack.back();
+        stack.pop_back();
+        if (!node) continue;
+        if (node != root_) all_nodes.push_back(node);
+        for (const auto& kv : node->children) {
+            stack.push_back(kv.second);
+        }
+    }
+
+    NVMeManifestHeader hdr;
+    hdr.magic = kNVMeMagic;
+    hdr.version = kNVMeVersion;
+    hdr.num_nodes = static_cast<uint32_t>(all_nodes.size());
+    hdr.max_node_id = next_node_id_;
+    if (!model_id_hash.empty()) {
+        std::strncpy(hdr.model_id_hash, model_id_hash.c_str(), sizeof(hdr.model_id_hash) - 1);
+    }
+    ofs.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
+
+    for (const auto& node : all_nodes) {
+        NVMeManifestNodeRecord rec;
+        rec.node_id = node->id;
+        if (auto p = node->parent.lock()) {
+            rec.parent_id = p->id;
+        } else {
+            rec.parent_id = 0;
+        }
+        rec.prefix_len = node->prefix_len;
+        rec.l3_bytes = node->l3_bytes;
+        rec.n_edge_tokens = static_cast<uint32_t>(node->edge_tokens.size());
+        rec.is_l3_offloaded = node->is_l3_offloaded;
+
+        ofs.write(reinterpret_cast<const char*>(&rec), sizeof(rec));
+        if (rec.n_edge_tokens > 0) {
+            ofs.write(reinterpret_cast<const char*>(node->edge_tokens.data()),
+                      rec.n_edge_tokens * sizeof(int32_t));
+        }
+    }
+    ofs.flush();
+    return true;
+}
+
+bool RadixTree::restore_manifest(const std::string& model_id_hash) {
+    std::unique_lock<std::shared_mutex> lock(rw_lock_);
+    if (!nvme_tier_) return false;
+
+    std::string manifest_path = nvme_tier_->base_path() + "/radix_manifest.bin";
+    std::ifstream ifs(manifest_path, std::ios::binary);
+    if (!ifs.is_open()) return false;
+
+    NVMeManifestHeader hdr;
+    ifs.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
+    if (!ifs.good()) return false;
+    if (hdr.magic != kNVMeMagic || hdr.version != kNVMeVersion) {
+        return false;
+    }
+    if (!model_id_hash.empty() && std::strncmp(hdr.model_id_hash, model_id_hash.c_str(), sizeof(hdr.model_id_hash) - 1) != 0) {
+        // Model hash mismatch: invalidate manifest
+        return false;
+    }
+
+    std::unordered_map<int64_t, std::shared_ptr<RadixNode>> id_to_node;
+    id_to_node[0] = root_;
+    size_t restored_l3_count = 0;
+
+    for (uint32_t i = 0; i < hdr.num_nodes; ++i) {
+        NVMeManifestNodeRecord rec;
+        ifs.read(reinterpret_cast<char*>(&rec), sizeof(rec));
+        if (!ifs.good()) break;
+
+        auto node = std::make_shared<RadixNode>();
+        node->id = rec.node_id;
+        node->prefix_len = rec.prefix_len;
+        node->l3_bytes = rec.l3_bytes;
+        node->is_l3_offloaded = rec.is_l3_offloaded;
+        node->last_accessed = std::chrono::steady_clock::now();
+
+        if (rec.n_edge_tokens > 0) {
+            node->edge_tokens.resize(rec.n_edge_tokens);
+            ifs.read(reinterpret_cast<char*>(node->edge_tokens.data()),
+                     rec.n_edge_tokens * sizeof(int32_t));
+            node->update_chunk_hashes();
+        }
+
+        id_to_node[rec.node_id] = node;
+        auto parent_it = id_to_node.find(rec.parent_id);
+        if (parent_it != id_to_node.end()) {
+            node->parent = parent_it->second;
+            if (!node->edge_tokens.empty()) {
+                parent_it->second->children[node->edge_tokens[0]] = node;
+            }
+        }
+        if (node->is_l3_offloaded) {
+            ++restored_l3_count;
+        }
+    }
+
+    next_node_id_ = std::max<int64_t>(next_node_id_, hdr.max_node_id);
+    cached_nvme_snapshots_ = restored_l3_count;
+    node_count_ = id_to_node.size();
+    return true;
 }
 
 }  // namespace strata::core

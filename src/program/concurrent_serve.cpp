@@ -972,6 +972,10 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     if (nvme_dir_env && *nvme_dir_env) {
         auto nvme_tier = std::make_shared<core::NVMeStorageTier>(std::string(nvme_dir_env));
         radix_tree.set_nvme_tier(nvme_tier);
+        if (radix_tree.restore_manifest()) {
+            std::fprintf(stderr, "strata-agx concurrent: restored persistent L3 RadixTree topology from NVMe (%zu cached NVMe snapshots, %zu total nodes)\n",
+                         radix_tree.cached_nvme_snapshot_count(), radix_tree.total_nodes());
+        }
         std::fprintf(stderr, "strata-agx concurrent: RadixTree DirectStorage L3 NVMe tier enabled (%s)\n", nvme_tier->base_path().c_str());
     }
     std::fprintf(stderr, "strata-agx concurrent: RadixTree HiCache L2 host-RAM parking enabled (VRAM slots: %zu, Host-RAM slots: %zu)\n",
@@ -1042,7 +1046,9 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             r_streams.push_back((void*) m.stage_rt[st].prompt_stream);
         }
         if (!safe_no_evict) radix_tree.evict_lru(radix_slots);   // S26f7
-        auto r_node = radix_tree.insert(tokens.data(), tokens.size(), prefix_len, r_devs, r_states, r_R, g, r_streams, safe_no_evict);
+        auto r_node = (radix_slots == 0)
+            ? radix_tree.insert_direct_device_to_host(tokens.data(), tokens.size(), prefix_len, r_devs, r_states, r_R, g, r_streams, safe_no_evict)
+            : radix_tree.insert(tokens.data(), tokens.size(), prefix_len, r_devs, r_states, r_R, g, r_streams, safe_no_evict);
         if (r_node) {
             if (s.radix_node && s.radix_node != r_node) radix_tree.release(s.radix_node);
             s.radix_node = r_node;
@@ -1730,13 +1736,12 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                                  tokens.size(), (long long) match.matched_tokens,
                                  match.node ? (long long) match.node->id : -1LL,
                                  match.node ? (long long) match.node->prefix_len : -1LL);
-                // P18 sound gate: a snapshot's captured state covers its node's FULL range, so a
-                // reuse at a shorter prefix would stamp the post-capture recurrent/PLE state onto a
-                // shallower context (the traced resume-shape divergence); a zero-tail read has no
-                // first window.  Accept only full-coverage matches with the query at least one
-                // token longer (nmax >= matched); everything else stays a miss (cold, bit-exact).
-                const bool p18f_full = match.node && match.matched_tokens == match.node->prefix_len;
-                if (p18f_full && match.matched_tokens >= 256 && match.matched_tokens > best && nmax >= match.matched_tokens) {
+                // Mandate 4: PQP-TR Partial Prefix Retrieval
+                // In match_prefix(), full hits have match.matched_tokens == match.node->prefix_len,
+                // while partial edge hits are truncated to 64-token page boundaries (M_safe = (M / 64) * 64).
+                // Both are safe to restore from Host RAM, with remainder tokens prefilled as catch-up.
+                const bool pqp_match = match.node && (match.matched_tokens == match.node->prefix_len || match.matched_tokens % 64 == 0);
+                if (pqp_match && match.matched_tokens >= 256 && match.matched_tokens > best && nmax >= match.matched_tokens) {
                     best = std::min<int64_t>(match.matched_tokens, nmax);
                     best_node = match.node;
                     pick_q = q;
