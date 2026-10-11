@@ -237,7 +237,7 @@ bool RadixNode::offload_to_nvme(NVMeStorageTier& nvme) {
     hdr.n_edge_tokens = static_cast<uint32_t>(edge_tokens.size());
     hdr.n_stages = static_cast<uint32_t>(stage_host_snapshots.size());
     hdr.total_payload_bytes = total_payload;
-    hdr.checksum = 0;
+    hdr.checksum = 0xFFFFFFFF53545241ULL; // Task 2.3: Seeded CRC32C
 
     std::memcpy(p + offset, &hdr, sizeof(hdr));
     offset += sizeof(hdr);
@@ -323,6 +323,22 @@ bool RadixNode::offload_to_nvme(NVMeStorageTier& nvme) {
         }
     }
 
+    // Task 2.3: Compute hardware SSE4.2 CRC32C over serialized payload
+    uint64_t crc = 0xFFFFFFFF53545241ULL;
+    const uint8_t* payload_bytes = buffer.data() + sizeof(NVMeNodeHeader);
+    const size_t crc_len = total_payload - sizeof(NVMeNodeHeader);
+    const size_t qwords = crc_len / 8;
+    const uint64_t* qp = reinterpret_cast<const uint64_t*>(payload_bytes);
+    for (size_t qi = 0; qi < qwords; ++qi) {
+#if defined(__SSE4_2__)
+        crc = _mm_crc32_u64(crc, qp[qi]);
+#else
+        crc = (crc ^ qp[qi]) * 1099511628211ULL;
+#endif
+    }
+    // Update header checksum in buffer
+    reinterpret_cast<NVMeNodeHeader*>(buffer.data())->checksum = crc;
+
     if (!nvme.write_node_direct(id, buffer.data(), total_payload)) {
         return false;
     }
@@ -352,6 +368,26 @@ bool RadixNode::hydrate_from_nvme(NVMeStorageTier& nvme) {
 
     if (hdr.magic != kNVMeMagic || hdr.version != kNVMeVersion || hdr.node_id != id) {
         return false;
+    }
+    // Task 2.3: Hardware SSE4.2 CRC32C Validation
+    if (hdr.checksum != 0) {
+        uint64_t crc = 0xFFFFFFFF53545241ULL;
+        const uint8_t* payload_bytes = buffer.data() + sizeof(NVMeNodeHeader);
+        const size_t crc_len = l3_bytes - sizeof(NVMeNodeHeader);
+        const size_t qwords = crc_len / 8;
+        const uint64_t* qp = reinterpret_cast<const uint64_t*>(payload_bytes);
+        for (size_t qi = 0; qi < qwords; ++qi) {
+#if defined(__SSE4_2__)
+            crc = _mm_crc32_u64(crc, qp[qi]);
+#else
+            crc = (crc ^ qp[qi]) * 1099511628211ULL;
+#endif
+        }
+        if (crc != hdr.checksum) {
+            std::fprintf(stderr, "strata-agx radix: CRC32C mismatch on NVMe node #%lld (got %llx, expected %llx)\n",
+                         (long long) id, (unsigned long long) crc, (unsigned long long) hdr.checksum);
+            return false;
+        }
     }
 
     if (hdr.n_edge_tokens > 0) {
@@ -1161,7 +1197,12 @@ void RadixTree::collect_unreferenced_leaves(
     const std::shared_ptr<RadixNode>& curr,
     std::vector<std::shared_ptr<RadixNode>>& leaves) {
     if (!curr) return;
-    if (curr != root_ && curr->ref_count == 0 && curr->children.empty()) {
+    // Task 2.1: Decoupled Interior VRAM Eviction:
+    // Any node with ref_count == 0 holding a device snapshot is evictable to L2 Host RAM,
+    // even if it has active child branches!
+    if (curr != root_ && curr->ref_count == 0 && curr->has_device_snapshot()) {
+        leaves.push_back(curr);
+    } else if (curr != root_ && curr->ref_count == 0 && curr->children.empty()) {
         leaves.push_back(curr);
         return;
     }
@@ -1329,9 +1370,10 @@ CompactionStats RadixTree::compact_tree() {
         for (auto& kv : curr->children) {
             compress_paths(kv.second);
         }
+        // Task 2.2: Assert child->ref_count == 0 before collapsing single-child path!
         if (curr != root_ && curr->ref_count == 0 && !curr->has_snapshot() && curr->children.size() == 1) {
             auto child = curr->children.begin()->second;
-            if (child) {
+            if (child && child->ref_count == 0) {
                 curr->edge_tokens.insert(curr->edge_tokens.end(), child->edge_tokens.begin(), child->edge_tokens.end());
                 curr->update_chunk_hashes();
                 curr->children = std::move(child->children);

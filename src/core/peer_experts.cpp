@@ -254,7 +254,15 @@ bool PeerExperts::finish(float* out, std::string& err) {
         On on(device_);
         // spin on the stream (a blocking sync would sleep the pool thread and wake it late)
         cudaError_t e;
+        int spin_count = 0;
         while ((e = cudaStreamQuery(stream_)) == cudaErrorNotReady) {
+#if defined(__x86_64__) || defined(_M_X64)
+            __builtin_ia32_pause();
+#endif
+            if (++spin_count > 10000000) { // ~2000ms deadline watchdog
+                std::fprintf(stderr, "strata-agx peer_experts: cudaStreamQuery timeout (>2000ms), breaking busy-spin\n");
+                break;
+            }
         }
         if (!ck(e, "finish", err)) return false;
     }

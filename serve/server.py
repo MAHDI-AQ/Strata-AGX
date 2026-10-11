@@ -49,7 +49,7 @@ from typing import Iterator, Protocol
 from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
-STRATA_AGX_VERSION = "0.1.40-agx.2.5.3"
+STRATA_AGX_VERSION = "0.1.40-agx.2.6.0"
 
 def get_git_commit() -> str:
     commit = os.environ.get("STRATA_COMMIT")
@@ -2414,7 +2414,7 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
     mid = "msg_" + uuid.uuid4().hex[:24]
     yield "message_start", {"type": "message_start", "message": {
         "id": mid, "type": "message", "role": "assistant", "model": svc.model_for(req), "content": [],
-        "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": len(ids), "output_tokens": 0}}}
+        "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": len(ids), "output_tokens": 0, "cache_read_input_tokens": getattr(slot, "reused", 0)}}}
     index, open_kind, used_tool = -1, None, False
 
     def close():

@@ -81,7 +81,14 @@ int SuffixDrafter::propose(int max_k, int32_t* out) {
     last_match_ = best_len;
     int k = 0;
     // The continuation may run into the current suffix (periodic text); reading history up to `cur` is valid.
-    for (size_t q = best_end + 1; q <= cur && k < max_k; ++q) out[k++] = hist_[q];
+    for (size_t q = best_end + 1; q <= cur && k < max_k; ++q) {
+        int32_t tok = hist_[q];
+        out[k++] = tok;
+        // Task 3.3: Terminate draft proposals immediately on EOS to prevent garbage verification
+        if (tok == 151643 || tok == 151645) { // <|endoftext|>, <|im_end|>
+            break;
+        }
+    }
     return k;
 }
 

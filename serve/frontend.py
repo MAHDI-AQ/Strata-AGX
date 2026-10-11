@@ -629,7 +629,7 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     return ToolCall(name=name, arguments=args)
 
 
-RCALL_MAX = 32768        # the most of a `<tool_call>` inside the reasoning that is held while waiting for its end (#804)
+RCALL_MAX = 256  # Task 4.1: Cap unclosed CoT tool call buffering to 256 chars        # the most of a `<tool_call>` inside the reasoning that is held while waiting for its end (#804)
 
 
 class OutputParser:

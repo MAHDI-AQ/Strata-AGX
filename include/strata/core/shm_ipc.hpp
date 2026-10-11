@@ -65,8 +65,19 @@ public:
     bool write_token(uint64_t id, int32_t token) {
         if (!active_ || !ring_) return false;
         uint32_t h = ring_->head.load(std::memory_order_relaxed);
-        uint32_t t = ring_->tail.load(std::memory_order_acquire);
-        if (h - t >= ring_->capacity) return false; // Full
+        // Task 1.3: Bounded backpressure spin instead of silent drop
+        int spins = 0;
+        while (true) {
+            uint32_t t = ring_->tail.load(std::memory_order_acquire);
+            if (h - t < ring_->capacity) break;
+            if (++spins > 200000) {
+                // If consumer is dead/stalled for >20ms, drop rather than deadlocking engine
+                return false;
+            }
+#if defined(__x86_64__) || defined(_M_X64)
+            __builtin_ia32_pause();
+#endif
+        }
         uint32_t idx = h & (ring_->capacity - 1);
         auto& m = ring_->entries[idx];
         m.id = id;
