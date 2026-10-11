@@ -1806,6 +1806,7 @@ class Service:
             if k != len(encoded):
                 raise ValueError("the prompt and its images do not match")
             ids = out
+            self.vision.dir.mkdir(parents=True, exist_ok=True)
             combined = self.vision.dir / f"req-{uuid.uuid4().hex[:12]}.sve"
             with open(combined, "wb") as f:
                 for path, _ in encoded:
