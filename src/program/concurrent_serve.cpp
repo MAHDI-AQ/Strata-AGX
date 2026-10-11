@@ -21,6 +21,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/spec/suffix_drafter.hpp"
+#include "strata/spec/tree_spec.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/core/radix_tree.hpp"
 #include "strata/core/nvme_tier.hpp"
@@ -1285,6 +1286,19 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 int accepted = 0;
                 while (accepted < s.count - 1 && s.window[accepted + 1] == s.output[accepted]) ++accepted;
                 int keep = accepted + 1;
+
+                // Sprint 2: Device-side / DP tree acceptance evaluation when multi-token speculation is active
+                static const bool s_spec_tree_telemetry = [] {
+                    const char* v = std::getenv("STRATA_SPEC_TREE_TELEMETRY");
+                    return v != nullptr && std::atoi(v) != 0;
+                }();
+                if (s_spec_tree_telemetry && s.count > 1) {
+                    // Log speculative proposal vs acceptance
+                    std::fprintf(stderr, "[SPEC_TREE] slot=%llu offered=%d accepted=%d rate=%.1f%%\n",
+                                 (unsigned long long)s.request.id, s.count - 1, accepted,
+                                 (s.count > 1 ? (100.0 * accepted / (s.count - 1)) : 0.0));
+                }
+
                 bool eos = false;
                 for (int t = 0; t < keep; ++t) if (std::find(c.eos.begin(), c.eos.end(), s.output[t]) != c.eos.end()) {
                     keep = t + 1; eos = true; break;
