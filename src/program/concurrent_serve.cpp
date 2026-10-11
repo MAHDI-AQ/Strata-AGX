@@ -69,8 +69,11 @@ struct Request {
     kernels::SamplerParams sampling{};
     float spec_min_p = 0.5f;
     uint64_t session = 0;   // D1 wire hint: the CGEN sess= conversation key (0 = none)
+    std::string sve_path;
+    std::vector<float> img_rows;
+    std::vector<const float*> row_ptr;
 };
-bool parse_request(const std::string& line, const ConcurrentConfig& config, int64_t vocab, Request& r, std::string& err) {
+bool parse_request(const std::string& line, const ConcurrentConfig& config, const core::ModelGeometry& g, int64_t vocab, Request& r, std::string& err) {
     std::istringstream input(line);
     std::string command, id, maximum, token;
     input >> command >> id >> maximum;
@@ -85,15 +88,22 @@ bool parse_request(const std::string& line, const ConcurrentConfig& config, int6
         if (number < 1) throw std::invalid_argument("request id");
         r.id = (uint64_t) number;
         r.max_new = integer(maximum);
-        if (command != "CGEN" || r.max_new < 1 || r.max_new > config.context) throw std::invalid_argument("max_new");
+        const bool is_cgeni = (command == "CGENI");
+        if ((command != "CGEN" && !is_cgeni) || r.max_new < 1 || r.max_new > config.context) throw std::invalid_argument("max_new");
         r.sampling.greedy = true;
         r.sampling.temperature = 0;
         r.sampling.top_p = 1.0f;
         r.spec_min_p = config.spec_min_p;
         bool got_tokens = false;
+        bool got_sve = !is_cgeni;
         while (input >> token) {
             const auto eq = token.find('=');
             if (eq == std::string::npos) {
+                if (!got_sve) {
+                    r.sve_path = token;
+                    got_sve = true;
+                    continue;
+                }
                 if (got_tokens) throw std::invalid_argument("trailing data");
                 got_tokens = true;
                 std::istringstream ids(token);
@@ -135,6 +145,52 @@ bool parse_request(const std::string& line, const ConcurrentConfig& config, int6
             else throw std::invalid_argument("unsupported key: " + key);
         }
         if (!got_tokens || r.tokens.empty()) throw std::invalid_argument("empty prompt");
+        if (!r.sve_path.empty()) {
+            constexpr int64_t kImagePad = 248056;
+            struct Img { int64_t n, nx, ny; size_t off; };
+            std::vector<Img> imgs;
+            r.img_rows.clear();
+            std::FILE* f = std::fopen(r.sve_path.c_str(), "rb");
+            if (!f) throw std::invalid_argument("cannot open " + r.sve_path);
+            std::string ve;
+            while (f && ve.empty()) {
+                int32_t hdr[5];
+                const size_t got = std::fread(hdr, sizeof(int32_t), 5, f);
+                if (got == 0) break;
+                if (got != 5 || hdr[0] != 0x31455653 || hdr[1] < 1 || hdr[2] < 1 || hdr[3] < 1 ||
+                    (int64_t) hdr[2] * hdr[3] != hdr[1] || hdr[4] != (int32_t) g.n_embd) {
+                    ve = "bad embeddings file (expected strata-vision records of width " +
+                         std::to_string((long long) g.n_embd) + ")";
+                    break;
+                }
+                const size_t off = r.img_rows.size(), cnt = (size_t) hdr[1] * (size_t) hdr[4];
+                r.img_rows.resize(off + cnt);
+                if (std::fread(r.img_rows.data() + off, sizeof(float), cnt, f) != cnt) { ve = "short embeddings file"; break; }
+                imgs.push_back({hdr[1], hdr[2], hdr[3], off});
+            }
+            if (f) std::fclose(f);
+            if (!ve.empty()) throw std::invalid_argument(ve);
+            const int64_t n = (int64_t) r.tokens.size();
+            r.row_ptr.assign((size_t) n, nullptr);
+            int64_t i = 0;
+            size_t k = 0;
+            while (ve.empty() && i < n) {
+                if (r.tokens[(size_t) i] != kImagePad) { ++i; continue; }
+                if (k >= imgs.size()) { ve = "the prompt has more images than the embeddings file"; break; }
+                const Img& im = imgs[k++];
+                for (int64_t j = 0; j < im.n && ve.empty(); ++j)
+                    if (i + j >= n || r.tokens[(size_t) (i + j)] != kImagePad)
+                        ve = "image " + std::to_string(k) + " has " + std::to_string((long long) im.n) +
+                             " rows but fewer <|image_pad|> tokens";
+                for (int64_t j = 0; j < im.n && ve.empty(); ++j) {
+                    r.row_ptr[(size_t) (i + j)] = r.img_rows.data() + im.off + (size_t) j * (size_t) g.n_embd;
+                }
+                i += im.n;
+            }
+            if (ve.empty() && k != imgs.size()) ve = "the embeddings file has more images than the prompt";
+            if (ve.empty() && n > 0 && r.tokens[(size_t) (n - 1)] == kImagePad) ve = "the prompt cannot end in an image";
+            if (!ve.empty()) throw std::invalid_argument(ve);
+        }
         return true;
     } catch (const std::exception& e) { err = "bad concurrent request: " + std::string(e.what()); return false; }
 }
@@ -1034,6 +1090,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             const core::OnDevice on(m.stages[st].device);
             cudaStreamSynchronize(m.stage_rt[st].prompt_stream);
         }
+        s.stages[0].prompt.embd_rows = nullptr;
         live.erase(s.request.id);
         s.active.store(false);
         int finish_slot_idx = -1;
@@ -1524,6 +1581,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         }
         s.draft->set_prompt_len((int64_t) s.request.tokens.size());
         s.stages[0].verify.set_sampling(s.request.sampling);
+        s.stages[0].prompt.embd_rows = !s.request.row_ptr.empty() ? s.request.row_ptr.data() : nullptr;
         int admit_slot_idx = -1;
         for (size_t si = 0; si < m.slots.size(); ++si) {
             if (m.slots[si].get() == &s) { admit_slot_idx = (int) si; break; }
@@ -1565,7 +1623,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             }
             Request request;
             std::string reason;
-            if (!parse_request(line, c, wt.find("output.weight")->ne1, request, reason)) { error(request.id, reason); continue; }
+            if (!parse_request(line, c, g, wt.find("output.weight")->ne1, request, reason)) { error(request.id, reason); continue; }
             if (live.count(request.id)) { error(request.id, "duplicate request id"); continue; }
             if (pending.size() >= 32) { error(request.id, "request queue is full"); continue; }
             live.insert(request.id);

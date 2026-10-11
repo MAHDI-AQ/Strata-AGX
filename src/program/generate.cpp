@@ -1251,7 +1251,7 @@ int main(int argc, char** argv) {
         // and the per-layer dumps are refused because they reroute the d_res/host_res staging the concurrent
         // rounds index (the staging guard lives with the token graph; concurrency never uses that graph).
         if (!o.serve || o.native_preset.empty() || o.mtp.empty() || o.spec < 2 || o.spec > 8 || (o.kv != "int8" && o.kv != "k8v4" && o.kv != "q4_0") ||
-            o.vision || o.spec_split ||
+            o.spec_split ||
             !o.cvec_files.empty() || o.kv_resident || o.expert_cache_remote[0] || o.expert_cache_remote[1] ||
             o.expert_cache_remote[2] || o.expert_profile.empty() || o.expert_cache == 0 || o.no_pool || o.no_capture ||
             o.no_token_graph || !o.dump_layers.empty() || !o.dump_halves.empty()) {
@@ -4612,6 +4612,10 @@ int main(int argc, char** argv) {
                 row_ptr.assign((size_t) n, nullptr);
                 const int64_t cells = (int64_t) mrope_host.size() / 3;
                 auto put = [&](int64_t c, int64_t t, int64_t h, int64_t w) {
+                    if (c < 0 || c >= cells) {
+                        ve = "mrope: coordinate offset " + std::to_string((long long) c) + " exceeds cell bounds (" + std::to_string((long long) cells) + ")";
+                        return;
+                    }
                     mrope_host[(size_t) c * 3] = (int32_t) t;
                     mrope_host[(size_t) c * 3 + 1] = (int32_t) h;
                     mrope_host[(size_t) c * 3 + 2] = (int32_t) w;

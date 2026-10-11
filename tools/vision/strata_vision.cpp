@@ -52,6 +52,7 @@ int main(int argc, char** argv) {
     std::string mmproj, model;
     bool gpu = false;
     int threads = 0, max_tokens = 0;
+    std::string device_name;
     llama_flash_attn_type fa = LLAMA_FLASH_ATTN_TYPE_AUTO;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -64,6 +65,7 @@ int main(int argc, char** argv) {
         else if (a == "--gpu") gpu = true;
         else if (a == "--threads") threads = std::atoi(next().c_str());
         else if (a == "--max-tokens") max_tokens = std::atoi(next().c_str());
+        else if (a == "--device") device_name = next();
         else if (a == "--flash-attn") {   // FA keeps K and V in FP16; off = the attention in FP32
             const std::string v = next();
             fa = v == "on" ? LLAMA_FLASH_ATTN_TYPE_ENABLED : v == "off" ? LLAMA_FLASH_ATTN_TYPE_DISABLED
@@ -96,6 +98,10 @@ int main(int argc, char** argv) {
 
     mtmd_context_params cp = mtmd_context_params_default();
     cp.use_gpu = gpu;
+    if (!device_name.empty()) {
+        cp.device = ggml_backend_dev_by_name(device_name.c_str());
+        if (!cp.device) { std::fprintf(stderr, "warning: device %s not found\n", device_name.c_str()); }
+    }
     cp.print_timings = false;
     cp.warmup = false;
     cp.flash_attn_type = fa;

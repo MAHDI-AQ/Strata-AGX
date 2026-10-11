@@ -730,8 +730,6 @@ class StrataEngine:
         return f" cvec={int(on)}" if isinstance(on, bool) else ""
 
     def _generate_multiplex(self, ids, max_new, sampling, cancel, embeddings=None):
-        if embeddings:
-            raise ValueError("concurrent serving currently supports text only")
         self.last = {}
         self.progress = None
         channel = queue.Queue(maxsize=256)
@@ -742,9 +740,12 @@ class StrataEngine:
         done = False
         sent = False
         try:
-            head = f"CGEN {number} {int(max_new)}{self.sampling_keys(sampling or {})}"
-            if (self.info or {}).get("admission"):    # D1: only an engine that advertises the hint
-                head += f" sess={session_hint(ids)}"
+            if embeddings:
+                head = f"CGENI {number} {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}"
+            else:
+                head = f"CGEN {number} {int(max_new)}{self.sampling_keys(sampling or {})}"
+                if (self.info or {}).get("admission"):    # D1: only an engine that advertises the hint
+                    head += f" sess={session_hint(ids)}"
             sent_at = time.monotonic()
             self._send(head + " " + ",".join(str(int(t)) for t in ids))
             sent = True
@@ -807,6 +808,30 @@ class StrataEngine:
                 self._channels.pop(number, None)
             self._shared_progress.pop(number, None)          # lock-free (see progress)
             self._shared_queue_wait.pop(number, None)        # D1: lock-free (see progress)
+
+    def _generate_serial_locked(self, ids, max_new, sampling, cancel, embeddings):
+        with self._write_lock:
+            head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}"
+            self._send(f"{head} {",".join(str(int(t)) for t in ids)}")
+            while not cancel.is_set():
+                try:
+                    line = self.lines.get(timeout=0.25)
+                except queue.Empty:
+                    if not self.alive():
+                        raise EngineDied("the engine stopped")
+                    yield None
+                    continue
+                if line is None:
+                    raise EngineDied("the engine stopped")
+                if line.startswith("T "):
+                    yield int(line[2:])
+                elif line.startswith("PP "):
+                    yield None
+                elif line.startswith("DONE"):
+                    self._parse_done(line)
+                    return
+                elif line.startswith("ERR"):
+                    raise ValueError(line[4:].strip())
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         if getattr(self, "multiplex", False):
@@ -1015,24 +1040,51 @@ class Vision:
         self._start()
 
     @staticmethod
+    def _validate_url(url: str):
+        import urllib.parse, ipaddress, socket
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError("only http and https image URLs are permitted")
+        hostname = parsed.hostname
+        if not hostname:
+            raise ValueError("invalid image URL host")
+        try:
+            addrinfo = socket.getaddrinfo(hostname, None)
+        except Exception as e:
+            raise ValueError(f"cannot resolve host {hostname}: {e}")
+        for family, _, _, _, sockaddr in addrinfo:
+            ip = ipaddress.ip_address(sockaddr[0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                raise ValueError(f"access to private/internal network address {ip} is blocked (SSRF guard)")
+            if str(ip) == "169.254.169.254":
+                raise ValueError("access to cloud metadata service is blocked (SSRF guard)")
+
+    @staticmethod
     def load(source: str) -> bytes:
         if source.startswith("data:"):
-            return base64.b64decode(source.split(",", 1)[1])
+            try:
+                return base64.b64decode(source.split(",", 1)[1], validate=True)
+            except Exception as e:
+                raise ValueError(f"invalid base64 image data ({e})")
         if source.startswith(("http://", "https://")):
-            req = urllib.request.Request(source, headers={"User-Agent": "strata"})
-            with urllib.request.urlopen(req, timeout=60) as r:
-                return r.read()
+            Vision._validate_url(source)
+            req = urllib.request.Request(source, headers={"User-Agent": "strata-agx"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = r.read()
+                if len(data) > 30 * 1024 * 1024:
+                    raise ValueError("image size exceeds 30 MB limit")
+                return data
         path = source[7:] if source.startswith("file://") else source
         if path and os.path.isfile(path):
-            return Path(path).read_bytes()
+            p = Path(path).resolve()
+            if str(p).startswith(("/etc", "/proc", "/sys", "/root")):
+                raise ValueError("local file path is restricted")
+            return p.read_bytes()
         raise ValueError("an image must be a data: URL, an http(s) URL or a local file path")
 
     @staticmethod
     def normalize(data: bytes) -> bytes:
-        """The formats strata-vision's decoder (stb_image) reads pass through; anything else is converted to PNG."""
-        if data[:3] == b"\xff\xd8\xff" or data[:8] == b"\x89PNG\r\n\x1a\n" or data[:2] == b"BM" or \
-                data[:6] in (b"GIF87a", b"GIF89a"):
-            return data
+        """Normalizes image data: converts alpha to white, clamps resolution to max 1024px, outputs clean PNG."""
         try:
             import io
             from PIL import Image
@@ -1040,8 +1092,16 @@ class Vision:
             raise ValueError("this image format needs Pillow (python -m pip install pillow); JPEG, PNG, BMP and "
                              "GIF work without it") from None
         try:
+            Image.MAX_IMAGE_PIXELS = 16_000_000
             im = Image.open(io.BytesIO(data))
+            if getattr(im, "is_animated", False):
+                im.seek(0)
             im.load()
+            max_edge = 1024
+            if max(im.size) > max_edge:
+                scale = max_edge / float(max(im.size))
+                new_size = (int(round(im.size[0] * scale)), int(round(im.size[1] * scale)))
+                im = im.resize(new_size, Image.Resampling.BICUBIC)
         except Exception as e:
             raise ValueError(f"the image could not be read ({e})") from None
         if im.mode in ("RGBA", "LA", "P") and "transparency" in im.info or im.mode in ("RGBA", "LA"):
@@ -1113,6 +1173,8 @@ def engine_args(cfg: dict) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32")."""
     args = list(cfg["args"])
+    if cfg.get("vision") and "--vision" not in args:
+        args.append("--vision")
     if len(gpu_list(cfg)) > 1 and "--layer-split" not in args:
         args += ["--layer-split", str(cfg.get("layer_split") or "auto")]
     # opt-in: an auto split runs on the first card alone when it holds every profiled expert and the KV
