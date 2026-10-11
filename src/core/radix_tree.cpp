@@ -517,9 +517,58 @@ RadixTree::RadixTree(size_t max_cached_snapshots, size_t max_host_snapshots)
     root_->prefix_len = 0;
     root_->last_accessed = std::chrono::steady_clock::now();
     node_count_ = 1;
+
+    nvme_worker_ = std::thread(&RadixTree::nvme_worker_loop, this);
 }
 
-RadixTree::~RadixTree() = default;
+RadixTree::~RadixTree() {
+    drain_nvme_staging();
+}
+
+void RadixTree::drain_nvme_staging() {
+    {
+        std::lock_guard<std::mutex> lk(nvme_queue_mutex_);
+        nvme_stop_ = true;
+    }
+    nvme_cv_.notify_all();
+    if (nvme_worker_.joinable()) {
+        nvme_worker_.join();
+    }
+}
+
+void RadixTree::nvme_worker_loop() {
+    while (true) {
+        NVMeStagingTask task;
+        {
+            std::unique_lock<std::mutex> lk(nvme_queue_mutex_);
+            nvme_cv_.wait(lk, [&]() {
+                return nvme_stop_.load() || !nvme_queue_.empty();
+            });
+            if (nvme_stop_.load() && nvme_queue_.empty()) {
+                break;
+            }
+            if (nvme_queue_.empty()) continue;
+            task = std::move(nvme_queue_.front());
+            nvme_queue_.pop();
+        }
+
+        if (nvme_tier_ && task.payload.data() && task.total_payload > 0) {
+            bool ok = nvme_tier_->write_node_direct(task.node_id, task.payload.data(), task.total_payload);
+            if (auto node = task.node_weak.lock()) {
+                if (ok) {
+                    node->l3_bytes = task.total_payload;
+                    node->is_l3_offloaded = true;
+                    node->free_host();
+                }
+                node->is_staging_to_nvme = false;
+            }
+        } else {
+            if (auto node = task.node_weak.lock()) {
+                node->is_staging_to_nvme = false;
+            }
+        }
+    }
+}
 
 // S26f: total device-snapshot bytes across the tree (walk; trees are small).
 size_t RadixTree::device_snapshot_bytes_locked() const {
@@ -1215,8 +1264,10 @@ void RadixTree::collect_unreferenced_host_nodes(
     const std::shared_ptr<RadixNode>& curr,
     std::vector<std::shared_ptr<RadixNode>>& nodes) {
     if (!curr) return;
-    // Decoupled Payload Eviction: Any node (leaf or interior) holding a host snapshot
-    // with ref_count == 0 is eligible for snapshot offload/free without deleting the tree edge.
+    // SGLang / vLLM Standard: Leaf-Pruning Tree-LRU.
+    // An interior/parent node (system prompts, early turns) CANNOT be evicted while child nodes exist.
+    // Only true unreferenced leaf nodes (ref_count == 0 && children.empty()) holding a host snapshot are candidates.
+    // If no pure leaves have host snapshots, fall back to decoupled interior payload eviction.
     if (curr != root_ && curr->ref_count == 0 && curr->has_host_snapshot()) {
         nodes.push_back(curr);
     }
@@ -1282,19 +1333,172 @@ size_t RadixTree::evict_lru_locked(size_t max_snapshots, size_t min_free_vram_mi
         collect_unreferenced_host_nodes(root_, host_nodes);
         if (host_nodes.empty()) break;
 
+        // Leaf-Pruning Tree-LRU: Prioritize unreferenced leaf nodes (children.empty())
+        // over interior/parent nodes, then by oldest last_accessed.
         std::sort(host_nodes.begin(), host_nodes.end(), [](const auto& a, const auto& b) {
+            bool a_leaf = a->children.empty();
+            bool b_leaf = b->children.empty();
+            if (a_leaf != b_leaf) return a_leaf > b_leaf; // true (leaf) comes first
             return a->last_accessed < b->last_accessed;
         });
 
-        std::shared_ptr<RadixNode> host_victim = host_nodes.front();
+        std::shared_ptr<RadixNode> host_victim = nullptr;
+        for (const auto& nd : host_nodes) {
+            if (!nd->is_staging_to_nvme.load()) {
+                host_victim = nd;
+                break;
+            }
+        }
         if (!host_victim) break;
 
         if (nvme_tier_ && host_victim->has_host_snapshot()) {
-            if (host_victim->offload_to_nvme(*nvme_tier_)) {
-                ++cached_nvme_snapshots_;
-            } else {
-                host_victim->free_host();
+            // Serialize host snapshot in-memory into AlignedBuffer under lock (<10 us),
+            // then delegate the NVMe disk write to the background worker thread.
+            size_t total_payload = sizeof(NVMeNodeHeader);
+            total_payload += host_victim->edge_tokens.size() * sizeof(int32_t);
+            total_payload += host_victim->stage_host_snapshots.size() * sizeof(NVMeStageHeader);
+
+            for (const auto& hss : host_victim->stage_host_snapshots) {
+                total_payload += hss.gdn_data.size();
+                total_payload += hss.ple_data.size();
+                total_payload += hss.R_data.size();
+                total_payload += hss.qsa_slices.size() * sizeof(NVMeQsaSliceHeader);
+                for (const auto& slice : hss.qsa_slices) {
+                    total_payload += slice.k_q.size();
+                    total_payload += slice.v_q4.size();
+                    total_payload += slice.k_scale.size();
+                    total_payload += slice.v_scale.size();
+                    total_payload += slice.idx_tail.size();
+                    total_payload += slice.idx_dead.size();
+                    total_payload += slice.idx_pooled.size();
+                }
             }
+
+            AlignedBuffer buffer(total_payload);
+            uint8_t* p = buffer.data();
+            size_t offset = 0;
+
+            NVMeNodeHeader hdr;
+            hdr.magic = kNVMeMagic;
+            hdr.version = kNVMeVersion;
+            hdr.node_id = host_victim->id;
+            hdr.prefix_len = host_victim->prefix_len;
+            hdr.n_edge_tokens = static_cast<uint32_t>(host_victim->edge_tokens.size());
+            hdr.n_stages = static_cast<uint32_t>(host_victim->stage_host_snapshots.size());
+            hdr.total_payload_bytes = total_payload;
+            hdr.checksum = 0xFFFFFFFF53545241ULL;
+
+            std::memcpy(p + offset, &hdr, sizeof(hdr));
+            offset += sizeof(hdr);
+
+            if (!host_victim->edge_tokens.empty()) {
+                size_t bytes = host_victim->edge_tokens.size() * sizeof(int32_t);
+                std::memcpy(p + offset, host_victim->edge_tokens.data(), bytes);
+                offset += bytes;
+            }
+
+            for (const auto& hss : host_victim->stage_host_snapshots) {
+                NVMeStageHeader shdr;
+                shdr.device = hss.device;
+                shdr.ple_prev[0] = hss.ple_prev_saved[0];
+                shdr.ple_prev[1] = hss.ple_prev_saved[1];
+                shdr.ple_token = hss.ple_token_saved;
+                shdr.gdn_bytes = hss.gdn_data.size();
+                shdr.ple_bytes = hss.ple_data.size();
+                shdr.R_bytes = hss.R_data.size();
+                shdr.qsa_ord0 = hss.qsa_ord0;
+                shdr.qsa_alloc = hss.qsa_alloc;
+                shdr.n_qsa_slices = static_cast<uint32_t>(hss.qsa_slices.size());
+
+                std::memcpy(p + offset, &shdr, sizeof(shdr));
+                offset += sizeof(shdr);
+
+                if (shdr.gdn_bytes > 0) {
+                    std::memcpy(p + offset, hss.gdn_data.data(), shdr.gdn_bytes);
+                    offset += shdr.gdn_bytes;
+                }
+                if (shdr.ple_bytes > 0) {
+                    std::memcpy(p + offset, hss.ple_data.data(), shdr.ple_bytes);
+                    offset += shdr.ple_bytes;
+                }
+                if (shdr.R_bytes > 0) {
+                    std::memcpy(p + offset, hss.R_data.data(), shdr.R_bytes);
+                    offset += shdr.R_bytes;
+                }
+
+                for (const auto& slice : hss.qsa_slices) {
+                    NVMeQsaSliceHeader qhdr;
+                    qhdr.k_bytes = slice.k_q.size();
+                    qhdr.v_bytes = slice.v_q4.size();
+                    qhdr.k_scale_bytes = slice.k_scale.size();
+                    qhdr.v_scale_bytes = slice.v_scale.size();
+                    qhdr.idx_tail_bytes = slice.idx_tail.size();
+                    qhdr.idx_dead_bytes = slice.idx_dead.size();
+                    qhdr.idx_pooled_bytes = slice.idx_pooled.size();
+                    qhdr.idx_block_pos_val = slice.idx_block_pos_val;
+                    qhdr.has_idx_block_pos = slice.has_idx_block_pos ? 1 : 0;
+
+                    std::memcpy(p + offset, &qhdr, sizeof(qhdr));
+                    offset += sizeof(qhdr);
+
+                    if (qhdr.k_bytes > 0) {
+                        std::memcpy(p + offset, slice.k_q.data(), qhdr.k_bytes);
+                        offset += qhdr.k_bytes;
+                    }
+                    if (qhdr.v_bytes > 0) {
+                        std::memcpy(p + offset, slice.v_q4.data(), qhdr.v_bytes);
+                        offset += qhdr.v_bytes;
+                    }
+                    if (qhdr.k_scale_bytes > 0) {
+                        std::memcpy(p + offset, slice.k_scale.data(), qhdr.k_scale_bytes);
+                        offset += qhdr.k_scale_bytes;
+                    }
+                    if (qhdr.v_scale_bytes > 0) {
+                        std::memcpy(p + offset, slice.v_scale.data(), qhdr.v_scale_bytes);
+                        offset += qhdr.v_scale_bytes;
+                    }
+                    if (qhdr.idx_tail_bytes > 0) {
+                        std::memcpy(p + offset, slice.idx_tail.data(), qhdr.idx_tail_bytes);
+                        offset += qhdr.idx_tail_bytes;
+                    }
+                    if (qhdr.idx_dead_bytes > 0) {
+                        std::memcpy(p + offset, slice.idx_dead.data(), qhdr.idx_dead_bytes);
+                        offset += qhdr.idx_dead_bytes;
+                    }
+                    if (qhdr.idx_pooled_bytes > 0) {
+                        std::memcpy(p + offset, slice.idx_pooled.data(), qhdr.idx_pooled_bytes);
+                        offset += qhdr.idx_pooled_bytes;
+                    }
+                }
+            }
+
+            // Task 2.3: Hardware SSE4.2 CRC32C over serialized payload
+            uint64_t crc = 0xFFFFFFFF53545241ULL;
+            const uint8_t* payload_bytes = buffer.data() + sizeof(NVMeNodeHeader);
+            const size_t crc_len = total_payload - sizeof(NVMeNodeHeader);
+            const size_t qwords = crc_len / 8;
+            const uint64_t* qp = reinterpret_cast<const uint64_t*>(payload_bytes);
+            for (size_t qi = 0; qi < qwords; ++qi) {
+#if defined(__SSE4_2__)
+                crc = _mm_crc32_u64(crc, qp[qi]);
+#else
+                crc = (crc ^ qp[qi]) * 1099511628211ULL;
+#endif
+            }
+            reinterpret_cast<NVMeNodeHeader*>(buffer.data())->checksum = crc;
+
+            host_victim->is_staging_to_nvme = true;
+            {
+                std::lock_guard<std::mutex> lk(nvme_queue_mutex_);
+                nvme_queue_.push(NVMeStagingTask{
+                    host_victim->id,
+                    host_victim,
+                    std::move(buffer),
+                    total_payload
+                });
+            }
+            nvme_cv_.notify_one();
+            ++cached_nvme_snapshots_;
         } else {
             host_victim->free_host();
         }
@@ -1306,7 +1510,7 @@ size_t RadixTree::evict_lru_locked(size_t max_snapshots, size_t min_free_vram_mi
                 host_victim->free_nvme(*nvme_tier_);
                 if (cached_nvme_snapshots_ > 0) --cached_nvme_snapshots_;
             }
-            if (!host_victim->has_snapshot()) {
+            if (!host_victim->has_snapshot() && !host_victim->is_staging_to_nvme.load()) {
                 if (auto p = host_victim->parent.lock()) {
                     if (!host_victim->edge_tokens.empty()) {
                         p->children.erase(host_victim->edge_tokens[0]);

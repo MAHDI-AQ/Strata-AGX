@@ -14,6 +14,7 @@
 #include "strata/core/session.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/radix_compactor.hpp"
+#include "strata/core/nvme_tier.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -25,6 +26,9 @@
 #include <shared_mutex>
 #include <mutex>
 #include <atomic>
+#include <queue>
+#include <thread>
+#include <condition_variable>
 
 #if defined(__SSE4_2__)
 #include <nmmintrin.h>
@@ -207,6 +211,7 @@ struct RadixNode : public std::enable_shared_from_this<RadixNode> {
     std::vector<RadixStageHostSnapshot> stage_host_snapshots;
     bool is_host_parked = false;
     bool is_l3_offloaded = false;
+    std::atomic<bool> is_staging_to_nvme{false};
     size_t l3_bytes = 0;
 
     void update_chunk_hashes() {
@@ -372,6 +377,22 @@ private:
     void collect_unreferenced_host_nodes(
         const std::shared_ptr<RadixNode>& curr,
         std::vector<std::shared_ptr<RadixNode>>& nodes);
+
+    struct NVMeStagingTask {
+        int64_t node_id = 0;
+        std::weak_ptr<RadixNode> node_weak;
+        AlignedBuffer payload;
+        size_t total_payload = 0;
+    };
+
+    std::queue<NVMeStagingTask> nvme_queue_;
+    std::mutex nvme_queue_mutex_;
+    std::condition_variable nvme_cv_;
+    std::atomic<bool> nvme_stop_{false};
+    std::thread nvme_worker_;
+
+    void nvme_worker_loop();
+    void drain_nvme_staging();
 };
 
 }  // namespace strata::core
