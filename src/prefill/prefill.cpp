@@ -26,6 +26,7 @@
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/prefill/moe_group_fused.cuh"
 #include "strata/prefill/kernels.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 
@@ -311,6 +312,11 @@ struct Prefill::Impl {
     // 70 s at the default ring, 0.7 s with a 16-slot one.  STRATA_GROUP_COPY=1: the copies (the A/B arm).
     int32_t* grp_host = nullptr;
     int32_t* grp_dev = nullptr;          // its device alias
+    int32_t* gpu_block_hist = nullptr;   // scratch for macro-path grouping
+    int32_t* gpu_cnt = nullptr;
+    int32_t* gpu_off = nullptr;
+    int32_t* gpu_order = nullptr;
+    int32_t* gpu_num_active = nullptr;
     size_t grp_n = 0, grp_tk = 0;        // int32s allocated; T_max * K (the offset of slot, and of src past it)
     // the zero-copy path's per-group pointer tables (mapped pinned, written by the pump, read by the kernels):
     // per (layer) group, [MMQ_GROUP gate/up bases][MMQ_GROUP down bases], all host-known when the group's last
@@ -720,6 +726,23 @@ bool Prefill::carve(size_t T, void* alloc) {
         // (written at every run's start, not here: when serving, these are live expert-cache slots until a request
         // lends them - a write now would corrupt a resident expert)
         if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
+    }
+    if (!m.gpu_block_hist) {
+        if (cudaMalloc(&m.gpu_block_hist, strata::prefill::gpu_group::MAX_BLOCKS * m.g->n_expert * sizeof(int32_t)) == cudaSuccess) {
+            m.owned.push_back(m.gpu_block_hist);
+        }
+        if (cudaMalloc(&m.gpu_order, m.g->n_expert * sizeof(int32_t)) == cudaSuccess) {
+            m.owned.push_back(m.gpu_order);
+        }
+        if (cudaMalloc(&m.gpu_num_active, sizeof(int32_t)) == cudaSuccess) {
+            m.owned.push_back(m.gpu_num_active);
+        }
+        if (cudaMalloc(&m.gpu_cnt, m.g->n_expert * sizeof(int32_t)) == cudaSuccess) {
+            m.owned.push_back(m.gpu_cnt);
+        }
+        if (cudaMalloc(&m.gpu_off, (m.g->n_expert + 1) * sizeof(int32_t)) == cudaSuccess) {
+            m.owned.push_back(m.gpu_off);
+        }
     }
     m.ring = ring_slots(T);
     for (int i = 0; i < m.ring; ++i) {
@@ -1687,43 +1710,114 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
                     if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
                     m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
-                    // group the (token, k) pairs by expert on the host
+                    // MoE Token Routing & Permutation Grouping
                     pt.mark(kPfHostGroup, cs);
-                    // (the sync below also orders this layer's writes of slot/src/bounds after the previous
-                    // layer's kernels that read them)
+                    static const bool s_ab_audit = [] {
+                        const char* v = std::getenv("STRATA_ROUTING_AB_AUDIT");
+                        return v != nullptr && std::atoi(v) != 0;
+                    }();
+                    static const bool s_gpu_routing = [] {
+                        const char* v = std::getenv("STRATA_GPU_ROUTING");
+                        return v != nullptr && std::atoi(v) != 0;
+                    }();
+
+                    // If GPU grouping is enabled or A/B audit is active, launch fused GPU kernel
+                    if (s_gpu_routing || s_ab_audit) {
+                        strata::prefill::gpu_group::GroupingDevTables dev_tables;
+                        dev_tables.slot = m.slot_dev;
+                        dev_tables.src = m.src_dev;
+                        dev_tables.cnt = m.gpu_cnt;
+                        dev_tables.off = m.gpu_off;
+                        dev_tables.order = m.gpu_order;
+                        dev_tables.num_active = m.gpu_num_active;
+                        dev_tables.bounds = m.bounds_dev;
+                        dev_tables.block_hist = m.gpu_block_hist;
+                        strata::prefill::gpu_group::launch_moe_gpu_group(
+                            m.ids, T * K, (int)K, (int)m.g->n_expert, dev_tables, m.cs);
+                    }
+
+                    std::vector<int32_t> order;
                     const bool grp_mapped = m.grp_host != nullptr;
                     int32_t* ids_h = grp_mapped ? m.grp_host : m.ids_host.data();
                     int32_t* slot_h = grp_mapped ? m.grp_host + m.grp_tk : m.slot_host.data();
                     int32_t* src_h = grp_mapped ? m.grp_host + 2 * m.grp_tk : m.src_host.data();
-                    if (grp_mapped) copy_i32(m.grp_dev, m.ids, T * K, m.cs);
-                    else cudaMemcpyAsync(m.ids_host.data(), m.ids, (size_t) T * K * 4, cudaMemcpyDeviceToHost, m.cs);
-                    cudaStreamSynchronize(m.cs);
-                    pt.fold();
-                    std::fill(m.cnt.begin(), m.cnt.end(), 0);
-                    for (int64_t i = 0; i < T * K; ++i) {
-                        const int32_t e = ids_h[(size_t) i];
-                        if (e < 0 || e >= m.g->n_expert) { err = "prefill: routed id out of range"; return false; }
-                        ++m.cnt[(size_t) e];
-                    }
-                    m.off[0] = 0;
-                    for (int64_t e = 0; e < m.g->n_expert; ++e) m.off[(size_t) e + 1] = m.off[(size_t) e] + m.cnt[(size_t) e];
-                    std::vector<int32_t> fill(m.off.begin(), m.off.end() - 1);
-                    for (int64_t i = 0; i < T * K; ++i) {
-                        const int32_t e = ids_h[(size_t) i];
-                        const int32_t p = fill[(size_t) e]++;
-                        slot_h[(size_t) i] = p;
-                        src_h[(size_t) p] = (int32_t) (i / K);
-                    }
-                    if (grp_mapped) {
-                        copy_i32(m.slot_dev, m.grp_dev + m.grp_tk, T * K, m.cs);
-                        copy_i32(m.src_dev, m.grp_dev + 2 * m.grp_tk, T * K, m.cs);
+
+                    if (s_gpu_routing && !s_ab_audit) {
+                        // ZERO-BUBBLE GPU ROUTING:
+                        // Asynchronously DMA only order, num_active, cnt, and off back to host
+                        int32_t active_count = 0;
+                        cudaMemcpyAsync(&active_count, m.gpu_num_active, sizeof(int32_t), cudaMemcpyDeviceToHost, m.cs);
+                        cudaStreamSynchronize(m.cs);
+                        pt.fold();
+
+                        order.resize(active_count);
+                        if (active_count > 0) {
+                            cudaMemcpy(order.data(), m.gpu_order, active_count * sizeof(int32_t), cudaMemcpyDeviceToHost);
+                        }
+
+                        // Populate m.cnt and m.off for downstream compute loops
+                        cudaMemcpy(m.cnt.data(), m.gpu_cnt, m.g->n_expert * sizeof(int32_t), cudaMemcpyDeviceToHost);
+                        cudaMemcpy(m.off.data(), m.gpu_off, (m.g->n_expert + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost);
+
+                        // Populate m.bounds_host for downstream MMQ ranges
+                        const size_t n = order.size(), ng = (n + MMQ_GROUP - 1) / MMQ_GROUP;
+                        m.bounds_host.resize(n + 1 + ng * (MMQ_GROUP + 1));
+                        cudaMemcpy(m.bounds_host.data(), m.bounds_dev, m.bounds_host.size() * sizeof(int32_t), cudaMemcpyDeviceToHost);
                     } else {
-                        cudaMemcpyAsync(m.slot_dev, m.slot_host.data(), (size_t) T * K * 4, cudaMemcpyHostToDevice, m.cs);
-                        cudaMemcpyAsync(m.src_dev, m.src_host.data(), (size_t) T * K * 4, cudaMemcpyHostToDevice, m.cs);
+                        if (grp_mapped) copy_i32(m.grp_dev, m.ids, T * K, m.cs);
+                        else cudaMemcpyAsync(m.ids_host.data(), m.ids, (size_t) T * K * 4, cudaMemcpyDeviceToHost, m.cs);
+                        cudaStreamSynchronize(m.cs);
+                        pt.fold();
+                        std::fill(m.cnt.begin(), m.cnt.end(), 0);
+                        for (int64_t i = 0; i < T * K; ++i) {
+                            const int32_t e = ids_h[(size_t) i];
+                            if (e < 0 || e >= m.g->n_expert) { err = "prefill: routed id out of range"; return false; }
+                            ++m.cnt[(size_t) e];
+                        }
+                        m.off[0] = 0;
+                        for (int64_t e = 0; e < m.g->n_expert; ++e) m.off[(size_t) e + 1] = m.off[(size_t) e] + m.cnt[(size_t) e];
+                        std::vector<int32_t> fill(m.off.begin(), m.off.end() - 1);
+                        for (int64_t i = 0; i < T * K; ++i) {
+                            const int32_t e = ids_h[(size_t) i];
+                            const int32_t p = fill[(size_t) e]++;
+                            slot_h[(size_t) i] = p;
+                            src_h[(size_t) p] = (int32_t) (i / K);
+                        }
+
+                        if (s_ab_audit) {
+                            // Dual-arm A/B bitwise verification
+                            std::vector<int32_t> gpu_slot(T * K), gpu_src(T * K);
+                            cudaMemcpy(gpu_slot.data(), m.slot_dev, T * K * sizeof(int32_t), cudaMemcpyDeviceToHost);
+                            cudaMemcpy(gpu_src.data(), m.src_dev, T * K * sizeof(int32_t), cudaMemcpyDeviceToHost);
+                            for (int64_t i = 0; i < T * K; ++i) {
+                                if (gpu_slot[i] != slot_h[i]) {
+                                    fprintf(stderr, "[AB_AUDIT FAIL L%d] slot mismatch at %ld: GPU=%d CPU=%d (T=%ld, K=%ld)\n",
+                                            (int)l, (long)i, gpu_slot[i], slot_h[i], (long)T, (long)K);
+                                    std::abort();
+                                }
+                                if (gpu_src[i] != src_h[i]) {
+                                    fprintf(stderr, "[AB_AUDIT FAIL L%d] src mismatch at %ld: GPU=%d CPU=%d (T=%ld, K=%ld)\n",
+                                            (int)l, (long)i, gpu_src[i], src_h[i], (long)T, (long)K);
+                                    std::abort();
+                                }
+                            }
+                        }
+
+                        if (!s_gpu_routing) {
+                            if (grp_mapped) {
+                                copy_i32(m.slot_dev, m.grp_dev + m.grp_tk, T * K, m.cs);
+                                copy_i32(m.src_dev, m.grp_dev + 2 * m.grp_tk, T * K, m.cs);
+                            } else {
+                                cudaMemcpyAsync(m.slot_dev, m.slot_host.data(), (size_t) T * K * 4, cudaMemcpyHostToDevice, m.cs);
+                                cudaMemcpyAsync(m.src_dev, m.src_host.data(), (size_t) T * K * 4, cudaMemcpyHostToDevice, m.cs);
+                            }
+                        }
                     }
                     // the experts, in id order: resident ones from VRAM, the others through the staging ring
-                    std::vector<int32_t> order;
-                    for (int32_t e = 0; e < m.g->n_expert; ++e) if (m.cnt[(size_t) e] > 0) order.push_back(e);
+                    if (!s_gpu_routing || s_ab_audit) {
+                        order.clear();
+                        for (int32_t e = 0; e < m.g->n_expert; ++e) if (m.cnt[(size_t) e] > 0) order.push_back(e);
+                    }
                     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
                     const bool use_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
                     const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
@@ -1744,13 +1838,30 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             for (size_t i = 0; i <= MMQ_GROUP; ++i)
                                 m.bounds_host[n + 1 + g * (MMQ_GROUP + 1) + i] =
                                     m.bounds_host[std::min(n, g * MMQ_GROUP + i)] - m.bounds_host[g * MMQ_GROUP];
-                        if (grp_mapped) {
-                            int32_t* bh = m.grp_host + 3 * m.grp_tk;
-                            std::memcpy(bh, m.bounds_host.data(), m.bounds_host.size() * 4);
-                            copy_i32(m.bounds_dev, m.grp_dev + 3 * m.grp_tk, (int64_t) m.bounds_host.size(), m.cs);
-                        } else {
-                            cudaMemcpyAsync(m.bounds_dev, m.bounds_host.data(), m.bounds_host.size() * 4,
-                                            cudaMemcpyHostToDevice, m.cs);
+                        if (s_ab_audit) {
+                            std::vector<int32_t> gpu_bounds(m.bounds_host.size());
+                            cudaMemcpy(gpu_bounds.data(), m.bounds_dev, m.bounds_host.size() * sizeof(int32_t), cudaMemcpyDeviceToHost);
+                            for (size_t b_idx = 0; b_idx < m.bounds_host.size(); ++b_idx) {
+                                if (gpu_bounds[b_idx] != m.bounds_host[b_idx]) {
+                                    fprintf(stderr, "[AB_AUDIT FAIL BOUNDS L%d] n=%zu, ng=%zu, total_size=%zu, idx %zu: GPU=%d CPU=%d\n",
+                                            (int)l, n, ng, m.bounds_host.size(), b_idx, gpu_bounds[b_idx], m.bounds_host[b_idx]);
+                                    // Print order comparison
+                                    int32_t active_gpu = 0;
+                                    cudaMemcpy(&active_gpu, m.gpu_num_active, sizeof(int32_t), cudaMemcpyDeviceToHost);
+                                    fprintf(stderr, "Active count: GPU=%d, CPU=%zu\n", active_gpu, n);
+                                    std::abort();
+                                }
+                            }
+                        }
+                        if (!s_gpu_routing) {
+                            if (grp_mapped) {
+                                int32_t* bh = m.grp_host + 3 * m.grp_tk;
+                                std::memcpy(bh, m.bounds_host.data(), m.bounds_host.size() * 4);
+                                copy_i32(m.bounds_dev, m.grp_dev + 3 * m.grp_tk, (int64_t) m.bounds_host.size(), m.cs);
+                            } else {
+                                cudaMemcpyAsync(m.bounds_dev, m.bounds_host.data(), m.bounds_host.size() * 4,
+                                                cudaMemcpyHostToDevice, m.cs);
+                            }
                         }
                     } else {
                         gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
