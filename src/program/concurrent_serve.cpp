@@ -828,11 +828,9 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             }
         }
         int64_t dynamic_chunk = c.prefill_chunk;
-        if (active_prefills >= 2) dynamic_chunk = std::min<int64_t>(dynamic_chunk, 2048);
-        if (active_decodes >= 2) dynamic_chunk = std::min<int64_t>(dynamic_chunk, 512);
-        else if (active_decodes == 1) dynamic_chunk = std::min<int64_t>(dynamic_chunk, 1024);
-
         const int64_t rem = s.position.load(std::memory_order_relaxed) - read0;
+        // Preserve Tensor Core GEMM efficiency (M >= 2048) on Ada Lovelace SM89 without wave starvation
+        if (dynamic_chunk < 2048 && rem > 2048) dynamic_chunk = 2048;
         // Subtask 1.2.3: micro-prefill bypass for short prompts
         if (rem <= c.prefill_chunk && rem <= 1024) {
             dynamic_chunk = std::min<int64_t>(c.prefill_chunk, rem);
@@ -1025,7 +1023,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     bool defer_snapshots = false;   // set from the overlap gate below (finish() is defined earlier)
     bool pipeline_in_flight = true; // S26f3: maintained by the round loop; gates admission-time flushes
     auto save_slot_snapshot = [&](Impl::Slot& s, int64_t prefix_len, const std::vector<int32_t>& tokens, bool safe_no_evict = false) {
-        if (prefix_len < 256 || prefix_len > kSnapshotMaxPrefixTokens || tokens.size() < (size_t) prefix_len) return;
+        if (prefix_len < 64 || prefix_len > kSnapshotMaxPrefixTokens || tokens.size() < (size_t) prefix_len) return;
         s.saved_prefix = prefix_len;
         s.saved_consumed.assign(tokens.begin(), tokens.begin() + prefix_len);
         for (size_t st = 0; st < m.stages.size(); ++st) {
@@ -1104,7 +1102,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             // is unusable for the next (appended) turn.  Capture the deepest real state below the
             // end instead: either exactly at the end (small prompts) or the last pre-end state
             // (within the final prefill chunk).  The state is copied NOW, so its position is real.
-            if (n < 256 || n > pos) continue;
+            if (n < 64 || n > pos) continue;
             if (n != pos && (pos - n) > 6208) continue;
             s.prompt_snap_done = true;
             save_slot_snapshot(s, n, s.consumed, /*safe_no_evict=*/true);   // S26f7/S26f9
@@ -1775,9 +1773,12 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                     while (match_len < limit && held.consumed[(size_t) match_len] == (int32_t) tokens[(size_t) match_len]) {
                         ++match_len;
                     }
-                    if (match_len >= 256 && match_len > candL) {
-                        candL = match_len;
-                        cand = ptr.get();
+                    if (match_len >= 64) {
+                        const bool sess_match = (pending[q].session != 0 && held.session == pending[q].session);
+                        if (match_len > candL || (match_len == candL && sess_match)) {
+                            candL = match_len;
+                            cand = ptr.get();
+                        }
                     }
                 }
 
@@ -1799,7 +1800,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             for (size_t q = 0; q < qn; ++q) {
                 const auto& tokens = pending[q].tokens;
                 const int64_t nmax = (int64_t) tokens.size() - 1;
-                if (nmax < 256 || nmax <= best) continue;
+                if (nmax < 64 || nmax <= best) continue;
                 auto match = radix_tree.match_prefix(tokens.data(), tokens.size());
                 if (std::getenv("STRATA_S26F_LOG"))
                     std::fprintf(stderr, "S26F match: qlen=%zu matched=%lld node=%lld nodecov=%lld\n",
@@ -1811,7 +1812,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 // while partial edge hits are truncated to 64-token page boundaries (M_safe = (M / 64) * 64).
                 // Both are safe to restore from Host RAM, with remainder tokens prefilled as catch-up.
                 const bool pqp_match = match.node && (match.matched_tokens == match.node->prefix_len || match.matched_tokens % 64 == 0);
-                if (pqp_match && match.matched_tokens >= 256 && match.matched_tokens > best && nmax >= match.matched_tokens) {
+                if (pqp_match && match.matched_tokens >= 64 && match.matched_tokens > best && nmax >= match.matched_tokens) {
                     if (best_node && best_node != match.node) {
                         radix_tree.release(best_node);
                     }
@@ -1861,7 +1862,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 for (auto& p_ptr : m.slots) {
                     auto* p = p_ptr.get();
                     const int64_t valid_len = p->saved_prefix;
-                    if (valid_len < 256 || valid_len > nmax || valid_len <= best) continue;
+                    if (valid_len < 64 || valid_len > nmax || valid_len <= best) continue;
                     bool same = true;
                     for (int64_t i = 0; i < valid_len && same; ++i) {
                         same = (p->saved_consumed[(size_t) i] == (int32_t) tokens[(size_t) i]);
@@ -1910,12 +1911,24 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             const int64_t req_len = (int64_t) req.tokens.size();
             Impl::Slot* pick = nullptr;
 
+            // 0. Prefer idle slot matching request session
+            if (req.session != 0) {
+                for (auto& ptr : m.slots) {
+                    if (!ptr->active.load() && req_len < ptr->max_context && ptr->session == req.session &&
+                        std::find(admitted_this_round.begin(), admitted_this_round.end(), ptr.get()) == admitted_this_round.end()) {
+                        pick = ptr.get();
+                        break;
+                    }
+                }
+            }
             // 1. Prefer an empty slot (consumed.empty()) to preserve cached slots for other conversations
-            for (auto& ptr : m.slots) {
-                if (!ptr->active.load() && req_len < ptr->max_context && ptr->consumed.empty() &&
-                    std::find(admitted_this_round.begin(), admitted_this_round.end(), ptr.get()) == admitted_this_round.end()) {
-                    pick = ptr.get();
-                    break;
+            if (pick == nullptr) {
+                for (auto& ptr : m.slots) {
+                    if (!ptr->active.load() && req_len < ptr->max_context && ptr->consumed.empty() &&
+                        std::find(admitted_this_round.begin(), admitted_this_round.end(), ptr.get()) == admitted_this_round.end()) {
+                        pick = ptr.get();
+                        break;
+                    }
                 }
             }
             // 2. If no empty slots, pick round-robin / rotation to avoid constantly thrashing Slot 0
