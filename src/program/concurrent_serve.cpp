@@ -218,6 +218,9 @@ struct ConcurrentServe::Impl {
             float* R_saved = nullptr;
             int32_t ple_prev_saved[2] = {-1, -1};
             int32_t ple_token_saved = -1;
+            // Frontier 2: Non-blocking multi-stage KV fork overlapping
+            cudaEvent_t fork_event = nullptr;
+            bool fork_in_flight = false;
             // TODO(C4 run-side): per-stage destruction guard (a core::OnDevice member) is deferred - OnDevice
             // is neither default-constructible nor movable, and StageSlot lives in a std::vector.
         };
@@ -271,6 +274,7 @@ struct ConcurrentServe::Impl {
                 if (gs.gdn_saved) cudaFree(gs.gdn_saved);
                 if (gs.ple_saved) cudaFree(gs.ple_saved);
                 if (gs.R_saved) cudaFree(gs.R_saved);
+                if (gs.fork_event) cudaEventDestroy(gs.fork_event);
             }
         }
     };
@@ -392,6 +396,7 @@ bool ConcurrentServe::prepare(const core::ModelGeometry& g, core::SessionState& 
         for (size_t st = 0; st < stages.size(); ++st) {
             auto& gs = s->stages[st];
             const core::OnDevice on(stages[st].device);
+            cudaEventCreateWithFlags(&gs.fork_event, cudaEventDisableTiming);
             if (i == 0) {
                 // Slot 0 borrows the CLI's chain: the primary on stage 0, the CLI stage sessions beyond it.
                 gs.state = st == 0 ? &primary : stages[st].session;
@@ -833,6 +838,14 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             dynamic_chunk = std::min<int64_t>(c.prefill_chunk, rem);
         }
         const int64_t n = std::min<int64_t>(dynamic_chunk, rem);
+        // Frontier 2: Enforce GPU stream dependency prior to prefill chunk launch
+        for (size_t st = 0; st < s.stages.size(); ++st) {
+            if (s.stages[st].fork_in_flight) {
+                const core::OnDevice on(m.stages[st].device);
+                cudaStreamWaitEvent(m.stage_rt[st].prompt_stream, s.stages[st].fork_event, 0);
+                s.stages[st].fork_in_flight = false;
+            }
+        }
         const auto start = Clock::now();
         if (!s.stages[0].prompt.run(s.request.tokens.data() + read0, n, read0, chunk_err)) return false;
         // Lane pipeline-prefill: the chunk that completes this slot's prompt must drain the deferred
@@ -1459,6 +1472,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             const auto& sg = m.stages[st];
             const core::OnDevice on(sg.device);
             auto& gs = s.stages[st];
+            if (!gs.fork_event) cudaEventCreateWithFlags(&gs.fork_event, cudaEventDisableTiming);
             uint8_t* base = nullptr;
             const int64_t slot_context = s.max_context > 0 ? s.max_context : c.context;
             const int64_t def_bytes = (int64_t) core::session_bytes(g, slot_context, m.session_k, sg.lb, sg.le);
@@ -1601,6 +1615,9 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         } else if (parent != nullptr) {
             // SPRINT 1: Cross-slot or self-slot prefix fork from snapshot
             s.consumed.assign(parent->saved_consumed.begin(), parent->saved_consumed.begin() + reused);
+            // Frontier 2: Non-blocking multi-stage KV fork overlapping
+            // Dispatch asynchronous snapshot fork concurrently across each stage's prompt stream
+            // and record a completion event per stage instead of host-blocking synchronization.
             for (size_t st = 0; st < m.stages.size(); ++st) {
                 const core::OnDevice on(m.stages[st].device);
                 std::string fork_err;
@@ -1612,10 +1629,10 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                     err = "concurrency: snapshot fork failed on stage " + std::to_string(st) + ": " + fork_err;
                     return false;
                 }
-            }
-            for (size_t st = 0; st < m.stage_rt.size(); ++st) {
-                const core::OnDevice on(m.stages[st].device);
-                if (cudaStreamSynchronize(m.stage_rt[st].prompt_stream) != cudaSuccess) { err = "concurrency: fork stream sync failed"; return false; }
+                if (s.stages[st].fork_event) {
+                    cudaEventRecord(s.stages[st].fork_event, m.stage_rt[st].prompt_stream);
+                    s.stages[st].fork_in_flight = true;
+                }
             }
             if (s.draft && parent->draft) {
                 std::string draft_err;
