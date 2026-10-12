@@ -640,6 +640,82 @@ void gpu_stamp(unsigned long long* buf, int i, void* stream) {
 // Task 7.2: Device-Side Speculative Tree Verification & Path Selection Kernel
 // Cross-Engine Reference: Sequoia (SOSP 2024), EAGLE-2 (arXiv:2406.16858)
 namespace {
+// Frontier 4: Warp-level MTP Tree Branch Selection Kernel
+__global__ void mtp_tree_branch_select_kernel(
+    const float* __restrict__ logits,
+    int vocab_size,
+    const int32_t* __restrict__ anchor_token,
+    int64_t base_pos,
+    int32_t* __restrict__ out_tree_tokens,
+    int32_t* __restrict__ out_parents,
+    int32_t* __restrict__ out_depths,
+    int64_t* __restrict__ out_positions,
+    float* __restrict__ out_log_probs) {
+
+    // Thread 0 initializes root node
+    if (threadIdx.x == 0) {
+        int32_t root_tok = anchor_token ? *anchor_token : 0;
+        out_tree_tokens[0] = root_tok;
+        out_parents[0] = -1;
+        out_depths[0] = 0;
+        out_positions[0] = base_pos;
+        out_log_probs[0] = 0.0f;
+    }
+
+    // Warp-level Top-2 reduction over vocab logits
+    float max1 = -1e30f;
+    int32_t id1 = 0;
+    float max2 = -1e30f;
+    int32_t id2 = 0;
+
+    for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
+        float val = logits[i];
+        if (val > max1) {
+            max2 = max1; id2 = id1;
+            max1 = val; id1 = i;
+        } else if (val > max2) {
+            max2 = val; id2 = i;
+        }
+    }
+
+    // Warp shuffle reduction
+    for (int offset = 16; offset > 0; offset /= 2) {
+        float other1 = __shfl_down_sync(0xffffffff, max1, offset);
+        int32_t other_id1 = __shfl_down_sync(0xffffffff, id1, offset);
+        float other2 = __shfl_down_sync(0xffffffff, max2, offset);
+        int32_t other_id2 = __shfl_down_sync(0xffffffff, id2, offset);
+
+        if (other1 > max1) {
+            max2 = (max1 > other2) ? max1 : other2;
+            id2 = (max1 > other2) ? id1 : other_id2;
+            max1 = other1;
+            id1 = other_id1;
+        } else if (other1 > max2) {
+            max2 = other1;
+            id2 = other_id1;
+        } else if (other2 > max2) {
+            max2 = other2;
+            id2 = other_id2;
+        }
+    }
+
+    if (threadIdx.x == 0) {
+        // Node 1: Top-1 candidate
+        out_tree_tokens[1] = id1;
+        out_parents[1] = 0;
+        out_depths[1] = 1;
+        out_positions[1] = base_pos + 1;
+        out_log_probs[1] = max1;
+
+        // Node 2: Top-2 candidate
+        out_tree_tokens[2] = id2;
+        out_parents[2] = 0;
+        out_depths[2] = 1;
+        out_positions[2] = base_pos + 1;
+        out_log_probs[2] = max2;
+    }
+}
+
 __global__ void spec_tree_verify_dp_kernel(
     const int32_t* __restrict__ tree_tokens,
     const int32_t* __restrict__ target_tokens,
@@ -746,6 +822,23 @@ __global__ void gpu_stamp_kernel(uint32_t* flag, uint32_t val) {
 }
 
 }  // namespace
+
+void mtp_tree_branch_select(const float* logits,
+                            int vocab_size,
+                            const int32_t* anchor_token,
+                            int64_t base_pos,
+                            int32_t* out_tree_tokens,
+                            int32_t* out_parents,
+                            int32_t* out_depths,
+                            int64_t* out_positions,
+                            float* out_log_probs,
+                            void* stream) {
+    if (!logits || vocab_size <= 0) return;
+    mtp_tree_branch_select_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(
+        logits, vocab_size, anchor_token, base_pos,
+        out_tree_tokens, out_parents, out_depths, out_positions, out_log_probs);
+    check("mtp_tree_branch_select");
+}
 
 void spec_tree_verify_dp(const int32_t* tree_tokens,
                          const int32_t* target_tokens,

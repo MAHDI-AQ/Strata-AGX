@@ -22,6 +22,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/spec/tree_buffer.hpp"
 
 #include <cuda_runtime.h>
 
@@ -82,6 +83,9 @@ public:
     /// step chain continues in draft_end); draft_end syncs, reads the drafts back and finishes the chain.
     /// draft() is exactly begin + end; the split lets the serve loop launch every slot before waiting any.
     bool draft_begin(int T, const int32_t* tokens, int64_t p, int a, std::string& err);
+    /// Frontier 4: Direct MTP Multi-Branch Tree Drafter Emission
+    /// Emits canonical candidate tree (Top-2 candidates at Depth 1, Depth 2 continuation) into DeviceTreeSpec.
+    bool draft_tree(int T, const int32_t* tokens, int64_t p, int a, strata::spec::DeviceTreeSpec& tree_spec, std::string& err);
     bool draft_end(int32_t* drafts, std::string& err, float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
 
     /// The first round: one cell (`cell`) from `R_row` (device) and `token` -> T-1 drafts.

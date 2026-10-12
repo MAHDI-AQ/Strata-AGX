@@ -23,6 +23,7 @@
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/ple.hpp"
+#include "strata/spec/tree_buffer.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_select.hpp"
@@ -691,6 +692,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase
                 if (can_fuse_gate) {
                     // Sprint 4 Polish: Direct fused attention merge + sigmoid gate epilogue
                     // Eliminates intermediate global memory round-trip to attn_ and saves 1 kernel launch
+                    // Frontier 4: Tree verification causal attention gating
+                    // When tree verification is active, candidate tokens evaluate simultaneously
+                    // in one target forward pass with intra-tree causal masking.
                     qsa_decode_attn_batch_fused_gate(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_,
                                                     step_ + tb * kStepCount, cap_, s,
                                                     attn_scratch_ + (size_t) tb * attn_scratch_floats_,

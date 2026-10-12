@@ -20,6 +20,8 @@
 #include <algorithm>
 #include <string>
 
+#include "strata/spec/tree_buffer.hpp"
+
 namespace strata::spec {
 
 inline constexpr int kMaxTreeNodes = 16;

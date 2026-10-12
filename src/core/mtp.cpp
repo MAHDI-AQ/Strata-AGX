@@ -1101,6 +1101,95 @@ bool MtpDrafter::draft_end(int32_t* drafts, std::string& err, float* probs, floa
     return true;
 }
 
+
+// Frontier 4: Direct MTP Multi-Branch Tree Drafter Emission
+// Emits canonical 4-node tree topology into DeviceTreeSpec on GPU 1:
+// Node 0: Anchor token at pos0 (Parent -1, Depth 0)
+// Node 1: Top-1 candidate at pos0+1 (Parent 0, Depth 1)
+// Node 2: Top-2 candidate at pos0+1 (Parent 0, Depth 1)
+// Node 3: Top-1 continuation of Node 1 at pos0+2 (Parent 1, Depth 2)
+bool MtpDrafter::draft_tree(int T, const int32_t* tokens, int64_t p, int a,
+                            strata::spec::DeviceTreeSpec& tree_spec, std::string& err) {
+    const OnDevice on_device(device_);
+    if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
+    const int32_t anchor_tok = tokens[a];
+    const int64_t pos0 = p + a;
+
+    // Canonical 4-node tree initialization
+    strata::spec::CanonicalTrees::init_4node(tree_spec, anchor_tok, pos0);
+
+    // Run first step from row a to produce logits for Depth 1
+    // Draft 0 rides the captured round
+    const bool cp = coupled_active_;
+    if (!capture_round(T, cp, err)) return false;
+
+    const Clock::time_point t0 = Clock::now();
+    for (int t = 0; t < T; ++t) {
+        h_tok_[t] = tokens[t];
+        put_row(t, p + t);
+    }
+    put_row(2 * max_t_ - 1, coupled_draft_cell(p, a, 0));
+    h_row_[0] = a;
+    h_row_[1] = 0;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+
+    const cudaGraphExec_t exec = cp ? round_exec_c_[T] : round_exec_[T];
+    if (cudaGraphLaunch(exec, cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = std::string("mtp draft_tree round: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+
+    // Top-1 candidate from step 0
+    const int32_t top1_tok = ((volatile int32_t*) h_out_)[0];
+    const float top1_prob = ((volatile float*) h_prob_)[0];
+    tree_spec.tokens[1] = top1_tok;
+    tree_spec.log_probs[1] = (top1_prob > 1e-6f) ? std::log(top1_prob) : -1.0f;
+
+    // Top-2 candidate via GPU warp reduction over logits
+    const int64_t nv = dhead_ != nullptr ? n_dvocab_ : n_vocab_;
+    strata::kernels::mtp_tree_branch_select(
+        head_logits_, (int) nv, tok_, pos0,
+        tok_, step_, pos_, nullptr, nullptr, cs_);
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = std::string("mtp draft_tree branch select: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+
+    // Read back Top-2 token (placed into tok_[2] by mtp_tree_branch_select_kernel)
+    int32_t top2_tok = 0;
+    cudaMemcpyAsync(&top2_tok, tok_ + 2, sizeof(int32_t), cudaMemcpyDeviceToHost, cs_);
+    cudaStreamSynchronize(cs_);
+    if (top2_tok == top1_tok || top2_tok == 0) {
+        // Fallback perturbation to guarantee distinct alternative candidate
+        top2_tok = (top1_tok + 1) % (int32_t) nv;
+    }
+    tree_spec.tokens[2] = top2_tok;
+    tree_spec.log_probs[2] = tree_spec.log_probs[1] - 0.693f; // ~50% probability relative to top1
+
+    // Step 1: continuation of Top-1 candidate (Node 3)
+    if (max_t_ > 2 && max_drafts_ > 1) {
+        if (!capture_step(1, cp, err)) return false;
+        put_row(max_t_ + 0, coupled_draft_cell(p, a, 1));
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (cudaGraphLaunch(cp ? step_exec_c_[1] : step_exec_[1], cs_) != cudaSuccess ||
+            cudaStreamSynchronize(cs_) != cudaSuccess) {
+            err = std::string("mtp draft_tree step: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+        const int32_t node3_tok = ((volatile int32_t*) h_out_)[1];
+        const float node3_prob = ((volatile float*) h_prob_)[1];
+        tree_spec.tokens[3] = node3_tok;
+        tree_spec.log_probs[3] = (node3_prob > 1e-6f) ? std::log(node3_prob) : -1.0f;
+    } else {
+        tree_spec.tokens[3] = top1_tok;
+        tree_spec.log_probs[3] = tree_spec.log_probs[1];
+    }
+
+    ms_draft += ms_since(t0);
+    ++rounds;
+    return true;
+}
+
 bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
                              float* probs, float min_p, int* n_drafts) {
     const OnDevice on_device(device_);

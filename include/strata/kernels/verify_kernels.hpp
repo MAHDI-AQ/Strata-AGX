@@ -99,6 +99,20 @@ void window_ids(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_str
 /// Evaluates candidate node validity against target predictions, computes longest valid
 /// branch using DP with cumulative log-prob tie-breaking, and writes best_path_indices
 /// and n_accepted directly into device memory in < 15 us without host round-trips.
+/// Frontier 4: Warp-level MTP Tree Branch Selection Kernel
+/// Extracts Top-2 tokens from Depth 1 logits, initializes canonical tree topology,
+/// and sets up the root and depth-1 branch nodes on GPU.
+void mtp_tree_branch_select(const float* logits,
+                            int vocab_size,
+                            const int32_t* anchor_token,
+                            int64_t base_pos,
+                            int32_t* out_tree_tokens,
+                            int32_t* out_parents,
+                            int32_t* out_depths,
+                            int64_t* out_positions,
+                            float* out_log_probs,
+                            void* stream);
+
 void spec_tree_verify_dp(const int32_t* tree_tokens,
                          const int32_t* target_tokens,
                          const int32_t* parents,
