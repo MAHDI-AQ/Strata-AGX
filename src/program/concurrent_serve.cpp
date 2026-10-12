@@ -1300,18 +1300,19 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 while (accepted < s.count - 1 && s.window[accepted + 1] == s.output[accepted]) ++accepted;
                 int keep = accepted + 1;
 
-                // Sprint 2: Dynamic 2D Speculative Tree Evaluation (EAGLE-2 / Sequoia Style)
-                // When dynamic speculative tree evaluation is enabled, evaluate alternate branch paths
+                // Sprint 2 / v2.6.1: Dynamic Speculative Tree Evaluation (Strict Contiguous Prefix & DP Safety)
+                // In autoregressive decode, accepted tokens must form a contiguous valid chain from the prefix.
+                // Non-contiguous token matches violate autoregressive invariants and corrupt KV/GDN state.
                 static const bool s_spec_tree_active = [] {
                     const char* v = std::getenv("STRATA_SPEC_TREE_DYNAMIC");
                     return v != nullptr && std::atoi(v) != 0;
                 }();
                 if (s_spec_tree_active && s.count > 2) {
-                    for (int cand = accepted + 1; cand < s.count - 1; ++cand) {
-                        if (s.window[cand + 1] == s.output[cand]) {
-                            accepted = std::max(accepted, cand);
-                        }
+                    int contiguous_accepted = accepted;
+                    while (contiguous_accepted < s.count - 1 && s.window[contiguous_accepted + 1] == s.output[contiguous_accepted]) {
+                        ++contiguous_accepted;
                     }
+                    accepted = contiguous_accepted;
                     keep = accepted + 1;
                 }
 
