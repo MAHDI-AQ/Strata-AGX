@@ -20,32 +20,76 @@ function notice(message) { $("error").hidden = !message; text("error", message |
 function list() {
   const query = $("search").value.toLowerCase(), filter = $("filter").value;
   const visible = records.filter(r => `${r.id} ${r.path} ${r.model}`.toLowerCase().includes(query) && (filter === "all" || (filter === "active" ? active(r) : r.state === filter)));
-  const nextStamp = JSON.stringify([visible, selected]);
-  if (stamp === nextStamp) return;
-  stamp = nextStamp;
-  const focusId = document.activeElement?.dataset.request;
-  $("requests").replaceChildren();
+  const container = $("requests");
+
   if (!visible.length) {
-    const empty = document.createElement("div"); empty.className = "empty";
+    let empty = container.querySelector(".empty");
+    if (!empty) {
+      container.replaceChildren();
+      empty = document.createElement("div"); empty.className = "empty";
+      container.append(empty);
+    }
     empty.textContent = records.length ? "No matching requests." : "No requests yet. API calls will appear here automatically.";
-    $("requests").append(empty);
+    return;
+  } else {
+    const empty = container.querySelector(".empty");
+    if (empty) empty.remove();
   }
+
+  // Keyed in-place update by request ID
+  const existingMap = new Map();
+  for (const child of Array.from(container.children)) {
+    if (child.dataset?.request) existingMap.set(child.dataset.request, child);
+  }
+
+  const newIds = new Set(visible.map(r => r.id));
+  // Remove items not in visible
+  for (const [id, el] of existingMap.entries()) {
+    if (!newIds.has(id)) el.remove();
+  }
+
+  // Insert or update in order
+  let prevEl = null;
   for (const r of visible) {
-    const button = document.createElement("button"); button.className = `request${selected === r.id ? " selected" : ""}`;
-    button.dataset.request = r.id; button.setAttribute("aria-label", `Request ${r.id}`); button.setAttribute("aria-pressed", String(selected === r.id));
-    const row = document.createElement("div"); row.className = "row";
-    const time = document.createElement("span"); time.textContent = new Date(r.started_at * 1000).toLocaleTimeString();
-    const tag = document.createElement("span"); tag.className = `tag ${r.state}`; tag.textContent = r.state;
-    row.append(time, tag);
-    const endpoint = document.createElement("div"); endpoint.className = "endpoint"; endpoint.textContent = `POST ${r.path}`;
-    const meta = document.createElement("div"); meta.className = "small";
-    meta.textContent = `${r.id} · ${seconds(r.wallclock_s)} · ${r.stream ? "stream" : "JSON response"}${r.http_status ? ` · HTTP ${r.http_status}` : ""}`;
-    button.append(row, endpoint, meta);
-    button.onclick = async () => { selected = r.id; detail = null; list(); await showDetail(); };
-    $("requests").append(button);
-    if (focusId === r.id) button.focus({preventScroll:true});
+    let btn = existingMap.get(r.id);
+    const isSelected = selected === r.id;
+    const timeStr = new Date(r.started_at * 1000).toLocaleTimeString();
+    const metaStr = `${r.id} · ${seconds(r.wallclock_s)} · ${r.stream ? "stream" : "JSON response"}${r.http_status ? ` · HTTP ${r.http_status}` : ""}`;
+
+    if (!btn) {
+      btn = document.createElement("button");
+      btn.dataset.request = r.id;
+      btn.setAttribute("aria-label", `Request ${r.id}`);
+      btn.className = `request${isSelected ? " selected" : ""}`;
+      btn.setAttribute("aria-pressed", String(isSelected));
+      btn.innerHTML = `<div class="row"><span>${escText(timeStr)}</span><span class="tag ${r.state}">${escText(r.state)}</span></div>` +
+                      `<div class="endpoint">POST ${escText(r.path)}</div>` +
+                      `<div class="small">${escText(metaStr)}</div>`;
+      btn.onclick = async () => { selected = r.id; detail = null; list(); await showDetail(); };
+      if (prevEl) prevEl.after(btn); else container.prepend(btn);
+    } else {
+      btn.className = `request${isSelected ? " selected" : ""}`;
+      btn.setAttribute("aria-pressed", String(isSelected));
+      const rowSpan = btn.querySelector(".row > span:first-child");
+      if (rowSpan && rowSpan.textContent !== timeStr) rowSpan.textContent = timeStr;
+      const tagSpan = btn.querySelector(".row > span.tag");
+      if (tagSpan) {
+        if (tagSpan.className !== `tag ${r.state}`) tagSpan.className = `tag ${r.state}`;
+        if (tagSpan.textContent !== r.state) tagSpan.textContent = r.state;
+      }
+      const epDiv = btn.querySelector(".endpoint");
+      if (epDiv && epDiv.textContent !== `POST ${r.path}`) epDiv.textContent = `POST ${r.path}`;
+      const metaDiv = btn.querySelector(".small");
+      if (metaDiv && metaDiv.textContent !== metaStr) metaDiv.textContent = metaStr;
+
+      if (prevEl && btn.previousElementSibling !== prevEl) {
+        prevEl.after(btn);
+      }
+    }
+    prevEl = btn;
   }
 }
+function escText(s) { const d = document.createElement("div"); d.textContent = s || ""; return d.innerHTML; }
 function content() {
   if (!detail) return;
   let value = detail[pane] || (pane === "response" && detail.stream ? "Streaming response: see Output and the request error, if any." : "No content.");
@@ -86,6 +130,62 @@ async function refresh() {
     text("active", inflight ? `${inflight} active / queued` : status.auto_load ? "Loads automatically on the next request" : "No active requests");
     const last = records.find(r => !active(r));
     text("wall", last ? seconds(last.wallclock_s) : "—"); text("speed", speed(last?.timings?.predicted_per_second));
+    if (metrics) {
+      // Slot 0 & Slot 1 Rendering
+      const slots = metrics.slots || [];
+      for (let sId = 0; sId < 2; sId++) {
+        const slot = slots.find(s => s.id === sId) || { id: sId, status: "idle", prompt_tokens: 0, generated: 0 };
+        const tag = $(`slot${sId}-tag`);
+        const tokEl = $(`slot${sId}-tokens`);
+        const spEl = $(`slot${sId}-speed`);
+        const bar = $(`slot${sId}-bar`);
+        if (tag) {
+          tag.className = `tag ${slot.status}`;
+          tag.textContent = slot.status === "reading" ? `Reading [${slot.cache_tier || "Fresh"}]` : (slot.status === "generating" ? (slot.phase || "Generating") : "Idle");
+        }
+        if (slot.status === "reading") {
+          if (tokEl) tokEl.textContent = `${slot.prompt_read || slot.prompt_tokens || 0} / ${slot.prompt_tokens || 0} tokens`;
+          if (spEl) spEl.textContent = slot.prefill_tok_s ? `Prefill: ${slot.prefill_tok_s} tok/s` : "Prefill in progress";
+          if (bar) bar.style.width = slot.prompt_tokens ? `${Math.min(100, (100 * (slot.prompt_read || 0)) / slot.prompt_tokens)}%` : "40%";
+        } else if (slot.status === "generating") {
+          if (tokEl) tokEl.textContent = `${slot.generated || 0} of ${slot.max_tokens || "—"} tokens`;
+          if (spEl) spEl.textContent = slot.tok_s ? `Decode: ${slot.tok_s} tok/s` : "Generating";
+          if (bar) bar.style.width = slot.max_tokens ? `${Math.min(100, (100 * (slot.generated || 0)) / slot.max_tokens)}%` : "50%";
+        } else {
+          const lReq = slot.last_request;
+          if (lReq) {
+            if (tokEl) tokEl.textContent = `Last: ${lReq.output_tokens || 0} tokens (${lReq.duration_s || 0}s)`;
+            const pStr = lReq.prefill_tok_s ? ` · prefill ${lReq.prefill_tok_s} t/s` : "";
+            const dStr = lReq.decode_tok_s ? `${lReq.decode_tok_s} t/s` : "done";
+            if (spEl) spEl.textContent = `${dStr}${pStr} · [${lReq.cache_tier || "Fresh"}]`;
+          } else {
+            if (tokEl) tokEl.textContent = "0 / 0 tokens";
+            if (spEl) spEl.textContent = "Standing by";
+          }
+          if (bar) bar.style.width = "0%";
+        }
+      }
+
+      // Radix 3-Tier Stats Rendering
+      if (metrics.radix) {
+        const rx = metrics.radix;
+        if ($("radix-mon-tag")) $("radix-mon-tag").textContent = rx.cache_tier || "3-Tier (VRAM → Host → NVMe)";
+        if ($("radix-mon-l1")) $("radix-mon-l1").textContent = `${rx.l1_vram_snapshots || 4} snap · ${rx.l1_vram_mib || 1600} MiB`;
+        if ($("radix-mon-l2")) $("radix-mon-l2").textContent = `${rx.l2_host_slots || 64} slots · ${rx.l2_host_gib || 32} GiB`;
+        if ($("radix-mon-l3")) $("radix-mon-l3").textContent = `${rx.l3_nvme_snapshots || 0} snap · ${rx.l3_nvme_gib || 0} GiB`;
+        if ($("radix-mon-hit")) $("radix-mon-hit").textContent = `${(rx.hit_rate || 0).toFixed(1)}%`;
+        if ($("radix-mon-nodes")) $("radix-mon-nodes").textContent = `${rx.total_nodes || 0} nodes`;
+      }
+
+      // MTP Speculative Stats Rendering
+      if (metrics.mtp) {
+        const mt = metrics.mtp;
+        if ($("mtp-mon-acc")) $("mtp-mon-acc").textContent = `${(mt.acceptance_rate || 0).toFixed(1)}%`;
+        if ($("mtp-mon-ratio")) $("mtp-mon-ratio").textContent = `${mt.drafts_accepted || 0} / ${mt.drafts_offered || 0}`;
+        if ($("mtp-mon-speedup")) $("mtp-mon-speedup").textContent = `${(mt.speculative_speedup || 1.0).toFixed(2)}x`;
+        if ($("mtp-mon-rolling")) $("mtp-mon-rolling").textContent = `${(mt.rolling_acceptance_rate || 0).toFixed(1)}%`;
+      }
+    }
     if (metrics && metrics.hardware && Array.isArray(metrics.hardware.gpus)) {
       const g0 = metrics.hardware.gpus[0];
       const g1 = metrics.hardware.gpus[1];

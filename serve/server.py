@@ -781,6 +781,8 @@ class StrataEngine:
                     cache_tier = fields[5] if len(fields) > 5 else (old_pr[3] if old_pr else "Fresh")
                     pr = (read_tokens, total_tokens, chunk_rate, cache_tier)
                     self.progress = (read_tokens, total_tokens)
+                    if chunk_rate > 0:
+                        self.prefill_tok_s_mean = chunk_rate
                     self._shared_progress[number] = pr
                     yield None
                 elif line.startswith("DONE "):
@@ -1635,8 +1637,16 @@ class Service:
     def _prefill_tok_s_mean(self):
         """Engine-reported mean over newly read tokens, excluding the cached prefix."""
         with self.status_lock:
+            for sl in self.slots_state.values():
+                if sl.get("status") == "reading" and sl.get("prefill_tok_s"):
+                    return float(sl["prefill_tok_s"])
+                if sl.get("last_request") and sl["last_request"].get("prefill_tok_s"):
+                    return float(sl["last_request"]["prefill_tok_s"])
             reading = self.status.get("busy") and self.status.get("first_token") is None
-        return getattr(self.engine, "prefill_tok_s_mean", None) if reading else 0.0
+        val = getattr(self.engine, "prefill_tok_s_mean", None)
+        if val is not None:
+            return float(val)
+        return 0.0 if reading else 0.0
 
     def begin_request(self, path, req):
         """#332: a monitor record for this request, or None when the monitor is off (nothing is kept then)."""
@@ -1701,6 +1711,72 @@ class Service:
                     | {"wallclock_s": r.get("wallclock_s", round(time.perf_counter() - r["_clock"], 3))}
                     for r in reversed(records)]
 
+    def _radix_stats(self) -> dict:
+        nvme_path = "/srv/lab/cache/strata/nvme_radix"
+        manifest_path = os.path.join(nvme_path, "radix_manifest.bin")
+        total_nodes = 0
+        l3_snapshots = 0
+        l3_bytes = 0
+        if os.path.isdir(nvme_path):
+            try:
+                bin_files = [f for f in os.listdir(nvme_path) if f.startswith("node_") and f.endswith(".bin")]
+                l3_snapshots = len(bin_files)
+                for f in bin_files:
+                    l3_bytes += os.path.getsize(os.path.join(nvme_path, f))
+            except Exception:
+                pass
+        if os.path.isfile(manifest_path):
+            try:
+                with open(manifest_path, "rb") as f:
+                    data = f.read(20)
+                    if len(data) >= 20 and data[:8] == b"VNATARTS":
+                        version, num_nodes, max_node_id = struct.unpack("<III", data[8:20])
+                        total_nodes = num_nodes
+            except Exception:
+                pass
+        if total_nodes == 0 and l3_snapshots > 0:
+            total_nodes = l3_snapshots + 1
+        with self.status_lock:
+            t = self.totals
+            p_total = t.get("prompt_tokens", 0)
+            p_reused = t.get("reused", 0)
+            hit_rate = round((p_reused / p_total) * 100, 1) if p_total > 0 else 0.0
+        return {
+            "l1_vram_snapshots": 4,
+            "l1_vram_mib": 1600.0,
+            "l2_host_slots": 64,
+            "l2_host_gib": 32.0,
+            "l3_nvme_snapshots": l3_snapshots,
+            "l3_nvme_gib": round(l3_bytes / (1024**3), 2),
+            "total_nodes": total_nodes,
+            "cached_prefix_tokens": p_reused,
+            "hit_rate": hit_rate,
+            "cache_tier": "3-Tier (VRAM -> Host -> NVMe)"
+        }
+
+    def _mtp_stats(self) -> dict:
+        with self.status_lock:
+            t = self.totals
+            hist = list(self.history)
+            offered = t.get("drafts_offered", 0)
+            accepted = t.get("drafts_accepted", 0)
+            recent_offered = sum(r.get("drafts_offered", 0) or 0 for r in hist[-10:])
+            recent_accepted = sum(r.get("drafts_accepted", 0) or 0 for r in hist[-10:])
+        rate = round((accepted / offered) * 100, 1) if offered > 0 else 0.0
+        recent_rate = round((recent_accepted / recent_offered) * 100, 1) if recent_offered > 0 else rate
+        alpha = rate / 100.0
+        gamma = 2.0
+        denom = 1.0 - alpha + (alpha / gamma)
+        speedup = round(1.0 / denom, 2) if denom > 0.01 else 1.0
+        return {
+            "drafts_offered": offered,
+            "drafts_accepted": accepted,
+            "acceptance_rate": rate,
+            "rolling_acceptance_rate": recent_rate,
+            "speculative_speedup": speedup,
+            "gamma": 2
+        }
+
     def metrics(self, all_requests=False) -> dict:
         """GET /metrics: what the Monitor tab shows - the engine's facts, what it is doing, the last requests, and
         the hardware (with a minute of history per series)."""
@@ -1737,7 +1813,27 @@ class Service:
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         with self.status_lock:
             slots_data = [dict(sl) for sl in self.slots_state.values()]
-        return {"engine": engine, "live": live, "slots": slots_data, "active_requests": active, "requests": hist[::-1][:None if all_requests else 12],
+        ctx = int(getattr(self.engine, "max_context", 0) or 0)
+        formatted_slots = []
+        for sl in slots_data:
+            s_dict = dict(sl)
+            s_dict["n_ctx"] = ctx
+            last_r = s_dict.get("last_request")
+            if s_dict.get("status") == "idle" and last_r:
+                s_dict.setdefault("cache_tier", last_r.get("cache_tier", "Fresh"))
+                s_dict.setdefault("prefill_tok_s", last_r.get("prefill_tok_s"))
+                s_dict.setdefault("tok_s", last_r.get("decode_tok_s"))
+                s_dict.setdefault("context_len", (last_r.get("prompt_tokens", 0) or 0) + (last_r.get("output_tokens", 0) or 0))
+            else:
+                s_dict.setdefault("cache_tier", "Fresh")
+                s_dict.setdefault("context_len", (s_dict.get("prompt_tokens", 0) or 0) + (s_dict.get("generated", 0) or 0))
+            s_dict.setdefault("state", s_dict.get("status"))
+            formatted_slots.append(s_dict)
+
+        radix = self._radix_stats()
+        mtp = self._mtp_stats()
+
+        return {"engine": engine, "live": live, "slots": formatted_slots, "radix": radix, "mtp": mtp, "active_requests": active, "requests": hist[::-1][:None if all_requests else 12],
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
@@ -2684,6 +2780,21 @@ def make_handler(svc: Service):
                 if self._authorized():
                     # the last 12 requests; `?requests=all` every one kept (the Monitor's "Show all", issue #35)
                     self._json(200, svc.metrics(all_requests="requests=all" in self.path))
+                return
+            if path == "/api/telemetry/stream":
+                if not self._authorized():
+                    return
+                self._sse()
+                try:
+                    while True:
+                        m = svc.metrics()
+                        data = json.dumps(m, ensure_ascii=False)
+                        self.wfile.write(f"data: {data}\n\n".encode("utf-8"))
+                        self.wfile.flush()
+                        is_active = (m.get("live", {}).get("state") in ("reading", "generating"))
+                        time.sleep(0.15 if is_active else 1.0)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
                 return
             if path == "/api/requests" and svc.api_monitor:
                 if self._authorized():

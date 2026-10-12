@@ -136,13 +136,17 @@ $("metrics").innerHTML = METRICS.map((m) => `
 
 function spark(id, values, max) {
   const svg = $(id);
-  const v = (values || []).map((x) => (x == null ? 0 : x));
-  if (v.length < 2) { svg.querySelector(".line").setAttribute("d", ""); svg.querySelector(".area").setAttribute("d", ""); return; }
+  if (!svg) return;
+  const lineEl = svg.querySelector(".line");
+  const areaEl = svg.querySelector(".area");
+  if (!lineEl || !areaEl) return;
+  const v = (values || []).map((x) => (x == null || isNaN(x) ? 0 : Number(x)));
+  if (v.length < 2) { lineEl.setAttribute("d", ""); areaEl.setAttribute("d", ""); return; }
   const top = Math.max(max || 0, ...v, 1e-9);
   const pts = v.map((x, i) => [(i / (v.length - 1)) * 100, 30 - (x / top) * 26]);
   const line = pts.map((p, i) => `${i ? "L" : "M"}${p[0].toFixed(2)},${p[1].toFixed(2)}`).join("");
-  svg.querySelector(".line").setAttribute("d", line);
-  svg.querySelector(".area").setAttribute("d", `${line}L100,32L0,32Z`);
+  lineEl.setAttribute("d", line);
+  areaEl.setAttribute("d", `${line}L100,32L0,32Z`);
 }
 function setMetric(key, value, unit, sub) {
   $(`mv-${key}`).innerHTML = value == null ? "–" : `${esc(value)}${unit ? `<small>${esc(unit)}</small>` : ""}`;
@@ -151,25 +155,49 @@ function setMetric(key, value, unit, sub) {
 
 let lastMetrics = null, metricsFailures = 0, keyWarned = false, mcpTick = 0;
 let reqShowAll = false;   // the Monitor's request table: the last 12, or every one the server keeps (issue #35)
-async function poll() {
-  try {
-    const r = await fetch(reqShowAll ? "metrics?requests=all" : "metrics", {headers: headers()});
-    if (r.status === 401) {
-      setPill("error", "API key needed");
-      if (!keyWarned) { keyWarned = true; toast("warn", "API key needed", "This server needs a key: add it under About > Settings.", 6000); }
-    } else if (r.ok) {
-      lastMetrics = await r.json();
-      metricsFailures = 0;
-      render(lastMetrics);
-    } else {
-      throw new Error(`HTTP ${r.status}`);
-    }
-  } catch (e) {
-    if (++metricsFailures === 3) setPill("error", "Server not reachable");
+let sseSource = null;
+
+function setupTelemetryStream() {
+  if (window.EventSource && !sseSource) {
+    try {
+      sseSource = new EventSource("api/telemetry/stream");
+      sseSource.onmessage = (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          lastMetrics = data;
+          metricsFailures = 0;
+          render(data);
+        } catch (_) {}
+      };
+      sseSource.onerror = () => {
+        if (sseSource) { sseSource.close(); sseSource = null; }
+      };
+    } catch (_) { sseSource = null; }
   }
-  if (tab === "monitor" && ++mcpTick % 10 === 0) loadMcp();       // server states change rarely: every 10 s
-  setTimeout(poll, 1000);
 }
+
+async function poll() {
+  if (!sseSource) {
+    try {
+      const r = await fetch(reqShowAll ? "metrics?requests=all" : "metrics", {headers: headers()});
+      if (r.status === 401) {
+        setPill("error", "API key needed");
+        if (!keyWarned) { keyWarned = true; toast("warn", "API key needed", "This server needs a key: add it under About > Settings.", 6000); }
+      } else if (r.ok) {
+        lastMetrics = await r.json();
+        metricsFailures = 0;
+        render(lastMetrics);
+      } else {
+        throw new Error(`HTTP ${r.status}`);
+      }
+    } catch (e) {
+      if (++metricsFailures === 3) setPill("error", "Server not reachable");
+    }
+  }
+  if (tab === "monitor" && ++mcpTick % 10 === 0) loadMcp();
+  setTimeout(poll, sseSource ? 3000 : 1000);
+}
+setupTelemetryStream();
 
 function setPill(state, text) {
   $("pill").dataset.state = state === "error" ? "queued" : state;
@@ -198,7 +226,7 @@ function render(m) {
     setPill("idle", "Slots Ready · S0: Idle · S1: Idle");
   }
   if (live.queued > 0) setPill("queued", `${live.queued} queued`);
-  if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept, m.slots || []);
+  if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept, m.slots || [], m.radix, m.mtp);
   if (tab === "about") renderAbout(eng, hw, st);
 }
 
@@ -211,7 +239,7 @@ function renderTotals(t) {
   return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
          `${fmt(t.output_tokens)} written${oSpeed}`;
 }
-function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, slotsList) {
+function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, slotsList, radixData, mtpData) {
   // Dual Slot State Cards rendering (Slot 0 and Slot 1)
   const slots = slotsList || [];
   for (let sId = 0; sId < 2; sId++) {
@@ -359,22 +387,76 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, slots
   $("temp-text").textContent = hw.gpu_temp == null ? "–" : `${fmt(hw.gpu_temp)} °C`;
   $("temp-bar").style.width = hw.gpu_temp == null ? "0%" : `${Math.min(100, hw.gpu_temp)}%`;
 
-  // recent requests
+  // Advanced Arch Cards: Radix 3-Tier KV & MTP
+  if (radixData) {
+    if ($("radix-tier-tag")) $("radix-tier-tag").textContent = radixData.cache_tier || "3-Tier (VRAM → Host → NVMe)";
+    if ($("radix-l1-val")) $("radix-l1-val").textContent = `${radixData.l1_vram_snapshots || 4} snap · ${fmt(radixData.l1_vram_mib || 1600)} MiB`;
+    if ($("radix-l2-val")) $("radix-l2-val").textContent = `${radixData.l2_host_slots || 64} slots · ${fmt(radixData.l2_host_gib || 32, 1)} GiB`;
+    if ($("radix-l3-val")) $("radix-l3-val").textContent = `${radixData.l3_nvme_snapshots || 0} snap · ${fmt(radixData.l3_nvme_gib || 0, 1)} GiB`;
+    const rHit = radixData.hit_rate != null ? Number(radixData.hit_rate) : 0;
+    if ($("radix-hit-rate")) $("radix-hit-rate").textContent = `${rHit.toFixed(1)}%`;
+    if ($("radix-hit-bar")) $("radix-hit-bar").style.width = `${Math.min(100, rHit)}%`;
+    if ($("radix-nodes-count")) $("radix-nodes-count").textContent = `${fmt(radixData.total_nodes || 0)} Radix Nodes`;
+  }
+  if (mtpData) {
+    if ($("mtp-acc-rate")) $("mtp-acc-rate").textContent = `${fmt(mtpData.acceptance_rate || 0, 1)}%`;
+    if ($("mtp-ratio")) $("mtp-ratio").textContent = `${fmt(mtpData.drafts_accepted || 0)} / ${fmt(mtpData.drafts_offered || 0)}`;
+    if ($("mtp-speedup")) $("mtp-speedup").textContent = `${fmt(mtpData.speculative_speedup || 1.0, 2)}x`;
+    if ($("mtp-rolling-rate")) $("mtp-rolling-rate").textContent = `${fmt(mtpData.rolling_acceptance_rate || 0, 1)}%`;
+    if ($("mtp-acc-bar")) $("mtp-acc-bar").style.width = `${Math.min(100, mtpData.acceptance_rate || 0)}%`;
+  }
+
+  // recent requests - in-place update without DOM flicker
   const body = $("req-body");
-  if (!requests.length) {
-    body.innerHTML = `<tr><td colspan="8" class="muted">No requests yet</td></tr>`;
+  const visibleReqs = requests.slice(0, reqShowAll ? requests.length : 12);
+  if (!visibleReqs.length) {
+    if (!body.querySelector(".empty-row")) {
+      body.innerHTML = `<tr class="empty-row"><td colspan="8" class="muted">No requests yet</td></tr>`;
+    }
   } else {
+    const emptyRow = body.querySelector(".empty-row");
+    if (emptyRow) emptyRow.remove();
+
     const badge = {stop: ["", "Done"], length: ["", "Max tokens"], cancel: ["st-badge--queued", "Stopped"],
                    disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"]};
-    body.innerHTML = requests.slice(0, reqShowAll ? requests.length : 12).map((r) => {
+
+    // Ensure table has matching number of rows
+    const currentRows = Array.from(body.querySelectorAll("tr:not(.empty-row)"));
+    while (currentRows.length < visibleReqs.length) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td></td><td></td><td class="num"></td><td class="num"></td><td class="num"></td><td class="num"></td><td class="num"></td><td class="num"></td>`;
+      body.appendChild(tr);
+      currentRows.push(tr);
+    }
+    while (currentRows.length > visibleReqs.length) {
+      const tr = currentRows.pop();
+      tr.remove();
+    }
+
+    // Update cell contents in-place
+    visibleReqs.forEach((r, idx) => {
+      const tr = currentRows[idx];
       const [cls, text] = badge[r.finish] || ["", r.finish || "–"];
       const t = new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
       const proj = r.projection == null ? "" : ` <span class="st-badge${r.projection ? " st-badge--reading" : ""}" title="experimental speed projection ${r.projection ? "on" : "off"}">${r.projection ? "ESP" : "stock"}</span>`;
       const hit = r.hit_rate == null ? "–" : `${(r.hit_rate * 100).toFixed(1)}%`;
-      return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${proj}</td><td class="num">${fmt(r.prompt_tokens)}</td>
-        <td class="num">${fmt(r.reused)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
-        <td class="num">${hit}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
-    }).join("");
+
+      const cells = tr.children;
+      if (cells[0].textContent !== t) cells[0].textContent = t;
+      const statusHtml = `<span class="st-badge ${cls}">${esc(text)}</span>${proj}`;
+      if (cells[1].innerHTML !== statusHtml) cells[1].innerHTML = statusHtml;
+      const ptStr = fmt(r.prompt_tokens);
+      if (cells[2].textContent !== ptStr) cells[2].textContent = ptStr;
+      const reStr = fmt(r.reused);
+      if (cells[3].textContent !== reStr) cells[3].textContent = reStr;
+      const outStr = fmt(r.output_tokens);
+      if (cells[4].textContent !== outStr) cells[4].textContent = outStr;
+      const spStr = fmt(r.decode_tok_s, 1);
+      if (cells[5].textContent !== spStr) cells[5].textContent = spStr;
+      if (cells[6].textContent !== hit) cells[6].textContent = hit;
+      const durStr = `${fmt(r.duration_s, 1)} s`;
+      if (cells[7].textContent !== durStr) cells[7].textContent = durStr;
+    });
   }
   const all = $("req-all");
   kept = kept == null ? requests.length : kept;

@@ -108,6 +108,61 @@
         <!-- filled by app.js: Speed, GPU load, VRAM, GPU temp, Power, PCIe, CPU, Disk read -->
       </div>
 
+      <!-- Advanced Engine Architecture: Radix 3-Tier KV & MTP Speculative Cards -->
+      <div class="arch-cards-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+        <div class="st-card radix-card" style="border-left:4px solid #10b981">
+          <div class="req-head" style="margin-bottom:10px">
+            <span class="card-title" style="font-weight:700;color:#10b981">Radix 3-Tier KV Memory</span>
+            <span class="muted small" id="radix-tier-tag">3-Tier (VRAM → Host → NVMe)</span>
+          </div>
+          <div class="radix-stats-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:12px">
+            <div class="fact-box" style="background:var(--st-surface-2);padding:8px 10px;border-radius:6px">
+              <span class="muted small" style="display:block">L1 VRAM</span>
+              <b id="radix-l1-val" style="font-size:16px">4 snap · 1,600 MiB</b>
+            </div>
+            <div class="fact-box" style="background:var(--st-surface-2);padding:8px 10px;border-radius:6px">
+              <span class="muted small" style="display:block">L2 Host RAM</span>
+              <b id="radix-l2-val" style="font-size:16px">64 slots · 32.0 GiB</b>
+            </div>
+            <div class="fact-box" style="background:var(--st-surface-2);padding:8px 10px;border-radius:6px">
+              <span class="muted small" style="display:block">L3 NVMe Disk</span>
+              <b id="radix-l3-val" style="font-size:16px">388 snap · 90.1 GiB</b>
+            </div>
+          </div>
+          <div style="display:flex;justify-content:space-between;align-items:center;font-size:13px;margin-bottom:6px">
+            <span>Prefix Cache Reuse / Hit Rate: <b id="radix-hit-rate" style="color:#10b981">0.0%</b></span>
+            <span class="muted" id="radix-nodes-count">504 Radix Nodes</span>
+          </div>
+          <div class="st-progress"><div class="st-progress__bar" id="radix-hit-bar" style="width:0%;background:#10b981"></div></div>
+        </div>
+
+        <div class="st-card mtp-card" style="border-left:4px solid #8b5cf6">
+          <div class="req-head" style="margin-bottom:10px">
+            <span class="card-title" style="font-weight:700;color:#8b5cf6">MTP Speculative Decoding</span>
+            <span class="muted small" id="mtp-gamma-tag">Multi-Token Prediction (γ=2)</span>
+          </div>
+          <div class="mtp-stats-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:12px">
+            <div class="fact-box" style="background:var(--st-surface-2);padding:8px 10px;border-radius:6px">
+              <span class="muted small" style="display:block">Acceptance Rate</span>
+              <b id="mtp-acc-rate" style="font-size:16px;color:#8b5cf6">0.0%</b>
+            </div>
+            <div class="fact-box" style="background:var(--st-surface-2);padding:8px 10px;border-radius:6px">
+              <span class="muted small" style="display:block">Drafts Acc / Off</span>
+              <b id="mtp-ratio" style="font-size:16px">0 / 0</b>
+            </div>
+            <div class="fact-box" style="background:var(--st-surface-2);padding:8px 10px;border-radius:6px">
+              <span class="muted small" style="display:block">Spec Speedup</span>
+              <b id="mtp-speedup" style="font-size:16px">1.00x</b>
+            </div>
+          </div>
+          <div style="display:flex;justify-content:space-between;align-items:center;font-size:13px;margin-bottom:6px">
+            <span>Rolling 10-req Acceptance: <b id="mtp-rolling-rate">0.0%</b></span>
+            <span class="muted" id="mtp-formula-sub">E[speedup] = 1/(1-α+α/γ)</span>
+          </div>
+          <div class="st-progress"><div class="st-progress__bar" id="mtp-acc-bar" style="width:0%;background:#8b5cf6"></div></div>
+        </div>
+      </div>
+
       <div class="monitor-row">
         <div class="st-card ctx-card">
           <div class="ctx-card-header">

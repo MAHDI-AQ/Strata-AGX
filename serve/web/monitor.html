@@ -25,6 +25,60 @@ header{height:70px;padding:0 32px;display:flex;align-items:center;justify-conten
 <div class="card"><div class="label">Last Decode Speed</div><div id="speed" class="value">—</div><div class="small">Engine timing · tokens / second</div></div>
 </div>
 
+<!-- Dual Slot State Cards -->
+<div class="cards" style="grid-template-columns: repeat(2, 1fr); margin: 0 0 14px 0; gap: 14px;">
+<div class="card" id="slot-card-0" style="border-left: 4px solid var(--st-accent);">
+  <div class="row" style="align-items: baseline;">
+    <div class="label" style="font-weight: 700; color: var(--st-accent);">Slot 0 · Concurrency Engine</div>
+    <span class="tag" id="slot0-tag" style="margin-left:auto;">Idle</span>
+  </div>
+  <div class="value" style="font-size: 20px; margin: 4px 0;"><span id="slot0-tokens">0 / 0 tokens</span></div>
+  <div class="small" id="slot0-speed" style="color: var(--st-ink-muted);">Waiting for request</div>
+  <div style="background: var(--st-surface-2); height: 6px; border-radius: 3px; margin-top: 8px; overflow: hidden;">
+    <div id="slot0-bar" style="background: var(--st-accent); height: 100%; width: 0%;"></div>
+  </div>
+</div>
+<div class="card" id="slot-card-1" style="border-left: 4px solid #3b82f6;">
+  <div class="row" style="align-items: baseline;">
+    <div class="label" style="font-weight: 700; color: #3b82f6;">Slot 1 · Concurrency Engine</div>
+    <span class="tag" id="slot1-tag" style="margin-left:auto;">Idle</span>
+  </div>
+  <div class="value" style="font-size: 20px; margin: 4px 0;"><span id="slot1-tokens">0 / 0 tokens</span></div>
+  <div class="small" id="slot1-speed" style="color: var(--st-ink-muted);">Waiting for request</div>
+  <div style="background: var(--st-surface-2); height: 6px; border-radius: 3px; margin-top: 8px; overflow: hidden;">
+    <div id="slot1-bar" style="background: #3b82f6; height: 100%; width: 0%;"></div>
+  </div>
+</div>
+</div>
+
+<!-- Advanced Arch Cards: Radix 3-Tier KV & MTP Speculative -->
+<div class="cards" style="grid-template-columns: repeat(2, 1fr); margin: 0 0 14px 0; gap: 14px;">
+<div class="card" style="border-left: 4px solid #10b981;">
+  <div class="row" style="align-items: baseline;">
+    <div class="label" style="font-weight: 700; color: #10b981;">Radix 3-Tier KV Cache</div>
+    <span class="small" id="radix-mon-tag" style="color: var(--st-ink-muted);">VRAM → Host → NVMe</span>
+  </div>
+  <div class="row" style="margin: 8px 0; justify-content: space-between;">
+    <div><span class="small" style="color: var(--st-ink-muted); display:block;">L1 VRAM</span><b id="radix-mon-l1">4 snap · 1600 MiB</b></div>
+    <div><span class="small" style="color: var(--st-ink-muted); display:block;">L2 Host</span><b id="radix-mon-l2">64 slots · 32.0 GiB</b></div>
+    <div><span class="small" style="color: var(--st-ink-muted); display:block;">L3 NVMe</span><b id="radix-mon-l3">388 snap · 90.1 GiB</b></div>
+  </div>
+  <div class="small" style="color: var(--st-ink-muted); margin-top: 4px;">Hit Rate: <b id="radix-mon-hit" style="color: #10b981;">0.0%</b> · <span id="radix-mon-nodes">504 nodes</span></div>
+</div>
+<div class="card" style="border-left: 4px solid #8b5cf6;">
+  <div class="row" style="align-items: baseline;">
+    <div class="label" style="font-weight: 700; color: #8b5cf6;">MTP Speculative Decoding</div>
+    <span class="small" id="mtp-mon-tag" style="color: var(--st-ink-muted);">Multi-Token Prediction (γ=2)</span>
+  </div>
+  <div class="row" style="margin: 8px 0; justify-content: space-between;">
+    <div><span class="small" style="color: var(--st-ink-muted); display:block;">Acceptance</span><b id="mtp-mon-acc" style="color: #8b5cf6;">0.0%</b></div>
+    <div><span class="small" style="color: var(--st-ink-muted); display:block;">Acc / Off</span><b id="mtp-mon-ratio">0 / 0</b></div>
+    <div><span class="small" style="color: var(--st-ink-muted); display:block;">Speedup</span><b id="mtp-mon-speedup">1.00x</b></div>
+  </div>
+  <div class="small" style="color: var(--st-ink-muted); margin-top: 4px;">Rolling 10-req Acc: <b id="mtp-mon-rolling">0.0%</b> · E[speedup] = 1/(1-α+α/γ)</div>
+</div>
+</div>
+
 <div class="cards" id="gpu-cards" style="grid-template-columns: repeat(2, 1fr); margin: 0 0 20px 0; gap: 14px;">
 <div class="card" style="border-left: 4px solid var(--st-accent);">
   <div class="row" style="align-items: baseline;"><div class="label" style="font-weight: 600; color: var(--st-accent);">CUDA 0 · RTX 4090 #1</div><span class="small" id="gpu0-temp" style="font-family: var(--st-font-mono);">—</span></div>
