@@ -488,15 +488,16 @@ class StrataEngine:
         self.ended = False                              # READY: alive from here (restart() set it True, #344)
         # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
         self.lines: queue.Queue = queue.Queue()
-        self.pump = threading.Thread(target=self._pump, daemon=True)
-        self.pump.start()
         self._shm_active = False
         self.shm_consumer = None
         shm_name = (env or {}).get("STRATA_IPC_SHM") or os.environ.get("STRATA_IPC_SHM")
+        self._shm_enabled = bool(self.multiplex and shm_name)
         if self.multiplex and shm_name:
             self.shm_consumer = ShmConsumer(shm_name)
             self.shm_pump = threading.Thread(target=self._shm_pump, daemon=True)
             self.shm_pump.start()
+        self.pump = threading.Thread(target=self._pump, daemon=True)
+        self.pump.start()
 
     def _shm_pump(self):
         consumer = getattr(self, "shm_consumer", None)
@@ -534,7 +535,7 @@ class StrataEngine:
             if len(fields) != 3 or fields[0] != "R" or not fields[1].isdigit():
                 continue
             number, payload = int(fields[1]), fields[2]
-            if getattr(self, "_shm_active", False) and payload.startswith("T "):
+            if (getattr(self, "_shm_enabled", False) or getattr(self, "_shm_active", False)) and payload.startswith("T "):
                 continue
             overflow = False
             with self._channels_lock:
