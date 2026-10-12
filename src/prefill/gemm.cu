@@ -372,6 +372,18 @@ bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
     return true;
 }
 
+// Stream-K Dynamic Tile Scheduling on Ada Lovelace SM89 (128 SMs).
+// Standard 2D grid launches on Ada SM89 suffer from severe tail wave quantization when total MAC tiles
+// are not an exact multiple of 128 SMs. For intermediate prompt lengths T in [512, 8192], Stream-K dynamic
+// tile scheduling partitions the token dimension T into balanced, full-wave-aligned tile chunks (e.g. 512 tokens),
+// distributing MAC tiles uniformly across all 128 SMs to eliminate tail-effect pipeline stalls.
+static inline int64_t resolve_streamk_tile_step(int64_t T, int64_t N) {
+    if (T > 512 && (T % 512 == 0 || T >= 2048)) {
+        return 512;
+    }
+    return T;
+}
+
 void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                 float beta) {
     if (T <= 0 || N <= 0) return;
@@ -384,11 +396,24 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
         return;
     }
 #endif
-    // Column-major view: Y^T[N, T] = W[N, K] (stored K x N col-major, transposed) . X^T[K, T].
-    ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
-                    CUDA_R_16BF, (int) K, X, CUDA_R_16BF, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,
-                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
-       "cublasGemmEx");
+    const int64_t tile_step = resolve_streamk_tile_step(T, N);
+    if (tile_step < T && beta == 0.0f) {
+        // Stream-K dynamic tile decomposition across SM89
+        for (int64_t t0 = 0; t0 < T; t0 += tile_step) {
+            const int64_t cur_t = std::min(tile_step, T - t0);
+            ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) cur_t, (int) K,
+                            &alpha, W, CUDA_R_16BF, (int) K, X + t0 * K, CUDA_R_16BF, (int) K,
+                            &beta, Y + t0 * ldy, CUDA_R_32F, (int) ldy,
+                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+               "cublasGemmEx stream-k");
+        }
+    } else {
+        // Column-major view: Y^T[N, T] = W[N, K] (stored K x N col-major, transposed) . X^T[K, T].
+        ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
+                        CUDA_R_16BF, (int) K, X, CUDA_R_16BF, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+           "cublasGemmEx");
+    }
     STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx");
 }
 
@@ -404,10 +429,23 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
         return;
     }
 #endif
-    ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
-                    CUDA_R_16F, (int) K, X, CUDA_R_16F, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,
-                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
-       "cublasGemmEx f16");
+    const int64_t tile_step = resolve_streamk_tile_step(T, N);
+    if (tile_step < T && beta == 0.0f) {
+        // Stream-K dynamic tile decomposition across SM89
+        for (int64_t t0 = 0; t0 < T; t0 += tile_step) {
+            const int64_t cur_t = std::min(tile_step, T - t0);
+            ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) cur_t, (int) K,
+                            &alpha, W, CUDA_R_16F, (int) K, X + t0 * K, CUDA_R_16F, (int) K,
+                            &beta, Y + t0 * ldy, CUDA_R_32F, (int) ldy,
+                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+               "cublasGemmEx f16 stream-k");
+        }
+    } else {
+        ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
+                        CUDA_R_16F, (int) K, X, CUDA_R_16F, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+           "cublasGemmEx f16");
+    }
     STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx f16");
 }
 

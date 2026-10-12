@@ -2241,6 +2241,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         return false;
                     }
                     cudaEventRecord(ev_l24, copy_stream);
+                    // Zero-host-sync: hardware stream wait event directly on GPU 1 execution stream
+                    if (next_->impl_->cs != nullptr) {
+                        cudaStreamWaitEvent(next_->impl_->cs, ev_l24, 0);
+                    }
                     if (next_run.valid() && !next_run.get()) { err = next_err; return false; }
                     ChainGate* gate = chain ? chain_gate_ : nullptr;
                     if (gate != nullptr) gate->acquire();
@@ -2250,9 +2254,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             ChainGate* g;
                             ~GateRelease() { if (g != nullptr) g->release(); }
                         } release{gate};
-                        if (cudaEventSynchronize(ev_l24) != cudaSuccess) {
-                            next_err = "prefill: micro-chunk hand-off event sync failed";
-                            return false;
+                        // Eliminate CPU host sync stall when stream event wait is active
+                        if (next_->impl_->cs == nullptr) {
+                            if (cudaEventSynchronize(ev_l24) != cudaSuccess) {
+                                next_err = "prefill: micro-chunk hand-off event sync failed";
+                                return false;
+                            }
                         }
                         return next_->run(tokens + c0 + u0, uT, p0 + u0, next_err);
                     });
