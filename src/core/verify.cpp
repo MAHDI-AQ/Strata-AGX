@@ -687,19 +687,31 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase
                 qsa_kv_resolve(st, *g_, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, n, cap_, cs);
                 stamp(l, 12, grp);
                 const QsaAttnPools pools = qsa_attn_pools(st);
-                qsa_decode_attn_batch(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, cap_,
-                                      s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs);
-                stamp(l, 13, grp);
-                if (st.kv_q4 || st.kv_hybrid) fwht256_inplace_cuda(attn_ + tb * NH * HD, (int64_t) n * NH, cs);   // back: H^-1 = H
-                if (qb) native_qsa_gate_apply(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD,
-                                              (int) (n * NH), (int) HD, cs);
-                else
-                for (int t = tb; t < te; ++t) {
-                    if (native_qsa_enabled())
-                        native_qsa_gate_apply(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, attn32_ + t * NH * HD,
-                                              (int) NH, (int) HD, cs);
+                const bool can_fuse_gate = !st.kv_q4 && !st.kv_hybrid && native_qsa_enabled();
+                if (can_fuse_gate) {
+                    // Sprint 4 Polish: Direct fused attention merge + sigmoid gate epilogue
+                    // Eliminates intermediate global memory round-trip to attn_ and saves 1 kernel launch
+                    qsa_decode_attn_batch_fused_gate(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_,
+                                                    step_ + tb * kStepCount, cap_, s,
+                                                    attn_scratch_ + (size_t) tb * attn_scratch_floats_,
+                                                    nullptr, qfull_ + tb * NH * 2 * HD,
+                                                    attn32_ + tb * NH * HD, n, cs);
+                    stamp(l, 13, grp);
+                } else {
+                    qsa_decode_attn_batch(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, cap_,
+                                          s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs);
+                    stamp(l, 13, grp);
+                    if (st.kv_q4 || st.kv_hybrid) fwht256_inplace_cuda(attn_ + tb * NH * HD, (int64_t) n * NH, cs);   // back: H^-1 = H
+                    if (qb) native_qsa_gate_apply(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD,
+                                                  (int) (n * NH), (int) HD, cs);
                     else
-                        qsa_gate_apply_f32(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, s, attn32_ + t * NH * HD, cs);
+                    for (int t = tb; t < te; ++t) {
+                        if (native_qsa_enabled())
+                            native_qsa_gate_apply(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, attn32_ + t * NH * HD,
+                                                  (int) NH, (int) HD, cs);
+                        else
+                            qsa_gate_apply_f32(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, s, attn32_ + t * NH * HD, cs);
+                    }
                 }
                 stamp(l, 14, grp);
                 native_quantize_q8_1(attn32_ + tb * NH * HD, xq_, (int) (NH * HD), n, cs);

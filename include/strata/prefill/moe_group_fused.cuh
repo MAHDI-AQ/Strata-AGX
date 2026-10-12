@@ -8,6 +8,7 @@ namespace strata::prefill::gpu_group {
 
 constexpr int MMQ_GROUP = 16;
 constexpr int MAX_BLOCKS = 64;
+constexpr int MULTI_CTA_TOKEN_THRESHOLD = 1024; // T * K > 1024 (e.g. T > 128 with K=8)
 
 struct GroupingDevTables {
     int32_t* slot;          // [T * K]: target slot for each (token, k)
@@ -17,7 +18,7 @@ struct GroupingDevTables {
     int32_t* order;         // [n_expert]: list of active experts (cnt > 0)
     int32_t* num_active;    // [1]: count of active experts
     int32_t* bounds;        // MMQ bounds array
-    int32_t* block_hist;    // [MAX_BLOCKS * n_expert]: per-block private histograms
+    int32_t* block_hist;    // [MAX_BLOCKS * n_expert]: per-block private histograms & offsets
 };
 
 void launch_moe_gpu_group(

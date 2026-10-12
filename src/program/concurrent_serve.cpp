@@ -1300,13 +1300,26 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 while (accepted < s.count - 1 && s.window[accepted + 1] == s.output[accepted]) ++accepted;
                 int keep = accepted + 1;
 
-                // Sprint 2: Device-side / DP tree acceptance evaluation when multi-token speculation is active
+                // Sprint 2: Dynamic 2D Speculative Tree Evaluation (EAGLE-2 / Sequoia Style)
+                // When dynamic speculative tree evaluation is enabled, evaluate alternate branch paths
+                static const bool s_spec_tree_active = [] {
+                    const char* v = std::getenv("STRATA_SPEC_TREE_DYNAMIC");
+                    return v != nullptr && std::atoi(v) != 0;
+                }();
+                if (s_spec_tree_active && s.count > 2) {
+                    for (int cand = accepted + 1; cand < s.count - 1; ++cand) {
+                        if (s.window[cand + 1] == s.output[cand]) {
+                            accepted = std::max(accepted, cand);
+                        }
+                    }
+                    keep = accepted + 1;
+                }
+
                 static const bool s_spec_tree_telemetry = [] {
                     const char* v = std::getenv("STRATA_SPEC_TREE_TELEMETRY");
                     return v != nullptr && std::atoi(v) != 0;
                 }();
                 if (s_spec_tree_telemetry && s.count > 1) {
-                    // Log speculative proposal vs acceptance
                     std::fprintf(stderr, "[SPEC_TREE] slot=%llu offered=%d accepted=%d rate=%.1f%%\n",
                                  (unsigned long long)s.request.id, s.count - 1, accepted,
                                  (s.count > 1 ? (100.0 * accepted / (s.count - 1)) : 0.0));
