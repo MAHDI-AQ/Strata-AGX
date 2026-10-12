@@ -2213,28 +2213,88 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         stats_.tokens += T;
         pt.mark(kPfStart, cs);
         if (next_ != nullptr) {
-            // SPRINT 5: Disaggregated async stage hand-off pipeline
-            float* h = m.hand[hand_buf];
-            if (cudaMemcpyAsync(h, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess) {
-                err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
-                return false;
+            // SECTION 1.3: Micro-Chunk (U=512) Double-Buffered P2P DMA Streaming Pipeline
+            constexpr int64_t U = 512;
+            if (T > U) {
+                for (int64_t u0 = 0; u0 < T; u0 += U) {
+                    const int64_t uT = std::min<int64_t>(U, T - u0);
+                    float* h = m.hand[hand_buf];
+                    cudaStream_t copy_stream = m.copy ? m.copy : m.cs;
+                    cudaEvent_t ev_l24 = m.hand_event[hand_buf];
+                    if (cudaEventRecord(ev_l24, m.cs) != cudaSuccess) {
+                        err = "prefill: hand-off micro-chunk event record failed";
+                        return false;
+                    }
+                    if (cudaStreamWaitEvent(copy_stream, ev_l24, 0) != cudaSuccess) {
+                        err = "prefill: copy stream wait on micro-chunk event failed";
+                        return false;
+                    }
+                    if (next_->impl_->device >= 0 && next_->impl_->R != nullptr) {
+                        cudaMemcpyPeerAsync(next_->impl_->R + (size_t) u0 * D, next_->impl_->device,
+                                            m.R + (size_t) u0 * D, m.device,
+                                            (size_t) uT * D * sizeof(float), copy_stream);
+                    }
+                    if (cudaMemcpyAsync(h + (size_t) u0 * D, m.R + (size_t) u0 * D,
+                                        (size_t) uT * D * sizeof(float),
+                                        cudaMemcpyDeviceToHost, copy_stream) != cudaSuccess) {
+                        err = std::string("prefill: micro-chunk hand-off DMA push: ") + cudaGetErrorString(cudaGetLastError());
+                        return false;
+                    }
+                    cudaEventRecord(ev_l24, copy_stream);
+                    if (next_run.valid() && !next_run.get()) { err = next_err; return false; }
+                    ChainGate* gate = chain ? chain_gate_ : nullptr;
+                    if (gate != nullptr) gate->acquire();
+                    next_->hand_in_ = h;
+                    next_run = std::async(std::launch::async, [this, tokens, c0, u0, uT, p0, &next_err, gate, ev_l24] {
+                        struct GateRelease {
+                            ChainGate* g;
+                            ~GateRelease() { if (g != nullptr) g->release(); }
+                        } release{gate};
+                        if (cudaEventSynchronize(ev_l24) != cudaSuccess) {
+                            next_err = "prefill: micro-chunk hand-off event sync failed";
+                            return false;
+                        }
+                        return next_->run(tokens + c0 + u0, uT, p0 + u0, next_err);
+                    });
+                    hand_buf ^= 1;
+                }
+                if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
+                continue;   // the last stage reports the chunk (on_chunk)
             }
-            if (cudaEventRecord(m.hand_event[hand_buf], m.cs) != cudaSuccess) {
+
+            // SPRINT 5: Single micro-chunk or U-bounded stage hand-off pipeline
+            float* h = m.hand[hand_buf];
+            cudaStream_t copy_stream = m.copy ? m.copy : m.cs;
+            cudaEvent_t ev_l24 = m.hand_event[hand_buf];
+            if (cudaEventRecord(ev_l24, m.cs) != cudaSuccess) {
                 err = "prefill: hand-off event record failed";
                 return false;
             }
+            if (cudaStreamWaitEvent(copy_stream, ev_l24, 0) != cudaSuccess) {
+                err = "prefill: copy stream wait on hand-off event failed";
+                return false;
+            }
+            if (next_->impl_->device >= 0 && next_->impl_->R != nullptr) {
+                cudaMemcpyPeerAsync(next_->impl_->R, next_->impl_->device,
+                                    m.R, m.device,
+                                    (size_t) T * D * sizeof(float), copy_stream);
+            }
+            if (cudaMemcpyAsync(h, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, copy_stream) != cudaSuccess) {
+                err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            cudaEventRecord(ev_l24, copy_stream);
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
             if (next_run.valid() && !next_run.get()) { err = next_err; return false; }
             ChainGate* gate = chain ? chain_gate_ : nullptr;
             if (gate != nullptr) gate->acquire();
             next_->hand_in_ = h;
-            cudaEvent_t ev = m.hand_event[hand_buf];
-            next_run = std::async(std::launch::async, [this, tokens, c0, T, p0, &next_err, gate, ev] {
+            next_run = std::async(std::launch::async, [this, tokens, c0, T, p0, &next_err, gate, ev_l24] {
                 struct GateRelease {
                     ChainGate* g;
                     ~GateRelease() { if (g != nullptr) g->release(); }
                 } release{gate};
-                if (cudaEventSynchronize(ev) != cudaSuccess) {
+                if (cudaEventSynchronize(ev_l24) != cudaSuccess) {
                     next_err = "prefill: hand-off event sync failed";
                     return false;
                 }
