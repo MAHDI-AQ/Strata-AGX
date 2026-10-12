@@ -1652,13 +1652,15 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         for (const auto& line : commands) {
             if (line == "QUIT") { quit = true; break; }
             if (line.rfind("CSTOP ", 0) == 0) {
-                // Task 1.2: Lockless Non-Blocking Cancellation (eliminate global pump_fence stalls)
+                // Task 1.2: Thread-Safe Cancellation with pump synchronization
                 uint64_t id = 0; std::istringstream(line.substr(6)) >> id;
+                if (!pump_fence()) return 1;
                 for (auto& s : m.slots) {
                     if (s->active.load() && s->request.id == id) {
                         finish(*s, "cancel");
                     }
                 }
+                pump_resume();
                 for (auto p = pending.begin(); p != pending.end();) {
                     if (p->id == id) { error(id, "cancelled before admission"); live.erase(id); p = pending.erase(p); }
                     else ++p;

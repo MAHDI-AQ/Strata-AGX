@@ -28,7 +28,7 @@ struct ShmMsg {
     int64_t progress_total{0};
 };
 
-static constexpr size_t kShmCapacity = 4096;
+static constexpr size_t kShmCapacity = 65536;
 
 struct ShmRing {
     std::atomic<uint32_t> head{0};  // Producer (C++) writes here

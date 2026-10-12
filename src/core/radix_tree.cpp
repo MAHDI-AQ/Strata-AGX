@@ -555,15 +555,23 @@ void RadixTree::nvme_worker_loop() {
         if (nvme_tier_ && task.payload.data() && task.total_payload > 0) {
             bool ok = nvme_tier_->write_node_direct(task.node_id, task.payload.data(), task.total_payload);
             if (auto node = task.node_weak.lock()) {
+                std::unique_lock<std::shared_mutex> lk(rw_lock_);
                 if (ok) {
                     node->l3_bytes = task.total_payload;
                     node->is_l3_offloaded = true;
                     node->free_host();
+                } else {
+                    if (cached_nvme_snapshots_ > 0) --cached_nvme_snapshots_;
                 }
                 node->is_staging_to_nvme = false;
+            } else {
+                std::unique_lock<std::shared_mutex> lk(rw_lock_);
+                if (!ok && cached_nvme_snapshots_ > 0) --cached_nvme_snapshots_;
             }
         } else {
             if (auto node = task.node_weak.lock()) {
+                std::unique_lock<std::shared_mutex> lk(rw_lock_);
+                if (cached_nvme_snapshots_ > 0) --cached_nvme_snapshots_;
                 node->is_staging_to_nvme = false;
             }
         }

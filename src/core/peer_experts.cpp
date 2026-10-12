@@ -260,7 +260,9 @@ bool PeerExperts::finish(float* out, std::string& err) {
             __builtin_ia32_pause();
 #endif
             if (++spin_count > 10000000) { // ~2000ms deadline watchdog
-                std::fprintf(stderr, "strata-agx peer_experts: cudaStreamQuery timeout (>2000ms), breaking busy-spin\n");
+                std::fprintf(stderr, "strata-agx peer_experts: cudaStreamQuery timeout (>2000ms), draining peer stream\n");
+                cudaStreamSynchronize(stream_);
+                e = cudaErrorLaunchTimeout;
                 break;
             }
         }
