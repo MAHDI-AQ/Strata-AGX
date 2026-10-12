@@ -7,7 +7,7 @@
 namespace strata::prefill::gpu_group {
 
 constexpr int MMQ_GROUP = 16;
-constexpr int MAX_BLOCKS = 64;
+constexpr int MAX_BLOCKS = 128;
 
 struct GroupingDevTables {
     int32_t* slot;          // [T * K]: target slot for each (token, k)
