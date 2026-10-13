@@ -287,13 +287,13 @@ void launch_moe_gpu_group(
 
         // Phase B: Global prefix scan & MMQ bounds
         size_t smem_scan = (n_expert + 1) * sizeof(int32_t);
-        moe_prefix_and_bounds_kernel<<<1, 256, smem_scan>>>(
+        moe_prefix_and_bounds_kernel<<<1, 256, smem_scan, stream>>>(
             tables.cnt, tables.block_hist, num_blocks, n_expert, total_tokens,
             tables.off, tables.order, tables.num_active, tables.bounds);
 
         // Phase C: Deterministic cooperative scatter
         size_t smem_scatter = n_expert * sizeof(int32_t);
-        moe_cooperative_scatter_kernel<<<num_blocks, 256, smem_scatter>>>(
+        moe_cooperative_scatter_kernel<<<num_blocks, 256, smem_scatter, stream>>>(
             ids_dev, total_tokens, k_top, n_expert, chunk_size, tables.block_hist,
             tables.slot, tables.src);
     }

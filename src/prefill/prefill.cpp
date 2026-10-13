@@ -2215,7 +2215,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         if (next_ != nullptr) {
             // SECTION 1.3: Micro-Chunk Dynamic P2P/Host DMA Streaming Pipeline
             // For large chunks (T >= 2048), scale micro-chunk to U=1024 for higher Ada SM89 Tensor Core saturation
-            const int64_t U = (T >= 2048) ? 1024 : 512;
+            static const int64_t env_u = [] { const char* v = std::getenv("STRATA_PREFILL_MICRO"); return v ? std::atoll(v) : 0; }(); const int64_t U = env_u > 0 ? env_u : ((T >= 2048) ? 1024 : 512);
             if (T > U) {
                 for (int64_t u0 = 0; u0 < T; u0 += U) {
                     const int64_t uT = std::min<int64_t>(U, T - u0);
