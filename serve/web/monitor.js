@@ -171,7 +171,11 @@ async function refresh() {
         const rx = metrics.radix;
         if ($("radix-mon-tag")) $("radix-mon-tag").textContent = rx.cache_tier || "3-Tier (VRAM Pool → Host RAM → NVMe Disk)";
         if ($("radix-mon-l1")) {
-          const expStr = (metrics.engine && metrics.engine.expert_slots) ? `${metrics.engine.expert_slots.toLocaleString()} Experts` : "Resident Experts"; const l1Text = rx.l1_vram_note || (rx.l1_vram_snapshots > 0 ? `${rx.l1_vram_snapshots} snap · ${rx.l1_vram_mib || 0} MiB` : `KV Working Pool (0 snap / ${expStr})`);
+          const eng = metrics.engine || {};
+          const expStr = eng.expert_slots ? `${eng.expert_slots.toLocaleString()} Exp` : "Resident Exp";
+          const poolDesc = rx.l1_vram_pool || `${eng.concurrency || 2} slots · ${(eng.max_context || 262144)/1024}k (${(eng.kv || "q4_0").toUpperCase()})`;
+          const activeTok = rx.l1_active_tokens != null ? `${rx.l1_active_tokens.toLocaleString()} toks` : "0 toks";
+          const l1Text = rx.l1_vram_note || `${poolDesc} · ${activeTok} · ${expStr}`;
           $("radix-mon-l1").textContent = l1Text;
         }
         if ($("radix-mon-l2")) {

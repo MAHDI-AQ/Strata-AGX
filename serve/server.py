@@ -1743,12 +1743,20 @@ class Service:
             hit_rate = min(100.0, max(0.0, round((p_reused / p_total) * 100, 1))) if p_total > 0 else 0.0
             slots_data = list(self.slots_state.values())
             active_slots = sum(1 for sl in slots_data if sl.get("status") in ("reading", "generating"))
+            total_active_tokens = sum(sl.get("context_len", 0) or 0 for sl in slots_data)
         exp_cnt = int(getattr(self.engine, "info", {}).get("expert_slots", 0) or 0)
         exp_str = f"{exp_cnt:,}" if exp_cnt > 0 else "resident"
+        eng_info = getattr(self.engine, "info", {})
+        kv_quant = eng_info.get("kv", "q4_0").upper()
+        conc_slots = eng_info.get("concurrency", len(slots_data) or 2)
+        ctx_k = int(eng_info.get("max_context", 262144) or 262144) // 1024
         return {
             "l1_vram_snapshots": 0,
-            "l1_vram_desc": "Working Session KV Pool",
-            "l1_vram_note": f"0 snapshots (VRAM dedicated to {exp_str} resident experts)",
+            "l1_vram_desc": "Live KV Pool",
+            "l1_vram_pool": f"{conc_slots} slots · {ctx_k}k ctx ({kv_quant})",
+            "l1_active_tokens": total_active_tokens,
+            "l1_vram_note": f"Live KV Pool: {conc_slots}x{ctx_k}k ({kv_quant}) · {total_active_tokens:,} toks · {exp_str} experts",
+            "l1_vram_experts": exp_cnt,
             "l2_host_slots": 64,
             "l2_host_active": active_slots,
             "l2_host_desc": f"{active_slots}/64 active slots",

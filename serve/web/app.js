@@ -391,7 +391,10 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, slots
   if (radixData) {
     if ($("radix-tier-tag")) $("radix-tier-tag").textContent = radixData.cache_tier || "3-Tier (VRAM Pool → Host RAM → NVMe Disk)";
     if ($("radix-l1-val")) {
-      const expStr = eng.expert_slots ? `${fmt(eng.expert_slots)} Experts` : "Resident Experts"; const l1Text = radixData.l1_vram_note || (radixData.l1_vram_snapshots > 0 ? `${radixData.l1_vram_snapshots} snap · ${fmt(radixData.l1_vram_mib || 0)} MiB` : `KV Working Pool (0 snap / ${expStr})`);
+      const expStr = eng.expert_slots ? `${fmt(eng.expert_slots)} Exp` : "Resident Exp";
+      const poolDesc = radixData.l1_vram_pool || `${eng.concurrency || 2} slots · ${(eng.max_context || 262144)/1024}k (${(eng.kv || "q4_0").toUpperCase()})`;
+      const activeTok = radixData.l1_active_tokens != null ? `${fmt(radixData.l1_active_tokens)} toks` : "0 toks";
+      const l1Text = radixData.l1_vram_note || `${poolDesc} · ${activeTok} · ${expStr}`;
       $("radix-l1-val").textContent = l1Text;
     }
     if ($("radix-l2-val")) {
