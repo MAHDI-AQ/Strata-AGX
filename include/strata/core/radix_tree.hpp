@@ -196,6 +196,12 @@ struct RadixStageHostSnapshot {
     std::vector<RadixQsaHostSlice> qsa_slices;
 };
 
+enum class RadixNodeKind : uint8_t {
+    SYSTEM_ROOT = 0,
+    TURN_BOUNDARY = 1,
+    LEAF_PROMPT = 2
+};
+
 struct RadixNode : public std::enable_shared_from_this<RadixNode> {
     int64_t id = 0;
     int64_t prefix_len = 0;
@@ -209,6 +215,8 @@ struct RadixNode : public std::enable_shared_from_this<RadixNode> {
 
     std::vector<RadixStageSnapshot> stage_snapshots;
     std::vector<RadixStageHostSnapshot> stage_host_snapshots;
+    RadixNodeKind kind = RadixNodeKind::LEAF_PROMPT;
+    bool is_permanent = false;
     bool is_host_parked = false;
     bool is_l3_offloaded = false;
     std::atomic<bool> is_staging_to_nvme{false};

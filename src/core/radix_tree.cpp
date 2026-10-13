@@ -762,7 +762,7 @@ std::shared_ptr<RadixNode> RadixTree::insert(
     const std::vector<void*>& streams,
     bool safe_no_evict) {
 
-    if (prefix_len < 256 || (size_t) prefix_len > n ||
+    if (prefix_len < 64 || (size_t) prefix_len > n ||
         states.size() != stage_devices.size() || streams.size() != stage_devices.size()) {
         return nullptr;
     }
@@ -1051,6 +1051,10 @@ std::shared_ptr<RadixNode> RadixTree::insert(
         if (std::getenv("STRATA_S26F_LOG"))
             std::fprintf(stderr, "S26F capture OK: prefix=%lld node=%lld bytes_now=%zu\n",
                         (long long) prefix_len, (long long) curr->id, device_snapshot_bytes_locked());
+        if (safe_no_evict) {
+            curr->is_permanent = true;
+            curr->kind = RadixNodeKind::SYSTEM_ROOT;
+        }
         ++cached_snapshots_;
         if (!safe_no_evict) evict_lru_locked(max_cached_snapshots_);   // S26f7
     }
@@ -1264,9 +1268,8 @@ void RadixTree::collect_unreferenced_host_nodes(
     if (!curr) return;
     // SGLang / vLLM Standard: Leaf-Pruning Tree-LRU.
     // An interior/parent node (system prompts, early turns) CANNOT be evicted while child nodes exist.
-    // Only true unreferenced leaf nodes (ref_count == 0 && children.empty()) holding a host snapshot are candidates.
-    // If no pure leaves have host snapshots, fall back to decoupled interior payload eviction.
-    if (curr != root_ && curr->ref_count == 0 && curr->has_host_snapshot()) {
+    // In addition, SYSTEM_ROOT nodes and permanent boundary nodes are strictly LRU-exempt.
+    if (curr != root_ && curr->ref_count == 0 && curr->has_host_snapshot() && !curr->is_permanent && curr->kind != RadixNodeKind::SYSTEM_ROOT) {
         nodes.push_back(curr);
     }
     for (const auto& kv : curr->children) {
@@ -1645,7 +1648,7 @@ std::shared_ptr<RadixNode> RadixTree::insert_direct_device_to_host(
     const std::vector<void*>& streams,
     bool safe_no_evict) {
 
-    if (prefix_len < 256 || (size_t) prefix_len > n ||
+    if (prefix_len < 64 || (size_t) prefix_len > n ||
         states.size() != stage_devices.size() || streams.size() != stage_devices.size()) {
         return nullptr;
     }
@@ -1882,8 +1885,14 @@ std::shared_ptr<RadixNode> RadixTree::insert_direct_device_to_host(
         }
 
         curr->is_host_parked = true;
+        if (safe_no_evict) {
+            curr->is_permanent = true;
+            curr->kind = RadixNodeKind::SYSTEM_ROOT;
+        }
         ++cached_host_snapshots_;
-        evict_lru_locked(max_cached_snapshots_);
+        if (!safe_no_evict) {
+            evict_lru_locked(max_cached_snapshots_);
+        }
     }
     return curr;
 }

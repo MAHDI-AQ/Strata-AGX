@@ -262,6 +262,9 @@ struct ConcurrentServe::Impl {
         std::atomic<double> prompt_ms{0};
         Clock::time_point decode_start{};
         int64_t saved_prefix = 0;
+        int64_t root_at = -1;            // Phase 1: End of system prompt (<|im_start|>user boundary)
+        int64_t turn_at = -1;            // Phase 1: Last turn boundary
+        bool root_snap_done = false;     // Phase 1: System root snapshot captured to L2 Host RAM
         bool prompt_snap_done = false;   // P18 L1: the prompt-end snapshot was captured this admission
         std::shared_ptr<core::RadixNode> radix_node = nullptr;
         std::string cache_tier = "Fresh";
@@ -855,7 +858,15 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         if (rem <= dynamic_chunk) {
             dynamic_chunk = rem;
         }
-        const int64_t n = std::min<int64_t>(dynamic_chunk, rem);
+        int64_t n = std::min<int64_t>(dynamic_chunk, rem);
+
+        // Phase 1: Boundary-aligned prefill clamping at T_sys (system prompt root)
+        if (s.root_at > 0 && !s.root_snap_done && read0 < s.root_at) {
+            const int64_t dist_to_root = s.root_at - read0;
+            if (dist_to_root > 0 && n > dist_to_root) {
+                n = dist_to_root;
+            }
+        }
         // Frontier 2: Enforce GPU stream dependency prior to prefill chunk launch
         for (size_t st = 0; st < s.stages.size(); ++st) {
             if (s.stages[st].fork_in_flight) {
@@ -1115,7 +1126,18 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     auto capture_prompt_end_snapshots = [&]() {
         for (auto& ptr : m.slots) {
             auto& s = *ptr;
-            if (!s.active.load() || !s.first || s.prompt_snap_done) continue;
+            if (!s.active.load() || !s.first) continue;
+            const int64_t cur_read = s.read.load(std::memory_order_acquire);
+
+            // Phase 1: Boundary snapshot capture at T_sys
+            if (s.root_at > 0 && !s.root_snap_done && cur_read >= s.root_at && (int64_t) s.consumed.size() >= s.root_at) {
+                s.root_snap_done = true;
+                save_slot_snapshot(s, s.root_at, s.consumed, /*safe_no_evict=*/true);
+                std::fprintf(stderr, "strata-agx concurrent: captured SYSTEM_ROOT boundary snapshot at T_sys=%lld (req=%llu)\n",
+                             (long long) s.root_at, (unsigned long long) s.request.id);
+            }
+
+            if (s.prompt_snap_done) continue;
             const int64_t pos = s.position.load();
             const int64_t n = (int64_t) s.consumed.size();
             // S26f9: end-append prompts re-tokenize at the junction, so a snapshot at the very end
@@ -1603,6 +1625,27 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         s.current = (int32_t) s.request.tokens.back();
         s.reused_prefix = reused;
         s.prompt_snap_done = false;
+        s.root_snap_done = false;
+        s.root_at = -1;
+        s.turn_at = -1;
+
+        // Phase 1: Semantic boundary detection for Qwen chat format (<|im_start|> = 248045)
+        // System prompt root ends at the second <|im_start|> (the start of the first user turn)
+        constexpr int64_t kImStartToken = 248045;
+        const auto& req_toks = s.request.tokens;
+        int im_start_count = 0;
+        for (int64_t idx = 0; idx < (int64_t) req_toks.size(); ++idx) {
+            if (req_toks[(size_t) idx] == kImStartToken) {
+                ++im_start_count;
+                if (im_start_count == 2) {
+                    if (idx >= 64) s.root_at = idx;
+                }
+                s.turn_at = idx;
+            }
+        }
+        if (s.root_at > 0 && reused >= s.root_at) {
+            s.root_snap_done = true; // Prefix already past system root
+        }
         if (retain) s.session = s.request.session;   // D1: keep the slot's conversation key current
         if (reused == 0) s.consumed.clear();
         std::fill(std::begin(s.probability), std::end(s.probability), 0.0f);
@@ -1644,6 +1687,12 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             if (!radix_tree.fork_to_session(radix_parent, reused, r_devs, r_child_states, g, r_streams, fork_err)) {
                 err = "concurrency: radix tree fork failed: " + fork_err;
                 return false;
+            }
+            for (size_t st = 0; st < m.stages.size(); ++st) {
+                if (s.stages[st].fork_event) {
+                    cudaEventRecord(s.stages[st].fork_event, m.stage_rt[st].prompt_stream);
+                    s.stages[st].fork_in_flight = true;
+                }
             }
             if (s.draft) s.draft->kv_restore(reused);
             if (s.radix_node && s.radix_node != radix_parent) radix_tree.release(s.radix_node);
