@@ -398,8 +398,9 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, slots
       $("radix-l1-val").textContent = l1Text;
     }
     if ($("radix-l2-val")) {
-      const activeStr = radixData.l2_host_active != null ? `${radixData.l2_host_active}/` : "";
-      $("radix-l2-val").textContent = `${activeStr}${radixData.l2_host_slots || 64} slots · ${fmt(radixData.l2_host_gib || 32, 1)} GiB`;
+      const nodeCount = radixData.l2_host_nodes != null ? radixData.l2_host_nodes : (radixData.l2_host_active || 0);
+      const hostGib = radixData.l2_host_gib != null ? fmt(radixData.l2_host_gib, 2) : "0.00";
+      $("radix-l2-val").textContent = `${nodeCount} nodes · ${hostGib} GiB (${radixData.l2_host_slots || 64} slots cap)`;
     }
     if ($("radix-l3-val")) $("radix-l3-val").textContent = `${radixData.l3_nvme_snapshots || 0} snap · ${fmt(radixData.l3_nvme_gib || 0, 1)} GiB`;
     const rHit = radixData.hit_rate != null ? Number(radixData.hit_rate) : 0;

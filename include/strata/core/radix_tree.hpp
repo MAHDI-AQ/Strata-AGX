@@ -342,6 +342,7 @@ public:
     /// Dynamic KV Fragmentation Compaction (Task 9.3)
         bool persist_manifest(const std::string& model_id_hash = "");
     bool restore_manifest(const std::string& model_id_hash = "");
+    void drain_nvme_staging();
     CompactionStats compact_tree();
 
     void set_nvme_tier(std::shared_ptr<class NVMeStorageTier> nvme) { nvme_tier_ = nvme; }
@@ -400,7 +401,6 @@ private:
     std::thread nvme_worker_;
 
     void nvme_worker_loop();
-    void drain_nvme_staging();
 };
 
 }  // namespace strata::core

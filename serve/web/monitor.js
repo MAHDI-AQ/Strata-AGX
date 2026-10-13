@@ -181,8 +181,9 @@ async function refresh() {
           $("radix-mon-l1").textContent = l1Text;
         }
         if ($("radix-mon-l2")) {
-          const activeStr = rx.l2_host_active != null ? `${rx.l2_host_active}/` : "";
-          $("radix-mon-l2").textContent = `${activeStr}${rx.l2_host_slots || 64} slots · ${rx.l2_host_gib || 32} GiB`;
+          const nodeCount = rx.l2_host_nodes != null ? rx.l2_host_nodes : (rx.l2_host_active || 0);
+          const hostGib = rx.l2_host_gib != null ? Number(rx.l2_host_gib).toFixed(2) : "0.00";
+          $("radix-mon-l2").textContent = `${nodeCount} nodes · ${hostGib} GiB (${rx.l2_host_slots || 64} slots cap)`;
         }
         if ($("radix-mon-l3")) $("radix-mon-l3").textContent = `${rx.l3_nvme_snapshots || 0} snap · ${rx.l3_nvme_gib || 0} GiB`;
         if ($("radix-mon-hit")) $("radix-mon-hit").textContent = `${(rx.hit_rate || 0).toFixed(1)}%`;

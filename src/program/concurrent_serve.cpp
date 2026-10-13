@@ -2451,6 +2451,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     for (auto& s : m.slots) if (s->active.load()) finish(*s, "cancel");
     for (const auto& r : pending) error(r.id, "server shutting down");
     if (nvme_dir_env && *nvme_dir_env) {
+        radix_tree.drain_nvme_staging();
         radix_tree.persist_manifest();
         std::fprintf(stderr, "strata-agx concurrent: persistent L3 RadixTree manifest saved to NVMe (%zu nodes)\n",
                      radix_tree.total_nodes());
