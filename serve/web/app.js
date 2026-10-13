@@ -389,9 +389,15 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, slots
 
   // Advanced Arch Cards: Radix 3-Tier KV & MTP
   if (radixData) {
-    if ($("radix-tier-tag")) $("radix-tier-tag").textContent = radixData.cache_tier || "3-Tier (VRAM → Host → NVMe)";
-    if ($("radix-l1-val")) $("radix-l1-val").textContent = `${radixData.l1_vram_snapshots || 4} snap · ${fmt(radixData.l1_vram_mib || 1600)} MiB`;
-    if ($("radix-l2-val")) $("radix-l2-val").textContent = `${radixData.l2_host_slots || 64} slots · ${fmt(radixData.l2_host_gib || 32, 1)} GiB`;
+    if ($("radix-tier-tag")) $("radix-tier-tag").textContent = radixData.cache_tier || "3-Tier (VRAM Pool → Host RAM → NVMe Disk)";
+    if ($("radix-l1-val")) {
+      const l1Text = radixData.l1_vram_note || (radixData.l1_vram_snapshots > 0 ? `${radixData.l1_vram_snapshots} snap · ${fmt(radixData.l1_vram_mib || 0)} MiB` : "KV Working Pool (0 snap / 20.4k Experts)");
+      $("radix-l1-val").textContent = l1Text;
+    }
+    if ($("radix-l2-val")) {
+      const activeStr = radixData.l2_host_active != null ? `${radixData.l2_host_active}/` : "";
+      $("radix-l2-val").textContent = `${activeStr}${radixData.l2_host_slots || 64} slots · ${fmt(radixData.l2_host_gib || 32, 1)} GiB`;
+    }
     if ($("radix-l3-val")) $("radix-l3-val").textContent = `${radixData.l3_nvme_snapshots || 0} snap · ${fmt(radixData.l3_nvme_gib || 0, 1)} GiB`;
     const rHit = radixData.hit_rate != null ? Number(radixData.hit_rate) : 0;
     if ($("radix-hit-rate")) $("radix-hit-rate").textContent = `${rHit.toFixed(1)}%`;

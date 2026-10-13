@@ -1740,18 +1740,23 @@ class Service:
             t = self.totals
             p_total = t.get("prompt_tokens", 0)
             p_reused = t.get("reused", 0)
-            hit_rate = round((p_reused / p_total) * 100, 1) if p_total > 0 else 0.0
+            hit_rate = min(100.0, max(0.0, round((p_reused / p_total) * 100, 1))) if p_total > 0 else 0.0
+            slots_data = list(self.slots_state.values())
+            active_slots = sum(1 for sl in slots_data if sl.get("status") in ("reading", "generating"))
         return {
-            "l1_vram_snapshots": 4,
-            "l1_vram_mib": 1600.0,
+            "l1_vram_snapshots": 0,
+            "l1_vram_desc": "Working Session KV Pool",
+            "l1_vram_note": "0 snapshots (VRAM dedicated to 20.4k resident experts)",
             "l2_host_slots": 64,
+            "l2_host_active": active_slots,
+            "l2_host_desc": f"{active_slots}/64 active slots",
             "l2_host_gib": 32.0,
             "l3_nvme_snapshots": l3_snapshots,
             "l3_nvme_gib": round(l3_bytes / (1024**3), 2),
             "total_nodes": total_nodes,
             "cached_prefix_tokens": p_reused,
             "hit_rate": hit_rate,
-            "cache_tier": "3-Tier (VRAM -> Host -> NVMe)"
+            "cache_tier": "3-Tier (VRAM Pool -> Host RAM -> NVMe Disk)"
         }
 
     def _mtp_stats(self) -> dict:
@@ -2183,7 +2188,7 @@ class Service:
                             t = self.totals
                             t["requests"] += 1
                             t["prompt_tokens"] += seen
-                            t["reused"] += last.get("reused") or 0
+                            t["reused"] += min(seen, last.get("reused") or 0)
                             t["output_tokens"] += n
                             t["prompt_ms"] += last.get("prompt_ms") or 0.0
                             t["decode_ms"] += last.get("decode_ms") or 0.0

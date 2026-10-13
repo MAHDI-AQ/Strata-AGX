@@ -169,9 +169,15 @@ async function refresh() {
       // Radix 3-Tier Stats Rendering
       if (metrics.radix) {
         const rx = metrics.radix;
-        if ($("radix-mon-tag")) $("radix-mon-tag").textContent = rx.cache_tier || "3-Tier (VRAM → Host → NVMe)";
-        if ($("radix-mon-l1")) $("radix-mon-l1").textContent = `${rx.l1_vram_snapshots || 4} snap · ${rx.l1_vram_mib || 1600} MiB`;
-        if ($("radix-mon-l2")) $("radix-mon-l2").textContent = `${rx.l2_host_slots || 64} slots · ${rx.l2_host_gib || 32} GiB`;
+        if ($("radix-mon-tag")) $("radix-mon-tag").textContent = rx.cache_tier || "3-Tier (VRAM Pool → Host RAM → NVMe Disk)";
+        if ($("radix-mon-l1")) {
+          const l1Text = rx.l1_vram_note || (rx.l1_vram_snapshots > 0 ? `${rx.l1_vram_snapshots} snap · ${rx.l1_vram_mib || 0} MiB` : "KV Working Pool (0 snap / 20.4k Experts)");
+          $("radix-mon-l1").textContent = l1Text;
+        }
+        if ($("radix-mon-l2")) {
+          const activeStr = rx.l2_host_active != null ? `${rx.l2_host_active}/` : "";
+          $("radix-mon-l2").textContent = `${activeStr}${rx.l2_host_slots || 64} slots · ${rx.l2_host_gib || 32} GiB`;
+        }
         if ($("radix-mon-l3")) $("radix-mon-l3").textContent = `${rx.l3_nvme_snapshots || 0} snap · ${rx.l3_nvme_gib || 0} GiB`;
         if ($("radix-mon-hit")) $("radix-mon-hit").textContent = `${(rx.hit_rate || 0).toFixed(1)}%`;
         if ($("radix-mon-nodes")) $("radix-mon-nodes").textContent = `${rx.total_nodes || 0} nodes`;
