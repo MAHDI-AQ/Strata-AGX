@@ -512,7 +512,16 @@ RadixTree::RadixTree(size_t max_cached_snapshots, size_t max_host_snapshots)
     if (env_dr && *env_dr) {
         deep_reserve_ = (size_t) std::strtoul(env_dr, nullptr, 10) << 20;
     }
+    const char* env_nvme_gib = std::getenv("STRATA_RADIX_NVME_MAX_GIB");
+    if (env_nvme_gib && *env_nvme_gib) {
+        nvme_budget_bytes_ = (size_t) std::strtoul(env_nvme_gib, nullptr, 10) << 30;
+    }
+    const char* env_nvme_cd = std::getenv("STRATA_RADIX_NVME_COOLDOWN_SEC");
+    if (env_nvme_cd && *env_nvme_cd) {
+        nvme_cooldown_sec_ = std::atoi(env_nvme_cd);
+    }
     root_ = std::make_shared<RadixNode>();
+    root_->created_at = std::chrono::steady_clock::now();
     root_->id = 0;
     root_->prefix_len = 0;
     root_->last_accessed = std::chrono::steady_clock::now();
@@ -559,7 +568,9 @@ void RadixTree::nvme_worker_loop() {
                 if (ok) {
                     node->l3_bytes = task.total_payload;
                     node->is_l3_offloaded = true;
-                    node->free_host();
+                    node->has_l3_persisted = true;
+                    // Continuous write-through: do NOT call node->free_host()!
+                    // Node remains hot in L2 Host RAM for sub-5ms restore while backed up to L3.
                 } else {
                     if (cached_nvme_snapshots_ > 0) --cached_nvme_snapshots_;
                 }
@@ -618,6 +629,232 @@ size_t RadixTree::host_snapshot_bytes_locked() const {
         for (auto& kv : node->children) stack.push_back(kv.second);
     }
     return total;
+}
+
+
+size_t RadixTree::l3_snapshot_bytes() const {
+    std::shared_lock<std::shared_mutex> lock(rw_lock_);
+    size_t total = 0;
+    std::vector<std::shared_ptr<RadixNode>> stack;
+    stack.push_back(root_);
+    while (!stack.empty()) {
+        auto node = stack.back();
+        stack.pop_back();
+        if (!node) continue;
+        if (node->is_l3_offloaded) {
+            total += node->l3_bytes;
+        }
+        for (const auto& kv : node->children) stack.push_back(kv.second);
+    }
+    return total;
+}
+
+bool RadixTree::queue_nvme_write_through_locked(const std::shared_ptr<RadixNode>& node) {
+    if (!nvme_tier_ || !node || !node->has_host_snapshot()) return false;
+    if (node->has_l3_persisted || node->is_l3_offloaded || node->is_staging_to_nvme.load()) return false;
+
+    // Guardrail: Minimum prefix length (must be SYSTEM_ROOT or >= 512 tokens)
+    if (node->kind != RadixNodeKind::SYSTEM_ROOT && node->prefix_len < 512) {
+        return false;
+    }
+
+    // Guardrail: TBW Cooldown protection for turn/leaf nodes (skip ephemeral micro-bursts)
+    if (node->kind != RadixNodeKind::SYSTEM_ROOT && nvme_cooldown_sec_ > 0) {
+        auto age_sec = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - node->created_at).count();
+        if (age_sec < nvme_cooldown_sec_) {
+            return false;
+        }
+    }
+
+    // Guardrail: Enforce 500 GiB NVMe budget ceiling via background LRU prune
+    if (nvme_budget_bytes_ > 0) {
+        prune_nvme_lru_locked(nvme_budget_bytes_);
+    }
+
+    size_t total_payload = sizeof(NVMeNodeHeader);
+    total_payload += node->edge_tokens.size() * sizeof(int32_t);
+    total_payload += node->stage_host_snapshots.size() * sizeof(NVMeStageHeader);
+
+    for (const auto& hss : node->stage_host_snapshots) {
+        total_payload += hss.gdn_data.size();
+        total_payload += hss.ple_data.size();
+        total_payload += hss.R_data.size();
+        total_payload += hss.qsa_slices.size() * sizeof(NVMeQsaSliceHeader);
+        for (const auto& slice : hss.qsa_slices) {
+            total_payload += slice.k_q.size();
+            total_payload += slice.v_q4.size();
+            total_payload += slice.k_scale.size();
+            total_payload += slice.v_scale.size();
+            total_payload += slice.idx_tail.size();
+            total_payload += slice.idx_dead.size();
+            total_payload += slice.idx_pooled.size();
+        }
+    }
+
+    AlignedBuffer buffer(total_payload);
+    uint8_t* p = buffer.data();
+    size_t offset = 0;
+
+    NVMeNodeHeader hdr;
+    hdr.magic = kNVMeMagic;
+    hdr.version = kNVMeVersion;
+    hdr.node_id = node->id;
+    hdr.prefix_len = node->prefix_len;
+    hdr.n_edge_tokens = static_cast<uint32_t>(node->edge_tokens.size());
+    hdr.n_stages = static_cast<uint32_t>(node->stage_host_snapshots.size());
+    hdr.total_payload_bytes = total_payload;
+    hdr.checksum = 0xFFFFFFFF53545241ULL;
+
+    std::memcpy(p + offset, &hdr, sizeof(hdr));
+    offset += sizeof(hdr);
+
+    if (!node->edge_tokens.empty()) {
+        size_t bytes = node->edge_tokens.size() * sizeof(int32_t);
+        std::memcpy(p + offset, node->edge_tokens.data(), bytes);
+        offset += bytes;
+    }
+
+    for (const auto& hss : node->stage_host_snapshots) {
+        NVMeStageHeader shdr;
+        shdr.device = hss.device;
+        shdr.ple_prev[0] = hss.ple_prev_saved[0];
+        shdr.ple_prev[1] = hss.ple_prev_saved[1];
+        shdr.ple_token = hss.ple_token_saved;
+        shdr.gdn_bytes = hss.gdn_data.size();
+        shdr.ple_bytes = hss.ple_data.size();
+        shdr.R_bytes = hss.R_data.size();
+        shdr.qsa_ord0 = hss.qsa_ord0;
+        shdr.qsa_alloc = hss.qsa_alloc;
+        shdr.n_qsa_slices = static_cast<uint32_t>(hss.qsa_slices.size());
+
+        std::memcpy(p + offset, &shdr, sizeof(shdr));
+        offset += sizeof(shdr);
+
+        if (shdr.gdn_bytes > 0) {
+            std::memcpy(p + offset, hss.gdn_data.data(), shdr.gdn_bytes);
+            offset += shdr.gdn_bytes;
+        }
+        if (shdr.ple_bytes > 0) {
+            std::memcpy(p + offset, hss.ple_data.data(), shdr.ple_bytes);
+            offset += shdr.ple_bytes;
+        }
+        if (shdr.R_bytes > 0) {
+            std::memcpy(p + offset, hss.R_data.data(), shdr.R_bytes);
+            offset += shdr.R_bytes;
+        }
+
+        for (const auto& slice : hss.qsa_slices) {
+            NVMeQsaSliceHeader qhdr;
+            qhdr.k_bytes = slice.k_q.size();
+            qhdr.v_bytes = slice.v_q4.size();
+            qhdr.k_scale_bytes = slice.k_scale.size();
+            qhdr.v_scale_bytes = slice.v_scale.size();
+            qhdr.idx_tail_bytes = slice.idx_tail.size();
+            qhdr.idx_dead_bytes = slice.idx_dead.size();
+            qhdr.idx_pooled_bytes = slice.idx_pooled.size();
+            qhdr.idx_block_pos_val = slice.idx_block_pos_val;
+            qhdr.has_idx_block_pos = slice.has_idx_block_pos ? 1 : 0;
+
+            std::memcpy(p + offset, &qhdr, sizeof(qhdr));
+            offset += sizeof(qhdr);
+
+            if (qhdr.k_bytes > 0) {
+                std::memcpy(p + offset, slice.k_q.data(), qhdr.k_bytes);
+                offset += qhdr.k_bytes;
+            }
+            if (qhdr.v_bytes > 0) {
+                std::memcpy(p + offset, slice.v_q4.data(), qhdr.v_bytes);
+                offset += qhdr.v_bytes;
+            }
+            if (qhdr.k_scale_bytes > 0) {
+                std::memcpy(p + offset, slice.k_scale.data(), qhdr.k_scale_bytes);
+                offset += qhdr.k_scale_bytes;
+            }
+            if (qhdr.v_scale_bytes > 0) {
+                std::memcpy(p + offset, slice.v_scale.data(), qhdr.v_scale_bytes);
+                offset += qhdr.v_scale_bytes;
+            }
+            if (qhdr.idx_tail_bytes > 0) {
+                std::memcpy(p + offset, slice.idx_tail.data(), qhdr.idx_tail_bytes);
+                offset += qhdr.idx_tail_bytes;
+            }
+            if (qhdr.idx_dead_bytes > 0) {
+                std::memcpy(p + offset, slice.idx_dead.data(), qhdr.idx_dead_bytes);
+                offset += qhdr.idx_dead_bytes;
+            }
+            if (qhdr.idx_pooled_bytes > 0) {
+                std::memcpy(p + offset, slice.idx_pooled.data(), qhdr.idx_pooled_bytes);
+                offset += qhdr.idx_pooled_bytes;
+            }
+        }
+    }
+
+    uint64_t crc = 0xFFFFFFFF53545241ULL;
+    const uint8_t* payload_bytes = buffer.data() + sizeof(NVMeNodeHeader);
+    const size_t crc_len = total_payload - sizeof(NVMeNodeHeader);
+    const size_t qwords = crc_len / 8;
+    const uint64_t* qp = reinterpret_cast<const uint64_t*>(payload_bytes);
+    for (size_t qi = 0; qi < qwords; ++qi) {
+#if defined(__SSE4_2__)
+        crc = _mm_crc32_u64(crc, qp[qi]);
+#else
+        crc = (crc ^ qp[qi]) * 1099511628211ULL;
+#endif
+    }
+    reinterpret_cast<NVMeNodeHeader*>(buffer.data())->checksum = crc;
+
+    node->is_staging_to_nvme = true;
+    {
+        std::lock_guard<std::mutex> lk(nvme_queue_mutex_);
+        nvme_queue_.push(NVMeStagingTask{
+            node->id,
+            node,
+            std::move(buffer),
+            total_payload
+        });
+    }
+    nvme_cv_.notify_one();
+    ++cached_nvme_snapshots_;
+    return true;
+}
+
+size_t RadixTree::prune_nvme_lru_locked(size_t max_bytes) {
+    if (!nvme_tier_) return 0;
+    size_t total_l3 = 0;
+    std::vector<std::shared_ptr<RadixNode>> l3_nodes;
+    std::vector<std::shared_ptr<RadixNode>> stack;
+    stack.push_back(root_);
+    while (!stack.empty()) {
+        auto node = stack.back();
+        stack.pop_back();
+        if (!node) continue;
+        if (node->is_l3_offloaded) {
+            total_l3 += node->l3_bytes;
+            l3_nodes.push_back(node);
+        }
+        for (const auto& kv : node->children) stack.push_back(kv.second);
+    }
+
+    if (total_l3 <= max_bytes) return 0;
+
+    // Prune oldest non-permanent nodes first
+    std::sort(l3_nodes.begin(), l3_nodes.end(), [](const auto& a, const auto& b) {
+        if (a->is_permanent != b->is_permanent) return !a->is_permanent; // non-permanent first
+        return a->last_accessed < b->last_accessed;
+    });
+
+    size_t pruned = 0;
+    for (auto& node : l3_nodes) {
+        if (total_l3 <= max_bytes) break;
+        if (node->ref_count > 0 || node->is_permanent) continue;
+        size_t b = node->l3_bytes;
+        node->free_nvme(*nvme_tier_);
+        total_l3 -= b;
+        if (cached_nvme_snapshots_ > 0) --cached_nvme_snapshots_;
+        ++pruned;
+    }
+    return pruned;
 }
 
 size_t RadixTree::host_snapshot_bytes() const {
@@ -1885,11 +2122,15 @@ std::shared_ptr<RadixNode> RadixTree::insert_direct_device_to_host(
         }
 
         curr->is_host_parked = true;
+        curr->created_at = std::chrono::steady_clock::now();
         if (safe_no_evict) {
             curr->is_permanent = true;
             curr->kind = RadixNodeKind::SYSTEM_ROOT;
         }
         ++cached_host_snapshots_;
+        // Continuous NVMe write-through staging with TBW endurance guardrails
+        queue_nvme_write_through_locked(curr);
+
         if (!safe_no_evict) {
             evict_lru_locked(max_cached_snapshots_);
         }

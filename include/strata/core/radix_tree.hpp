@@ -215,6 +215,8 @@ struct RadixNode : public std::enable_shared_from_this<RadixNode> {
 
     std::vector<RadixStageSnapshot> stage_snapshots;
     std::vector<RadixStageHostSnapshot> stage_host_snapshots;
+    std::chrono::steady_clock::time_point created_at;
+    bool has_l3_persisted = false;
     RadixNodeKind kind = RadixNodeKind::LEAF_PROMPT;
     bool is_permanent = false;
     bool is_host_parked = false;
@@ -358,6 +360,9 @@ public:
     size_t cached_nvme_snapshot_count() const { return cached_nvme_snapshots_; }
     size_t total_nodes() const { return node_count_; }
     size_t host_snapshot_bytes() const;
+    size_t l3_snapshot_bytes() const;
+    bool queue_nvme_write_through_locked(const std::shared_ptr<RadixNode>& node);
+    size_t prune_nvme_lru_locked(size_t max_bytes);
 
 private:
     mutable std::shared_mutex rw_lock_;
@@ -366,6 +371,8 @@ private:
     size_t max_cached_snapshots_ = 4;
     size_t max_host_snapshots_ = 64;
     size_t host_ram_budget_ = (size_t) 32ULL << 30;   // 32 GiB calibrated L2 Host-RAM cache ceiling   // 16 GiB safety ceiling for Host RAM snapshots
+    size_t nvme_budget_bytes_ = 500ULL << 30; // 500 GiB persistent NVMe L3 cache budget
+    int nvme_cooldown_sec_ = 45; // 45s cooldown for turn nodes to protect flash endurance
     size_t host_snapshot_bytes_locked() const;
     size_t cached_snapshots_ = 0;
     size_t cached_host_snapshots_ = 0;

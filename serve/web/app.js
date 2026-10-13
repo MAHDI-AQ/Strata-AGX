@@ -402,7 +402,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, slots
       const hostGib = radixData.l2_host_gib != null ? fmt(radixData.l2_host_gib, 2) : "0.00";
       $("radix-l2-val").textContent = `${nodeCount} nodes · ${hostGib} GiB (${radixData.l2_host_slots || 64} slots cap)`;
     }
-    if ($("radix-l3-val")) $("radix-l3-val").textContent = `${radixData.l3_nvme_snapshots || 0} snap · ${fmt(radixData.l3_nvme_gib || 0, 1)} GiB`;
+    if ($("radix-l3-val")) $("radix-l3-val").textContent = `${radixData.l3_nvme_snapshots || 0} snap · ${fmt(radixData.l3_nvme_gib || 0, 1)} GiB (${radixData.l3_nvme_limit_gib || 500} GiB cap)`;
     const rHit = radixData.hit_rate != null ? Number(radixData.hit_rate) : 0;
     if ($("radix-hit-rate")) $("radix-hit-rate").textContent = `${rHit.toFixed(1)}%`;
     if ($("radix-hit-bar")) $("radix-hit-bar").style.width = `${Math.min(100, rHit)}%`;

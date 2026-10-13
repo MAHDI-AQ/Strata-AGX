@@ -1760,6 +1760,7 @@ class Service:
             "l2_host_limit_gib": 32.0,
             "l3_nvme_snapshots": l3_snapshots,
             "l3_nvme_gib": round(l3_bytes / (1024**3), 2),
+            "l3_nvme_limit_gib": 500.0,
             "total_nodes": total_nodes,
             "cached_prefix_tokens": p_reused,
             "hit_rate": hit_rate,
