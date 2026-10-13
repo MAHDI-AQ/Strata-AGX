@@ -265,6 +265,7 @@ struct ConcurrentServe::Impl {
         int64_t root_at = -1;            // Phase 1: End of system prompt (<|im_start|>user boundary)
         int64_t turn_at = -1;            // Phase 1: Last turn boundary
         bool root_snap_done = false;     // Phase 1: System root snapshot captured to L2 Host RAM
+        bool turn_snap_done = false;     // Phase 3: Conversational turn boundary snapshot
         bool prompt_snap_done = false;   // P18 L1: the prompt-end snapshot was captured this admission
         std::shared_ptr<core::RadixNode> radix_node = nullptr;
         std::string cache_tier = "Fresh";
@@ -860,11 +861,16 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         }
         int64_t n = std::min<int64_t>(dynamic_chunk, rem);
 
-        // Phase 1: Boundary-aligned prefill clamping at T_sys (system prompt root)
+        // Phase 1 & 3: Boundary-aligned prefill clamping at T_sys and T_turn
         if (s.root_at > 0 && !s.root_snap_done && read0 < s.root_at) {
             const int64_t dist_to_root = s.root_at - read0;
             if (dist_to_root > 0 && n > dist_to_root) {
                 n = dist_to_root;
+            }
+        } else if (s.turn_at > 0 && !s.turn_snap_done && s.turn_at > s.root_at && read0 < s.turn_at) {
+            const int64_t dist_to_turn = s.turn_at - read0;
+            if (dist_to_turn > 0 && n > dist_to_turn) {
+                n = dist_to_turn;
             }
         }
         // Frontier 2: Enforce GPU stream dependency prior to prefill chunk launch
@@ -1135,6 +1141,13 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 save_slot_snapshot(s, s.root_at, s.consumed, /*safe_no_evict=*/true);
                 std::fprintf(stderr, "strata-agx concurrent: captured SYSTEM_ROOT boundary snapshot at T_sys=%lld (req=%llu)\n",
                              (long long) s.root_at, (unsigned long long) s.request.id);
+            }
+            // Phase 3: Boundary snapshot capture at T_turn
+            if (s.turn_at > 0 && !s.turn_snap_done && s.turn_at > s.root_at && cur_read >= s.turn_at && (int64_t) s.consumed.size() >= s.turn_at) {
+                s.turn_snap_done = true;
+                save_slot_snapshot(s, s.turn_at, s.consumed, /*safe_no_evict=*/false);
+                std::fprintf(stderr, "strata-agx concurrent: captured TURN_BOUNDARY snapshot at T_turn=%lld (req=%llu)\n",
+                             (long long) s.turn_at, (unsigned long long) s.request.id);
             }
 
             if (s.prompt_snap_done) continue;
@@ -1626,6 +1639,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         s.reused_prefix = reused;
         s.prompt_snap_done = false;
         s.root_snap_done = false;
+        s.turn_snap_done = false;
         s.root_at = -1;
         s.turn_at = -1;
 
