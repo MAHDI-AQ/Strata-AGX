@@ -1653,7 +1653,19 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             std::fprintf(stderr, "strata-agx concurrent: snapshot fork: slot forks %lld tokens from %s (saved=%lld)\n",
                          (long long) reused, (parent == &s ? "self" : "parent"), (long long) parent->saved_prefix);
         } else {
-            // Intra-slot retention (slot continues itself with zero-copy truncation)
+            // Intra-slot retention: restore verified GDN/PLE/QSA snapshot state to prevent state corruption across turns
+            if (s.saved_prefix >= reused && s.stages[0].gdn_saved) {
+                for (size_t st = 0; st < m.stages.size(); ++st) {
+                    const core::OnDevice on(m.stages[st].device);
+                    std::string fork_err;
+                    const auto& ss = s.stages[st];
+                    core::session_fork(*ss.state, *ss.state, g, reused,
+                                       (void*) m.stage_rt[st].prompt_stream, fork_err,
+                                       ss.R_saved, ss.gdn_saved, ss.ple_saved,
+                                       ss.ple_prev_saved, ss.ple_token_saved);
+                    cudaStreamSynchronize(m.stage_rt[st].prompt_stream);
+                }
+            }
             if ((int64_t) s.consumed.size() > reused) {
                 s.consumed.resize((size_t) reused);
             }
@@ -1749,47 +1761,8 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         constexpr size_t kAdmissionScanQueue = 32;   // the pending deque's own cap (see the overflow check above; M2 raise 16->32 for burst headroom)
         const auto admit_start = retain ? Clock::now() : Clock::time_point{};
         std::vector<Impl::Slot*> admitted_this_round;
-        while (retain && !pending.empty()) {
-            Impl::Slot* pick = nullptr;
-            size_t pick_q = 0;
-            int64_t best = 0;
-            const size_t qn = std::min<size_t>(pending.size(), kAdmissionScanQueue);
-            for (size_t q = 0; q < qn; ++q) {
-                const auto& tokens = pending[q].tokens;
-                const int64_t nmax = (int64_t) tokens.size() - 1;
-                if (nmax < 1) continue;   // n < 2: no legal reuse for this request
-                if (nmax <= best) continue;   // cannot beat the current best: skip before any compare
-                Impl::Slot* cand = nullptr;
-                int64_t candL = 0;
-                for (auto& ptr : m.slots) {
-                    const auto& held = *ptr;
-                    if (held.active.load() || (int64_t) tokens.size() >= held.max_context) continue;
-                    if (std::find(admitted_this_round.begin(), admitted_this_round.end(), ptr.get()) != admitted_this_round.end()) continue;
-                    const int64_t L = (int64_t) held.consumed.size();
-                    if (L < 1) continue;
-                    // Compute Longest Common Prefix (LCP) allowing partial prefix rollback
-                    int64_t match_len = 0;
-                    const int64_t limit = std::min<int64_t>(L, nmax);
-                    while (match_len < limit && held.consumed[(size_t) match_len] == (int32_t) tokens[(size_t) match_len]) {
-                        ++match_len;
-                    }
-                    if (match_len >= 64) {
-                        const bool sess_match = (pending[q].session != 0 && held.session == pending[q].session);
-                        if (match_len > candL || (match_len == candL && sess_match)) {
-                            candL = match_len;
-                            cand = ptr.get();
-                        }
-                    }
-                }
-
-                if (cand != nullptr && candL > best) { best = candL; pick = cand; pick_q = q; }
-            }
-            if (pick == nullptr) break;
-            auto& s = *pick;
-            s.request = std::move(pending[pick_q]); pending.erase(pending.begin() + (std::ptrdiff_t) pick_q);
-            if (!admit_slot(s, best, nullptr)) return 1;
-            admitted_this_round.push_back(&s);
-        }
+        // Pass 1: Intra-slot retention is gated on verified snapshot integrity (handled by Pass 3 & RadixTree).
+        // Bare LCP rollback without snapshot restore corrupts recurrent GDN/PLE state in hybrid models.
 
         // SPRINT 4: Dynamic RadixTree prefix fork pass
         while (retain && !pending.empty()) {
