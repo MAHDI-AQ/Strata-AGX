@@ -77,7 +77,7 @@ IMAGE_PAD = "<|image_pad|>"
 VISION_START = "<|vision_start|>"
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
-REASONING_ANSWER_RESERVE = 32   # #P28: tokens kept free for the answer when the budget is auto-derived
+REASONING_ANSWER_RESERVE = 64   # #P28: tokens kept free for the answer when the budget is auto-derived
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
@@ -1438,8 +1438,11 @@ class Service:
             raise ValueError(f"reasoning_budget_tokens={value!r}: expected a whole number of tokens (0: no budget)")
         if value > 0:
             return value
-        if not explicit and max_new > REASONING_ANSWER_RESERVE + 64:
-            return max_new - REASONING_ANSWER_RESERVE   # #P28: never starve the answer
+        if not explicit and max_new > 48:
+            # Reserve at least 30% of max_new or REASONING_ANSWER_RESERVE for final answer prose
+            reserve = max(REASONING_ANSWER_RESERVE, int(max_new * 0.30))
+            derived = max(16, max_new - reserve)
+            return derived
         return None
 
     def _vision_down(self) -> bool:
@@ -2482,9 +2485,14 @@ def openai_collect(chunks) -> dict:
     calls = [by_index[i] for i in sorted(by_index)]
     if last["choices"][0]["finish_reason"] != "tool_calls":
         calls = [c for c in calls if _is_json(c["function"]["arguments"])]   # a call the output ended inside (#211)
-    msg = {"role": "assistant", "content": "".join(content) or None}
-    if "".join(reasoning):
-        msg["reasoning_content"] = "".join(reasoning)
+    c_text = "".join(content)
+    r_text = "".join(reasoning)
+    # Prevent empty response crash when model spent tokens in reasoning or hit finish_reason=length
+    if not c_text and not calls and r_text:
+        c_text = r_text
+    msg = {"role": "assistant", "content": c_text if c_text else None}
+    if r_text:
+        msg["reasoning_content"] = r_text
     if calls:
         msg["tool_calls"] = calls
     if mcp:
