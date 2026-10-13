@@ -255,8 +255,18 @@ def _is_synthetic_system_reminder(content) -> bool:
     return False
 
 def _late_system_to_user(messages: list[dict]) -> list[dict]:
-    """Merges consecutive user turns while ensuring synthetic context/reminders precede human queries."""
+    """
+    1. Converts late system messages (system after index 0) to user.
+    2. Identifies synthetic system reminders/context injected as user messages.
+       If an initial system/developer turn exists, hoists synthetic reminders into it
+       so the user turn contains PURE human queries, eliminating prompt hypnosis.
+    3. Merges any remaining consecutive user messages cleanly.
+    """
     converted = [dict(m, role="user") if m.get("role") == "system" and i > 0 else m for i, m in enumerate(messages)]
+    
+    # Check if we have an initial system/developer turn
+    has_sys_at_0 = len(converted) > 0 and converted[0].get("role") in ("system", "developer")
+    
     merged = []
     i = 0
     while i < len(converted):
@@ -272,6 +282,15 @@ def _late_system_to_user(messages: list[dict]) -> list[dict]:
             i += 1
 
         if len(user_block) == 1:
+            # Check if this single user message is synthetic and we can hoist it to the initial system turn
+            if has_sys_at_0 and len(merged) == 1 and _is_synthetic_system_reminder(user_block[0].get("content")):
+                sys_c = merged[0].get("content", "")
+                syn_c = user_block[0].get("content", "")
+                if isinstance(sys_c, str) and isinstance(syn_c, str):
+                    merged[0]["content"] = sys_c + chr(10) + chr(10) + syn_c
+                i_next = i
+                # proceed to next message
+                continue
             merged.append(user_block[0])
             continue
 
@@ -283,10 +302,20 @@ def _late_system_to_user(messages: list[dict]) -> list[dict]:
             else:
                 regular.append(u)
 
-        ordered_block = synthetic + regular if regular else synthetic
+        # If we have an initial system message, hoist synthetic reminders directly into it!
+        if has_sys_at_0 and synthetic and len(merged) == 1:
+            for s_msg in synthetic:
+                sys_c = merged[0].get("content", "")
+                syn_c = s_msg.get("content", "")
+                if isinstance(sys_c, str) and isinstance(syn_c, str):
+                    merged[0]["content"] = sys_c + chr(10) + chr(10) + syn_c
+            # The remaining regular messages become the pure user block
+            target_block = regular if regular else synthetic
+        else:
+            target_block = synthetic + regular if regular else synthetic
 
         combined_content = None
-        for u in ordered_block:
+        for u in target_block:
             c = u.get("content", "")
             if combined_content is None:
                 combined_content = c
@@ -300,7 +329,7 @@ def _late_system_to_user(messages: list[dict]) -> list[dict]:
                 elif isinstance(combined_content, str) and isinstance(c, list):
                     combined_content = [{"type": "text", "text": combined_content}] + c
 
-        merged_user = dict(ordered_block[-1])
+        merged_user = dict(target_block[-1])
         merged_user["content"] = combined_content
         merged.append(merged_user)
 
@@ -627,6 +656,42 @@ def forced_call(tool_choice, tools: list[dict] | None) -> str | None:
     return None
 
 
+def fill_missing_tool_arguments(name: str, args: dict, schema: dict | None) -> dict:
+    if not isinstance(args, dict) or not schema:
+        return args
+    params = schema.get("parameters") or {}
+    required = params.get("required") or []
+    properties = params.get("properties") or {}
+    if not required:
+        return args
+    filled = dict(args)
+    for req in required:
+        if req in filled and filled[req] is not None:
+            continue
+        p_type = (properties.get(req) or {}).get("type")
+        if req == "description":
+            cmd = str(filled.get("command") or filled.get("cmd") or "").strip()
+            if cmd:
+                first_line = cmd.splitlines()[0][:60].strip()
+                filled[req] = f"Execute {first_line}"
+            else:
+                filled[req] = f"Execute {name}"
+        elif req in ("summary", "thought", "explanation", "justification"):
+            filled[req] = f"Execute {name}"
+        elif p_type == "string":
+            filled[req] = ""
+        elif p_type in ("integer", "number"):
+            filled[req] = 0
+        elif p_type == "boolean":
+            filled[req] = False
+        elif p_type == "array":
+            filled[req] = []
+        elif p_type == "object":
+            filled[req] = {}
+        else:
+            filled[req] = ""
+    return filled
+
 def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     """`<function=NAME>\\n<parameter=P>\\nVALUE\\n</parameter>...</function>` or `{"name": ..., "arguments": ...}` -> ToolCall.
     Values are JSON-decoded when the tool's schema says the parameter is not a string."""
@@ -643,7 +708,7 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
                         pass
                 if not isinstance(args, dict):
                     args = {}
-                return ToolCall(name=data["name"], arguments=args)
+                return ToolCall(name=data["name"], arguments=fill_missing_tool_arguments(data["name"], args, schema))
         except Exception:
             pass
         m = re.search(r'"name"\s*:\s*"([^"]+)"', body)
@@ -656,7 +721,7 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
                     args = json.loads(ma.group(1))
                 except Exception:
                     pass
-            return ToolCall(name=name, arguments=args)
+            return ToolCall(name=name, arguments=fill_missing_tool_arguments(name, args, schema))
 
     if not body.startswith("<function=") or ">" not in body:
         raise ValueError("malformed tool call: " + body[:80])
@@ -683,7 +748,7 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
                 args[pname] = json.loads(value)
             except ValueError:
                 args[pname] = value
-    return ToolCall(name=name, arguments=args)
+    return ToolCall(name=name, arguments=fill_missing_tool_arguments(name, args, schema))
 
 
 RCALL_MAX = 256  # Task 4.1: Cap unclosed CoT tool call buffering to 256 chars        # the most of a `<tool_call>` inside the reasoning that is held while waiting for its end (#804)
@@ -712,6 +777,7 @@ class OutputParser:
         self.sfirst = True
         self.sval_started = False
         self.sdeclared = {}
+        self.seen_params = {}
 
     def _scan(self) -> list[Event]:
         """Advance the streaming view of the call body in self.buf (see stream_tools)."""
@@ -743,6 +809,8 @@ class OutputParser:
                     if b < 0:
                         return out
                     pname = stripped[11:b]
+                    self.cur_pname = pname
+                    self.seen_params[pname] = []
                     args(("" if self.sfirst else ",") + json.dumps(pname) + ":")
                     self.sfirst = False
                     self.sp += b + 1
@@ -752,6 +820,19 @@ class OutputParser:
                     else:
                         self.ss = "raw"
                 elif stripped.startswith("</function>"):
+                    name = self.scall.name if self.scall else ""
+                    schema = self.schemas.get(name) or {}
+                    seen = getattr(self, "seen_params", {})
+                    curr_args = {p: "".join(parts) for p, parts in seen.items()} if isinstance(seen, dict) else {p: "" for p in seen}
+                    filled = fill_missing_tool_arguments(name, curr_args, schema)
+                    for k, v in filled.items():
+                        if k not in curr_args:
+                            args(("" if self.sfirst else ",") + json.dumps(k) + ":" + json.dumps(v, ensure_ascii=False))
+                            self.sfirst = False
+                            if isinstance(seen, dict):
+                                seen[k] = [str(v)]
+                            else:
+                                seen.add(k)
                     args("}")
                     self.sp += len("</function>")
                     self.ss = "done"
@@ -770,6 +851,8 @@ class OutputParser:
                     value = rest[:end]
                     if value.endswith("\n"):
                         value = value[:-1]
+                    if getattr(self, "cur_pname", None) in self.seen_params:
+                        self.seen_params[self.cur_pname].append(value)
                     args(json.dumps(value)[1:-1] + '"')
                     self.sp += end + len(PARAM_END)
                     self.ss = "between"
@@ -779,6 +862,8 @@ class OutputParser:
                 if safe > 0 and rest[safe - 1] == "\n":   # may be the trailing newline before </parameter>
                     safe -= 1
                 if safe > 0:
+                    if getattr(self, "cur_pname", None) in self.seen_params:
+                        self.seen_params[self.cur_pname].append(rest[:safe])
                     args(json.dumps(rest[:safe])[1:-1])
                     self.sp += safe
                 return out
@@ -795,6 +880,8 @@ class OutputParser:
                     v = json.loads(value)
                 except ValueError:
                     v = value
+                if getattr(self, "cur_pname", None) in self.seen_params:
+                    self.seen_params[self.cur_pname].append(str(v))
                 args(json.dumps(v, ensure_ascii=False))
                 self.sp += end + len(PARAM_END)
                 self.ss = "between"
@@ -818,6 +905,18 @@ class OutputParser:
                     tail += json.dumps(raw_val)
             else:
                 tail += '""'
+        name = self.scall.name if self.scall else ""
+        schema = self.schemas.get(name) or {}
+        seen = getattr(self, "seen_params", {})
+        curr_args = {p: "".join(parts) for p, parts in seen.items()} if isinstance(seen, dict) else {p: "" for p in seen}
+        filled = fill_missing_tool_arguments(name, curr_args, schema)
+        for k, v in filled.items():
+            if k not in curr_args:
+                tail += ("," if not tail.endswith("{") else "") + json.dumps(k) + ":" + json.dumps(v, ensure_ascii=False)
+                if isinstance(seen, dict):
+                    seen[k] = [str(v)]
+                else:
+                    seen.add(k)
         tail += "}"
         out.append(Event("tool_args", tail, call=self.scall))
         self.ss = "done"

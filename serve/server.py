@@ -2545,7 +2545,7 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
     mid = "msg_" + uuid.uuid4().hex[:24]
     yield "message_start", {"type": "message_start", "message": {
         "id": mid, "type": "message", "role": "assistant", "model": svc.model_for(req), "content": [],
-        "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": len(ids), "output_tokens": 0, "cache_read_input_tokens": getattr(slot, "reused", 0)}}}
+        "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": len(ids), "output_tokens": 0, "cache_read_input_tokens": 0}}}
     index, open_kind, used_tool = -1, None, False
 
     def close():
