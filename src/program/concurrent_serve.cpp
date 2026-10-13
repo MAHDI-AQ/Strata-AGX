@@ -12,6 +12,7 @@
 #include "strata/core/triple_buffer_ipc.hpp"
 #include "strata/program/batch_schedule.hpp"
 #include "strata/prefill/prefill.hpp"
+#include "strata/prefill/moe_group_fused.cuh"
 #include "strata/core/native_head.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/progress.hpp"
@@ -44,8 +45,14 @@
 #include <thread>
 #include <unordered_set>
 
+#include <csignal>
 namespace strata::program {
 namespace {
+static std::atomic<bool> g_sigterm_received{false};
+static void handle_engine_signal(int sig) {
+    g_sigterm_received.store(true, std::memory_order_relaxed);
+}
+
 using Clock = std::chrono::steady_clock;
 double elapsed(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 bool gpu_alloc(void** p, size_t bytes, int reserve, std::string& err) {
@@ -363,6 +370,9 @@ int64_t ConcurrentServe::prompt_workspace_bytes() const {   // LANE m1m2 (M1 tel
 bool ConcurrentServe::prepare(const core::ModelGeometry& g, core::SessionState& primary, core::MtpDrafter& draft,
                               const std::vector<ServeStage>& stages, std::string& err) {
     auto& m = *impl_;
+    g_sigterm_received.store(false, std::memory_order_relaxed);
+    std::signal(SIGTERM, handle_engine_signal);
+    std::signal(SIGINT, handle_engine_signal);
     m.geometry = &g;
     m.stages = stages;   // C4: stage devices and borrowed sessions are read here; run() re-reads the rest
     const auto& c = m.config;
@@ -1794,6 +1804,10 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             input->cv.notify_all();
         }
         if (!pump_check()) return 1;   // a chunk failed while this loop was in a round
+        if (g_sigterm_received.load(std::memory_order_relaxed)) {
+            std::fprintf(stderr, "strata-agx concurrent: caught SIGTERM/SIGINT -> initiating clean shutdown\n");
+            quit = true;
+        }
         for (const auto& line : commands) {
             if (line == "QUIT") { quit = true; break; }
             if (line.rfind("CSTOP ", 0) == 0) {
@@ -2465,6 +2479,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     // lane-spec: the acceptance census at exit - windows served, drafts offered vs accepted (offered = the
     // sum over windows of count-1; accepted likewise of keep-1 - the same fields the DONE line carries per
     // request), split by the window's source and read off by draft position.
+    std::fprintf(stderr, "strata-agx concurrent: MoE dispatch census: single-CTA=%llu multi-CTA=%llu\n", (unsigned long long) prefill::gpu_group::get_moe_dispatch_stats().single_cta_launches, (unsigned long long) prefill::gpu_group::get_moe_dispatch_stats().multi_cta_launches);
     std::fprintf(stderr, "strata-agx concurrent: spec census: windows=%lld offered=%lld accepted=%lld "
                  "mtp[windows=%lld offered=%lld accepted=%lld] lookup[windows=%lld offered=%lld accepted=%lld]\n",
                  (long long) windows_served, (long long) offered_total, (long long) accepted_total,

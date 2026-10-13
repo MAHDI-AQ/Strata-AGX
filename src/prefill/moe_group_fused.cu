@@ -1,8 +1,25 @@
+#include <atomic>
 #include "strata/prefill/moe_group_fused.cuh"
 #include <cstdio>
 #include <algorithm>
 
 namespace strata::prefill::gpu_group {
+
+static std::atomic<uint64_t> g_single_cta_count{0};
+static std::atomic<uint64_t> g_multi_cta_count{0};
+
+MoeDispatchStats get_moe_dispatch_stats() {
+    MoeDispatchStats s;
+    s.single_cta_launches = g_single_cta_count.load(std::memory_order_relaxed);
+    s.multi_cta_launches = g_multi_cta_count.load(std::memory_order_relaxed);
+    return s;
+}
+
+void reset_moe_dispatch_stats() {
+    g_single_cta_count.store(0, std::memory_order_relaxed);
+    g_multi_cta_count.store(0, std::memory_order_relaxed);
+}
+
 
 // ============================================================================
 // Single-CTA Deterministic Fused Kernel (Handles small tokens T * K <= 1024)
@@ -266,6 +283,7 @@ void launch_moe_gpu_group(
 
     if (total_tokens <= 1024 || tables.block_hist == nullptr) {
         // Small tokens: Single-CTA persistent kernel
+        g_single_cta_count.fetch_add(1, std::memory_order_relaxed);
         if (tables.cnt) cudaMemsetAsync(tables.cnt, 0, n_expert * sizeof(int32_t), stream);
 
         size_t smem_bytes = (3 * n_expert + 1) * sizeof(int32_t);
@@ -275,6 +293,7 @@ void launch_moe_gpu_group(
             tables.order, tables.num_active, tables.bounds);
     } else {
         // Large tokens: Multi-CTA Cooperative Architecture (128 blocks for SM saturation)
+        g_multi_cta_count.fetch_add(1, std::memory_order_relaxed);
         if (tables.cnt) cudaMemsetAsync(tables.cnt, 0, n_expert * sizeof(int32_t), stream);
 
         int num_blocks = MAX_BLOCKS;

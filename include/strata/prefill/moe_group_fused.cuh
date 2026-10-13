@@ -6,6 +6,14 @@
 
 namespace strata::prefill::gpu_group {
 
+struct MoeDispatchStats {
+    uint64_t single_cta_launches = 0;
+    uint64_t multi_cta_launches = 0;
+};
+MoeDispatchStats get_moe_dispatch_stats();
+void reset_moe_dispatch_stats();
+
+
 constexpr int MMQ_GROUP = 16;
 constexpr int MAX_BLOCKS = 128;
 
