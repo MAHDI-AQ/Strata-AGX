@@ -171,7 +171,7 @@ async function refresh() {
         const rx = metrics.radix;
         if ($("radix-mon-tag")) $("radix-mon-tag").textContent = rx.cache_tier || "3-Tier (VRAM Pool → Host RAM → NVMe Disk)";
         if ($("radix-mon-l1")) {
-          const l1Text = rx.l1_vram_note || (rx.l1_vram_snapshots > 0 ? `${rx.l1_vram_snapshots} snap · ${rx.l1_vram_mib || 0} MiB` : "KV Working Pool (0 snap / 20.4k Experts)");
+          const expStr = (metrics.engine && metrics.engine.expert_slots) ? `${metrics.engine.expert_slots.toLocaleString()} Experts` : "Resident Experts"; const l1Text = rx.l1_vram_note || (rx.l1_vram_snapshots > 0 ? `${rx.l1_vram_snapshots} snap · ${rx.l1_vram_mib || 0} MiB` : `KV Working Pool (0 snap / ${expStr})`);
           $("radix-mon-l1").textContent = l1Text;
         }
         if ($("radix-mon-l2")) {

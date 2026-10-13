@@ -1743,10 +1743,12 @@ class Service:
             hit_rate = min(100.0, max(0.0, round((p_reused / p_total) * 100, 1))) if p_total > 0 else 0.0
             slots_data = list(self.slots_state.values())
             active_slots = sum(1 for sl in slots_data if sl.get("status") in ("reading", "generating"))
+        exp_cnt = int(getattr(self.engine, "info", {}).get("expert_slots", 0) or 0)
+        exp_str = f"{exp_cnt:,}" if exp_cnt > 0 else "resident"
         return {
             "l1_vram_snapshots": 0,
             "l1_vram_desc": "Working Session KV Pool",
-            "l1_vram_note": "0 snapshots (VRAM dedicated to 20.4k resident experts)",
+            "l1_vram_note": f"0 snapshots (VRAM dedicated to {exp_str} resident experts)",
             "l2_host_slots": 64,
             "l2_host_active": active_slots,
             "l2_host_desc": f"{active_slots}/64 active slots",
