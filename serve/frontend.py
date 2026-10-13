@@ -240,26 +240,70 @@ def unmark_think_literals(prompt: str, tags: dict[str, str] = LITERAL_TAGS) -> t
     return "".join(out), spans
 
 
+_SYSTEM_REMINDER_PATTERNS = [
+    re.compile(r"^\s*<system-reminder>[\s\S]*?</system-reminder>\s*$", re.IGNORECASE),
+    re.compile(r"^\s*Current runtime context:?[\s\S]*$", re.IGNORECASE),
+    re.compile(r"^\s*<context>[\s\S]*?</context>\s*$", re.IGNORECASE),
+]
+
+def _is_synthetic_system_reminder(content) -> bool:
+    if isinstance(content, str):
+        return any(p.match(content) for p in _SYSTEM_REMINDER_PATTERNS)
+    if isinstance(content, list) and len(content) == 1 and content[0].get("type") == "text":
+        text = content[0].get("text", "")
+        return any(p.match(text) for p in _SYSTEM_REMINDER_PATTERNS)
+    return False
+
 def _late_system_to_user(messages: list[dict]) -> list[dict]:
-    """Merges consecutive user turns to prevent prompt fragmentation."""
+    """Merges consecutive user turns while ensuring synthetic context/reminders precede human queries."""
     converted = [dict(m, role="user") if m.get("role") == "system" and i > 0 else m for i, m in enumerate(messages)]
     merged = []
-    for m in converted:
-        if merged and merged[-1].get("role") == "user" and m.get("role") == "user":
-            prev_c = merged[-1].get("content", "")
-            curr_c = m.get("content", "")
-            if isinstance(prev_c, str) and isinstance(curr_c, str):
-                merged[-1]["content"] = prev_c + chr(10) + chr(10) + curr_c
-            elif isinstance(prev_c, list) and isinstance(curr_c, list):
-                merged[-1]["content"] = prev_c + curr_c
-            elif isinstance(prev_c, list) and isinstance(curr_c, str):
-                merged[-1]["content"] = prev_c + [{"type": "text", "text": curr_c}]
-            elif isinstance(prev_c, str) and isinstance(curr_c, list):
-                merged[-1]["content"] = [{"type": "text", "text": prev_c}] + curr_c
-            else:
-                merged.append(m)
-        else:
+    i = 0
+    while i < len(converted):
+        m = converted[i]
+        if m.get("role") != "user":
             merged.append(m)
+            i += 1
+            continue
+
+        user_block = []
+        while i < len(converted) and converted[i].get("role") == "user":
+            user_block.append(converted[i])
+            i += 1
+
+        if len(user_block) == 1:
+            merged.append(user_block[0])
+            continue
+
+        synthetic = []
+        regular = []
+        for u in user_block:
+            if _is_synthetic_system_reminder(u.get("content")):
+                synthetic.append(u)
+            else:
+                regular.append(u)
+
+        ordered_block = synthetic + regular if regular else synthetic
+
+        combined_content = None
+        for u in ordered_block:
+            c = u.get("content", "")
+            if combined_content is None:
+                combined_content = c
+            else:
+                if isinstance(combined_content, str) and isinstance(c, str):
+                    combined_content = combined_content + chr(10) + chr(10) + c
+                elif isinstance(combined_content, list) and isinstance(c, list):
+                    combined_content = combined_content + c
+                elif isinstance(combined_content, list) and isinstance(c, str):
+                    combined_content = combined_content + [{"type": "text", "text": c}]
+                elif isinstance(combined_content, str) and isinstance(c, list):
+                    combined_content = [{"type": "text", "text": combined_content}] + c
+
+        merged_user = dict(ordered_block[-1])
+        merged_user["content"] = combined_content
+        merged.append(merged_user)
+
     return merged
 def _object_list(value, name: str) -> list[dict]:
     """#460: a request's "messages" (or a message's "tool_calls") as a list of objects.  Some clients send the array
