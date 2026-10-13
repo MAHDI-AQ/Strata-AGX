@@ -1141,12 +1141,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         // ---- embeddings, broadcast to the four streams - or, in a later stage of a layer split, the rows the
         // previous stage handed on
         if (hand_in_ != nullptr) {
-            if (!(m.device >= 0 && m.R != nullptr)) {
-                if (cudaMemcpyAsync(m.R, hand_in_ + (size_t) c0 * D, (size_t) T * D * 4, cudaMemcpyHostToDevice, m.cs) !=
-                    cudaSuccess) {
-                    err = "prefill: the layer split's hand-off upload failed";
-                    return false;
-                }
+            if (cudaMemcpyAsync(m.R, hand_in_ + (size_t) c0 * D, (size_t) T * D * 4, cudaMemcpyHostToDevice, m.cs) !=
+                cudaSuccess) {
+                err = "prefill: the layer split's hand-off upload failed";
+                return false;
             }
         }
         // C-4: the whole chunk's rows in one gather (the same per-element arithmetic as the per-token path, so the
@@ -2243,10 +2241,6 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         return false;
                     }
                     cudaEventRecord(ev_l24, copy_stream);
-                    // Zero-host-sync: hardware stream wait event directly on GPU 1 execution stream
-                    if (next_->impl_->cs != nullptr) {
-                        cudaStreamWaitEvent(next_->impl_->cs, ev_l24, 0);
-                    }
                     if (next_run.valid() && !next_run.get()) { err = next_err; return false; }
                     ChainGate* gate = chain ? chain_gate_ : nullptr;
                     if (gate != nullptr) gate->acquire();
@@ -2256,12 +2250,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             ChainGate* g;
                             ~GateRelease() { if (g != nullptr) g->release(); }
                         } release{gate};
-                        // Eliminate CPU host sync stall when stream event wait is active
-                        if (next_->impl_->cs == nullptr) {
-                            if (cudaEventSynchronize(ev_l24) != cudaSuccess) {
-                                next_err = "prefill: micro-chunk hand-off event sync failed";
-                                return false;
-                            }
+                        if (cudaEventSynchronize(ev_l24) != cudaSuccess) {
+                            next_err = "prefill: micro-chunk hand-off event sync failed";
+                            return false;
                         }
                         return next_->run(tokens + c0 + u0, uT, p0 + u0, next_err);
                     });
