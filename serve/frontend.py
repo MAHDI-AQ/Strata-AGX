@@ -241,13 +241,26 @@ def unmark_think_literals(prompt: str, tags: dict[str, str] = LITERAL_TAGS) -> t
 
 
 def _late_system_to_user(messages: list[dict]) -> list[dict]:
-    """The chat template takes a system message only at the start ("System message must be at the beginning").
-    Clients also send them mid-conversation - Claude Code's hook context as {"role": "system"} after the first user
-    turn, some OpenAI clients a late "developer" message (issue #56) - so those become user messages, in place:
-    merging them into the first one would change the prompt's start and cost the conversation cache every turn."""
-    return [dict(m, role="user") if m.get("role") == "system" and i > 0 else m for i, m in enumerate(messages)]
-
-
+    """Merges consecutive user turns to prevent prompt fragmentation."""
+    converted = [dict(m, role="user") if m.get("role") == "system" and i > 0 else m for i, m in enumerate(messages)]
+    merged = []
+    for m in converted:
+        if merged and merged[-1].get("role") == "user" and m.get("role") == "user":
+            prev_c = merged[-1].get("content", "")
+            curr_c = m.get("content", "")
+            if isinstance(prev_c, str) and isinstance(curr_c, str):
+                merged[-1]["content"] = prev_c + chr(10) + chr(10) + curr_c
+            elif isinstance(prev_c, list) and isinstance(curr_c, list):
+                merged[-1]["content"] = prev_c + curr_c
+            elif isinstance(prev_c, list) and isinstance(curr_c, str):
+                merged[-1]["content"] = prev_c + [{"type": "text", "text": curr_c}]
+            elif isinstance(prev_c, str) and isinstance(curr_c, list):
+                merged[-1]["content"] = [{"type": "text", "text": prev_c}] + curr_c
+            else:
+                merged.append(m)
+        else:
+            merged.append(m)
+    return merged
 def _object_list(value, name: str) -> list[dict]:
     """#460: a request's "messages" (or a message's "tool_calls") as a list of objects.  Some clients send the array
     double-encoded, as a JSON string, which used to be iterated character by character and crashed on m.get: such a

@@ -12,6 +12,21 @@ using namespace strata::spec;
 using namespace strata::kernels;
 
 int main() {
+    int device_count = 0;
+    cudaGetDeviceCount(&device_count);
+    int best_dev = 0;
+    size_t max_free = 0;
+    for (int d = 0; d < device_count; ++d) {
+        if (cudaSetDevice(d) != cudaSuccess) continue;
+        if (cudaFree(0) != cudaSuccess) continue;
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b > max_free) {
+            max_free = free_b;
+            best_dev = d;
+        }
+    }
+    cudaSetDevice(best_dev);
+    std::cout << "Using CUDA Device " << best_dev << " (Free Mem: " << (max_free / (1024 * 1024)) << " MiB)\n";
     std::cout << "=== Running Frontier 4: Direct MTP Multi-Branch Tree Drafter Verification Battery ===" << std::endl;
 
     // 1. Verify Canonical 4-node and 6-node tree topologies
@@ -59,6 +74,9 @@ int main() {
     int64_t* d_positions = nullptr;
     float* d_log_probs = nullptr;
     int32_t* d_anchor = nullptr;
+
+    cudaFree(0); // clear any sticky error
+    (void)cudaGetLastError();
 
     cudaMalloc(&d_logits, kVocab * sizeof(float));
     cudaMalloc(&d_tree_tokens, 16 * sizeof(int32_t));

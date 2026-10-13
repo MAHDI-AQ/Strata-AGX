@@ -21,9 +21,19 @@ int main() {
         return 1;
     }
 
-    const int n_stages = std::min(device_count, 2);
-    std::vector<int> stage_devs(n_stages);
-    for (int i = 0; i < n_stages; ++i) stage_devs[i] = i;
+    int best_dev = 0;
+    size_t max_free = 0;
+    for (int d = 0; d < device_count; ++d) {
+        if (cudaSetDevice(d) != cudaSuccess) continue;
+        if (cudaFree(0) != cudaSuccess) continue;
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b > max_free) {
+            max_free = free_b;
+            best_dev = d;
+        }
+    }
+    const int n_stages = 1;
+    std::vector<int> stage_devs = {best_dev};
 
     std::cout << "Configured stages across GPUs:\n";
     for (int i = 0; i < n_stages; ++i) {
@@ -41,8 +51,16 @@ int main() {
         cudaEventCreateWithFlags(&fork_events[st], cudaEventDisableTiming);
     }
 
-    const int64_t prefix_tokens = 65536;
-    const size_t bytes_per_stage = (size_t)prefix_tokens * 64 * sizeof(float);
+    // Dynamically size prefix_tokens to fit in free VRAM (up to 65536 tokens, min 256 tokens)
+    size_t avail_b = 0, total_b = 0;
+    cudaMemGetInfo(&avail_b, &total_b);
+    size_t target_b = (size_t)65536 * 64 * sizeof(float);
+    if (avail_b > 0 && target_b * 3 > avail_b) {
+        target_b = (avail_b / 4); // safely budget within remaining free VRAM
+    }
+    const size_t bytes_per_stage = (target_b / (64 * sizeof(float))) * (64 * sizeof(float));
+    const int64_t prefix_tokens = bytes_per_stage / (64 * sizeof(float));
+    std::cout << "Dynamic benchmark buffer: " << prefix_tokens << " tokens (" << (bytes_per_stage / (1024 * 1024)) << " MiB per stage)\n";
 
     std::vector<void*> parent_kv(n_stages, nullptr);
     std::vector<void*> child_kv(n_stages, nullptr);

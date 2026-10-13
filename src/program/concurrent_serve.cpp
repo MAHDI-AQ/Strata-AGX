@@ -1586,10 +1586,21 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         if (retain) s.session = s.request.session;   // D1: keep the slot's conversation key current
         if (reused == 0) s.consumed.clear();
         std::fill(std::begin(s.probability), std::end(s.probability), 0.0f);
+        std::fill(std::begin(s.drafts), std::end(s.drafts), 0);
+        std::fill(std::begin(s.lookup_tokens), std::end(s.lookup_tokens), 0);
+        std::fill(std::begin(s.window), std::end(s.window), 0);
+        std::fill(std::begin(s.output), std::end(s.output), 0);
         s.suffix.reset(); s.policy = spec::DraftPolicy{c.window};
         for (auto token : s.request.tokens) s.suffix.append((int32_t) token);
 
         if (reused == 0) {
+            s.saved_prefix = 0;
+            s.saved_consumed.clear();
+            s.cache_tier = "Fresh";
+            if (s.radix_node) {
+                radix_tree.release(s.radix_node);
+                s.radix_node = nullptr;
+            }
             for (size_t st = 0; st < m.stages.size(); ++st) {   // C4: every stage's state resets on its device
                 const core::OnDevice on(m.stages[st].device);
                 core::session_zero(*s.stages[st].state, g, nullptr, m.stage_rt[st].prompt_stream);
@@ -1784,7 +1795,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 // In match_prefix(), full hits have match.matched_tokens == match.node->prefix_len,
                 // while partial edge hits are truncated to 64-token page boundaries (M_safe = (M / 64) * 64).
                 // Both are safe to restore from Host RAM, with remainder tokens prefilled as catch-up.
-                const bool pqp_match = match.node && (match.matched_tokens == match.node->prefix_len || match.matched_tokens % 64 == 0);
+                const bool pqp_match = match.node && (match.matched_tokens == match.node->prefix_len);
                 if (pqp_match && match.matched_tokens >= 64 && match.matched_tokens > best && nmax >= match.matched_tokens) {
                     if (best_node && best_node != match.node) {
                         radix_tree.release(best_node);
@@ -1836,6 +1847,8 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                     auto* p = p_ptr.get();
                     const int64_t valid_len = p->saved_prefix;
                     if (valid_len < 64 || valid_len > nmax || valid_len <= best) continue;
+                    // Enforce session affinity: cross-slot snapshot reuse only permitted for same session
+                    if (pending[q].session != 0 && p->session != 0 && p->session != pending[q].session) continue;
                     bool same = true;
                     for (int64_t i = 0; i < valid_len && same; ++i) {
                         same = (p->saved_consumed[(size_t) i] == (int32_t) tokens[(size_t) i]);
@@ -2094,9 +2107,24 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                         windows[wi].count = (int) std::min<int64_t>(std::max(windows[wi].count, c.mtp_window_rows), win_slots[wi]->max_context - windows[wi].position);
             }
             // Stable packing order avoids recapturing a graph merely because fairness rotated the request order.
-            std::sort(windows.begin(), windows.end(), [](const auto& a, const auto& b) {
-                return std::less<core::Verifier*>{}(a.verifier, b.verifier);
+            // Synchronize win_slots and ready with windows sorting order!
+            struct WinEntry {
+                core::Verifier::BatchWindow win;
+                Impl::Slot* slot;
+            };
+            std::vector<WinEntry> entries(windows.size());
+            for (size_t wi = 0; wi < windows.size(); ++wi) {
+                entries[wi] = {windows[wi], win_slots[wi]};
+            }
+            std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) {
+                return std::less<core::Verifier*>{}(a.win.verifier, b.win.verifier);
             });
+            for (size_t wi = 0; wi < windows.size(); ++wi) {
+                windows[wi] = entries[wi].win;
+                win_slots[wi] = entries[wi].slot;
+            }
+            // Sync ready vector order to match sorted win_slots
+            ready = win_slots;
             const auto start = Clock::now();
             dispatch.failed = false;
             // C3/C4 (design-wiring §5): refresh EVERY stage's publish target for THIS round before it runs.

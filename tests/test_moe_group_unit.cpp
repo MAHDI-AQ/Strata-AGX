@@ -12,7 +12,21 @@ int main() {
         std::cerr << "No CUDA devices found!" << std::endl;
         return 1;
     }
-    cudaSetDevice(0);
+    int best_dev = 0;
+    size_t max_free = 0;
+    for (int d = 0; d < device_count; ++d) {
+        if (cudaSetDevice(d) != cudaSuccess) continue;
+        if (cudaFree(0) != cudaSuccess) continue;
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+            if (free_b > max_free) {
+                max_free = free_b;
+                best_dev = d;
+            }
+        }
+    }
+    cudaSetDevice(best_dev);
+    std::cout << "Using CUDA Device " << best_dev << " (Free Mem: " << (max_free / (1024 * 1024)) << " MiB)\n";
 
     const int n_expert = 128;
     const int k_top = 8;

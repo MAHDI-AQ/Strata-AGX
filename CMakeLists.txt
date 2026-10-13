@@ -401,6 +401,11 @@ target_link_libraries(tree_spec_test PRIVATE strata_spec strata_kernels)
 
 add_executable(test_frontier4_tree_drafter tests/spec/test_frontier4_tree_drafter.cpp)
 target_link_libraries(test_frontier4_tree_drafter PRIVATE strata_spec strata_kernels)
+add_executable(test_frontier2_kv_fork tests/concurrency/test_frontier2_kv_fork.cpp)
+target_link_libraries(test_frontier2_kv_fork PRIVATE strata_engine)
+
+add_executable(test_moe_group_unit tests/test_moe_group_unit.cpp)
+target_link_libraries(test_moe_group_unit PRIVATE strata_prefill strata_engine)
   target_link_libraries(tree_spec_test PRIVATE strata_engine)
   add_executable(nanobatch_test tests/core/nanobatch_test.cpp)
   target_link_libraries(nanobatch_test PRIVATE strata_engine)

@@ -714,6 +714,11 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     cudaMemsetAsync(st.idx_tail, 0, (size_t) (s.idx_block - 1) * s.idx_dim * 4, cs);
     cudaMemsetAsync(st.idx_dead, 0, (size_t) s.idx_dim * 4, cs);
     cudaMemsetAsync(st.idx_pooled, 0, (size_t) st.idx_pooled_rows * s.idx_dim * 4, cs);
+    if (st.idx_block_pos) cudaMemsetAsync(st.idx_block_pos, 0, sizeof(int32_t), cs);
+    if (st.step) cudaMemsetAsync(st.step, 0, (size_t) strata::kernels::kStepCount * sizeof(int32_t), cs);
+    if (st.pos_dev) cudaMemsetAsync(st.pos_dev, 0, (size_t) s.n_head * sizeof(int32_t), cs);
+    if (st.host_step) std::memset(st.host_step, 0, strata::kernels::qsa_step_bytes() + sizeof(int32_t));
+    if (st.host_pos) std::memset(st.host_pos, 0, (size_t) s.n_head * sizeof(int32_t));
 }
 
 strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st) {

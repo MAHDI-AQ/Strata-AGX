@@ -682,16 +682,10 @@ RadixMatch RadixTree::match_prefix(const int32_t* tokens, size_t n) const {
                 best = RadixMatch{curr, (int64_t) matched_len};
             }
         } else {
-            // Mandate 4: PQP-TR Partial Prefix Retrieval
-            // If the query diverges mid-edge (0 < match_edge < edge.size()) and child has a snapshot,
-            // truncate partial edge hits to 64-token page boundaries: M_safe = ((matched_len + match_edge) / 64) * 64.
-            if (child->has_snapshot() && match_edge > 0) {
-                const int64_t total_matched = (int64_t) (matched_len + match_edge);
-                const int64_t M_safe = (total_matched / 64) * 64;
-                if (M_safe >= 256 && (int64_t) n - 1 >= M_safe && M_safe > best.matched_tokens) {
-                    best = RadixMatch{child, M_safe};
-                }
-            }
+            // Disallow mid-edge partial snapshot restore for hybrid recurrent models (GDN + QSA + PLE).
+            // A snapshot saved at prefix_len holds recurrent states (gdn_saved, ple_saved, R_saved)
+            // that cannot be unrolled backward. Reusing a partial edge hit causes recurrent state
+            // pollution from ghost tokens of divergent requests. Exact node snapshot match is required.
             break;
         }
     }
@@ -747,16 +741,10 @@ RadixMatch RadixTree::match_prefix(const int64_t* tokens, size_t n) const {
                 best = RadixMatch{curr, (int64_t) matched_len};
             }
         } else {
-            // Mandate 4: PQP-TR Partial Prefix Retrieval
-            // If the query diverges mid-edge (0 < match_edge < edge.size()) and child has a snapshot,
-            // truncate partial edge hits to 64-token page boundaries: M_safe = ((matched_len + match_edge) / 64) * 64.
-            if (child->has_snapshot() && match_edge > 0) {
-                const int64_t total_matched = (int64_t) (matched_len + match_edge);
-                const int64_t M_safe = (total_matched / 64) * 64;
-                if (M_safe >= 256 && (int64_t) n - 1 >= M_safe && M_safe > best.matched_tokens) {
-                    best = RadixMatch{child, M_safe};
-                }
-            }
+            // Disallow mid-edge partial snapshot restore for hybrid recurrent models (GDN + QSA + PLE).
+            // A snapshot saved at prefix_len holds recurrent states (gdn_saved, ple_saved, R_saved)
+            // that cannot be unrolled backward. Reusing a partial edge hit causes recurrent state
+            // pollution from ghost tokens of divergent requests. Exact node snapshot match is required.
             break;
         }
     }
@@ -1237,6 +1225,9 @@ bool RadixTree::fork_to_session(
             }
         }
     }
+    node->last_accessed = std::chrono::steady_clock::now();
+    lock.unlock(); // Drop rw_lock_ before host-blocking cudaStreamSynchronize to eliminate scheduler deadlock
+
     // Task 2.4: Asynchronous Multi-Stage KV Forking across concurrent CUDA streams
     // Stage 0 and Stage 1 DMA memcpy operations overlap concurrently across streams[0] and streams[1].
     for (size_t st = 0; st < n_stages; ++st) {
@@ -1246,7 +1237,6 @@ bool RadixTree::fork_to_session(
             return false;
         }
     }
-    node->last_accessed = std::chrono::steady_clock::now();
     return true;
 }
 

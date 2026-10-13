@@ -1,3 +1,5 @@
+function escapeHtml(str) { if (str == null) return ""; return String(str).replace(/[&<>"\x27]/g, function(m) { return {"&": "&amp;", "<": "&lt;", ">": "&gt;", """: "&quot;", "\x27": "&#039;"}[m]; }); }
+
 "use strict";
 const $ = id => document.getElementById(id);
 let selected = null, detail = null, pane = "input", records = [], state = null, operating = false, stamp = "", actionError = "";

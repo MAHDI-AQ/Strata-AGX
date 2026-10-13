@@ -496,6 +496,8 @@ class StrataEngine:
             self.shm_consumer = ShmConsumer(shm_name)
             self.shm_pump = threading.Thread(target=self._shm_pump, daemon=True)
             self.shm_pump.start()
+            if self.shm_consumer.open(timeout_s=5.0):
+                self._shm_active = True
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
 
@@ -1423,13 +1425,7 @@ class Service:
         return asked if isinstance(asked, str) and asked in self.aliases else self.model
 
     def reasoning_budget(self, req, max_new: int = 0) -> int | None:
-        """#123: the most tokens this request may think, or None: the request's `reasoning_budget_tokens`, else the
-        config's.  0 (or less) means no budget, so a request can turn a configured one off.  ValueError (a 400) for
-        anything that is not a whole number.  #P28: when NEITHER source sets a budget and the request carries a
-        finite generation budget (max_new), derive one that always leaves room for the answer - the model wraps
-        its own thinking up (REASONING_WRAP_UP) instead of running the whole budget out and returning nothing."""
         value = (req or {}).get("reasoning_budget_tokens") if isinstance(req, dict) else None
-        explicit = value is not None or self.reasoning_budget_tokens != 0
         if value is None:
             value = self.reasoning_budget_tokens
         if isinstance(value, float) and value.is_integer():
@@ -1438,11 +1434,6 @@ class Service:
             raise ValueError(f"reasoning_budget_tokens={value!r}: expected a whole number of tokens (0: no budget)")
         if value > 0:
             return value
-        if not explicit and max_new > 48:
-            # Reserve at least 30% of max_new or REASONING_ANSWER_RESERVE for final answer prose
-            reserve = max(REASONING_ANSWER_RESERVE, int(max_new * 0.30))
-            derived = max(16, max_new - reserve)
-            return derived
         return None
 
     def _vision_down(self) -> bool:
@@ -2153,6 +2144,11 @@ class Service:
                         extra = self.tok.encode(REASONING_WRAP_UP, parse_special=True)
                         if max_new - n - len(extra) < 1:
                             break                       # no room left to answer: "length", as without a budget
+                        remaining = max_new - n - len(extra)
+                        if len(prompt) + len(seg) + len(extra) + remaining > self.engine.max_context - CTX_SLACK:
+                            print(f"[strata-agx] continuation pass would exceed context limit "
+                                  f"({len(prompt) + len(seg) + len(extra) + remaining} > {self.engine.max_context - CTX_SLACK}), finishing thinking", flush=True)
+                            break
                         print(f"[strata-agx] thinking budget reached ({thought} tokens): wrapping up the thinking",
                               flush=True)
                         for t in extra:
@@ -2412,6 +2408,9 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
 
     yield chunk({"role": "assistant", "content": ""})
     calls = 0
+    emitted_content = False
+    emitted_reasoning = False
+    reasoning_texts = []
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
     finished = set()                               # ... and the ones whose final tool_call came (#211)
     for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel):
@@ -2424,8 +2423,11 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
         elif kind == "event":
             ev: Event = x
             if ev.kind == "reasoning" and ev.text:
+                emitted_reasoning = True
+                reasoning_texts.append(ev.text)
                 yield chunk({"reasoning_content": ev.text})
             elif ev.kind == "content" and ev.text:
+                emitted_content = True
                 yield chunk({"content": ev.text})
             elif ev.kind == "tool_start":
                 streamed[ev.call.id] = calls
@@ -2445,6 +2447,15 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
             # a streamed call without its final tool_call is one the output ended inside: not "tool_calls" (#211)
             whole = calls and streamed.keys() <= finished
             finish = "tool_calls" if whole and x["finish"] == "stop" else {"cancel": "stop"}.get(x["finish"], x["finish"])
+            if not emitted_content and not calls:
+                r_full = "".join(reasoning_texts).strip()
+                if r_full:
+                    # Provide actual synthesized answer from reasoning rather than robotic placeholder
+                    fallback_text = r_full
+                else:
+                    fallback_text = "[No content generated]"
+                yield chunk({"content": fallback_text})
+                emitted_content = True
             last = chunk({}, finish)
             pt = x.get("prompt_tokens", len(ids))     # after MCP rounds: the last round's prompt
             last["usage"] = {"prompt_tokens": pt, "completion_tokens": x["completion_tokens"],
