@@ -57,7 +57,6 @@ Context::Context() {}
 Context::~Context() {}
 void Context::run(const Product&, void*) {}
 void gather_native(const void*, const void*, size_t, const void*, size_t, void*, void*, void*) {}
-bool gather_native_group(const GatherGroup&, size_t, size_t, size_t, size_t, void*, size_t, void*, size_t, void*) { return false; }
 void gather_strata_q2(const uint8_t*, void*, void*, void*) {}
 void swiglu(const float*, float*, int64_t, int64_t, bool, void*) {}
 void iota(int32_t*, int64_t, void*) {}
@@ -2007,16 +2006,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 m.gsrc_host[2 * g * MMQ_GROUP + MMQ_GROUP + q] =
                                     resident ? (const char*) blob_dev + f.down_off : (const char*) (m.grp_d + q * mmq_db);
                                 if (!resident) {
-                                    mmq::GatherGroup gg{};
-                                    gg.blob[q] = blob_dev;
-                                    gg.first = (int) q;
-                                    gg.n = (int) q + 1;
-                                    if (!mmq::gather_native_group(gg, f.up_off, mmq_gub / 2, f.down_off, mmq_db,
-                                                                  m.grp_gu + q * mmq_gub, mmq_gub,
-                                                                  m.grp_d + q * mmq_db, mmq_db, m.cs)) {
-                                        mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2, blob_dev + f.down_off,
-                                                           mmq_db, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
-                                    }
+                                    mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2, blob_dev + f.down_off,
+                                                       mmq_db, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
+                                    // the gathered down matrix's last row ends at its slot's end: MMQ's K
+                                    // over-read (MMQ_TAIL) reads the NEXT slot - zero it (the group tail
+                                    // memsets below cover the group's last slot)
                                     cudaMemsetAsync(m.grp_d + (size_t) (q + 1) * mmq_db, 0, MMQ_TAIL, m.cs);
                                 }
                             } else if (lay.native) {
