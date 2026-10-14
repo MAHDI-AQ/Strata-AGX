@@ -768,7 +768,46 @@ class OutputParser:
         # character; other types whole, once complete) - before the final "tool_call".  Without it, a client sees
         # nothing until the call is complete, which for a large file write can be many minutes.
         self.stream_tools = stream_tools
+        # #804/#1058: calls found inside the reasoning wait here as [raw text, ToolCall | None] until the turn shows
+        # they were acts: only whitespace (or more calls) after them, then the end of the turn or `</think>`.  The
+        # reasoning text before them is tracked (code fence, inline code, current line) to tell an act from a quote.
+        self.pending = []
+        self.rescued = 0             # calls delivered from the reasoning
+        self.refused = 0             # declared calls kept as reasoning text (quoted, or the turn was cut)
+        self.fence, self.line, self.ticks = "", "", 0
         self._reset_scan()
+
+    def _track(self, text: str) -> str:
+        parts = text.split("\n")
+        for k, part in enumerate(parts):
+            if k < len(parts) - 1:
+                s = (self.line + part).strip()
+                if not self.fence:
+                    if (s.startswith("```") and "`" not in s[3:]) or (s.startswith("~~~") and "~" not in s[3:]):
+                        self.fence = s[:3]
+                elif s.startswith(self.fence) and s[len(self.fence):] == "":
+                    self.fence = ""
+                self.line = ""
+                if not self.fence:
+                    self.ticks = 0
+            else:
+                self.line += part
+                if not self.fence:
+                    self.ticks = (self.ticks + part.count("`")) % 2
+        return text
+
+    def _release(self, as_calls: bool) -> list[Event]:
+        out = []
+        for raw, call in self.pending:
+            if as_calls and call is not None:
+                self.rescued += 1
+                out.append(Event("tool_call", call=call))
+            else:
+                if call is not None:
+                    self.refused += 1
+                out.append(Event("reasoning", self._track(raw)))
+        self.pending = []
+        return out
 
     def _reset_scan(self):
         self.sp = 0                  # how much of self.buf (the call body) the scanner has consumed
@@ -948,21 +987,21 @@ class OutputParser:
                             call = parse_tool_call(body[:end], self.schemas.get(name))
                     except (ValueError, Exception):
                         pass
-                    if call is not None:
-                        out.append(Event("tool_call", call=call))
-                        # Tool call closes reasoning phase: transition to content
-                        self.state = "content"
-                        self.lead = True
+                    raw = self.buf[:len(CALL_START) + end + len(CALL_END)]
+                    if (call is not None and not self.fence and not self.ticks and self.line.strip() == "") or self.pending:
+                        self.pending.append([raw, call])    # settled by what follows it (see __init__)
                     else:
-                        out.append(Event("reasoning", self.buf[:len(CALL_START) + end + len(CALL_END)]))
-                        self.state = "reasoning"
+                        out.append(Event("reasoning", self._track(raw)))
                     self.buf = body[end + len(CALL_END):]
+                    self.state = "reasoning"
                 elif think >= 0:                     # the thinking ended inside it: it never was a call
-                    out.append(Event("reasoning", self.buf[:len(CALL_START) + think]))
+                    out += self._release(False)
+                    out.append(Event("reasoning", self._track(self.buf[:len(CALL_START) + think])))
                     self.buf = body[think:]
                     self.state = "reasoning"
                 elif len(body) > RCALL_MAX:          # a tag in the prose that never closes: stop holding the thinking back
-                    out.append(Event("reasoning", self.buf))
+                    out += self._release(False)
+                    out.append(Event("reasoning", self._track(self.buf)))
                     self.buf = ""
                     self.state = "reasoning"
                 else:
@@ -983,7 +1022,10 @@ class OutputParser:
                         self.buf = self.buf[len(self.buf) - keep:]
                     return out
                 if i:
-                    out.append(Event("reasoning", self.buf[:i]))
+                    out += self._release(False)
+                    out.append(Event("reasoning", self._track(self.buf[:i])))
+                else:
+                    out += self._release(True)
                 self.buf = self.buf[i + len(THINK_END):]
                 self.state, self.lead = "content", True
             elif self.state == "content":
