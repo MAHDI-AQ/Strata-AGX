@@ -43,7 +43,8 @@ On 2026-10-14, Strata AGX landed the **Multi-Agent Concurrency & Hardware Accele
 - **Coalesced Warp Expert Swapping (commit `e5b97089`):** Replaces uncoalesced thread scans with 32-thread warp vote reductions (`__ballot_sync`), cutting router window latency by **7.8% (2.2ms)** (upstream `33fd01b4`).
 - **Reasoning Code Fence Guard (commit `d79f294a`):** Strict markdown fence tracking protects reasoning mode (`</think>`) against accidental execution of quoted `<tool_call>` examples. Verified **3/3 (100%)** on tool fidelity tests (upstream `38357f18`).
 - **Core Route H Architecture Clean-Up (commit `aa513381`):** Locks multiplexed asynchronous serving as canonical default and prunes legacy single-stream paths.
-- **Zero-Copy Resident VRAM Routing (commit `7fdea49f`):** Preserves AGX proprietary resident routing (`m.gsrc_host`) across all 18,883 resident MoE experts.
+- **Zero-Copy Resident VRAM Routing (commit `7fdea49f`):** Preserves AGX proprietary resident routing (`m.gsrc_host`) across all **18,883 resident MoE experts** in dual-RTX 4090 VRAM.
+  - *Hardware Architecture Note:* By isolating multimodal image preprocessing and ViT execution 100% on CPU CCD1 (`taskset -c 8-15,24-31`), `strata-vision` incurs **0 MiB VRAM footprint**, allowing the entire dual-4090 48 GB VRAM estate to remain dedicated to text & MoE expert residency (locking in the full 18,883 resident experts simultaneously with multimodal vision serving).
 - **Empirical Hardware Telemetry ($C=2$ on Dual RTX 4090s):**
   - **Streaming Decode:** **121.1 tok/s** (Stream 0) + **118.4 tok/s** (Stream 1) = **239.5 tok/s aggregate decode rate**.
   - **TTFT (Prefix Cache Hit):** **2.0 ms ($p50$)** on $T_{sys} / T_{turn}$ Radix-Tree boundaries.

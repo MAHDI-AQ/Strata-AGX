@@ -98,6 +98,10 @@ bool NVMeStorageTier::write_node_direct(int64_t node_id, const void* data, size_
         }
         if (fd < 0) return false;
     }
+#if defined(__linux__)
+    // Pre-allocate blocks via native Linux fallocate to eliminate ext4 metadata journal locks during Direct I/O
+    ::fallocate(fd, 0, 0, static_cast<off_t>(bytes));
+#endif
 
     size_t write_bytes = bytes;
     const void* write_ptr = data;

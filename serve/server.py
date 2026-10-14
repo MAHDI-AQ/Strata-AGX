@@ -675,6 +675,8 @@ class StrataEngine:
             self.last.update(drafts_accepted=int(f[6]), drafts_offered=int(f[7]), reused=int(f[8]))
         if len(f) >= 10 and not f[9].isdigit():           # trailing cache_tier from concurrent engine
             self.last.update(cache_tier=f[9])
+        if len(f) >= 11 and f[10].isdigit():              # live L2 Host RAM bytes from RadixTree
+            self.last.update(l2_host_bytes=int(f[10]))
         if len(f) >= 11:                                  # decode hit rate fields
             self.last.update(hits=int(f[9]), lookups=int(f[10]))
         if len(f) >= 14:                                  # the expert tiers (engine 0.1.31+): RAM / file blobs, file MB
@@ -1041,7 +1043,7 @@ class Vision:
     sends the same picture again (every turn, with most clients) encodes it once."""
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None):
-        args = ["taskset", "-c", "8-15", cfg["exe"], "--mmproj", cfg["mmproj"], "--model", cfg["model"]]
+        args = ["taskset", "-c", "8-15,24-31", cfg["exe"], "--mmproj", cfg["mmproj"], "--model", cfg["model"]]
         if cfg.get("gpu"):
             args.append("--gpu")
         if cfg.get("threads"):
@@ -1125,7 +1127,35 @@ class Vision:
         raise ValueError("an image must be a data: URL, an http(s) URL or a local file path")
 
     @staticmethod
+    def _normalize_worker(data: bytes) -> bytes:
+        """Executes image preprocessing pinned to CCD1 so Pillow CPU decoding never pollutes CCD0."""
+        try:
+            os.sched_setaffinity(0, {8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31})
+        except Exception:
+            pass
+        return Vision._normalize_impl(data)
+
+    @staticmethod
     def normalize(data: bytes) -> bytes:
+        """Normalizes image data offloaded to a dedicated CCD1 thread."""
+        result = [None]
+        err = [None]
+        def runner():
+            try:
+                result[0] = Vision._normalize_worker(data)
+            except Exception as e:
+                err[0] = e
+        t = threading.Thread(target=runner, daemon=True)
+        t.start()
+        t.join(timeout=30)
+        if err[0]:
+            raise err[0]
+        if result[0] is None:
+            raise ValueError("image normalization timed out")
+        return result[0]
+
+    @staticmethod
+    def _normalize_impl(data: bytes) -> bytes:
         """Normalizes image data: converts alpha to white, clamps resolution to max 1024px, outputs clean PNG."""
         try:
             import io
@@ -1787,11 +1817,13 @@ class Service:
             "l1_display": f"{active_slots}/{conc_slots} slots active · {total_active_tokens:,} toks",
             
             # L2 Host RAM Tier (Parked DDR4 Prefix Nodes)
+            # Task 1: Byte-accurate C++ telemetry from RadixTree::host_snapshot_bytes_locked()
             "l2_host_slots": 64,
             "l2_host_nodes": total_nodes,
-            "l2_host_gib": round(min(20.0, total_nodes * 0.117), 2) if total_nodes > 0 else 0.0,
-            "l2_host_limit_gib": 20.0,
-            "l2_display": f"{total_nodes} nodes · {round(min(20.0, total_nodes * 0.117), 1)} GiB",
+            "l2_host_bytes": getattr(self.engine, "last", {}).get("l2_host_bytes", 0),
+            "l2_host_gib": round(getattr(self.engine, "last", {}).get("l2_host_bytes", 0) / (1024**3), 2),
+            "l2_host_limit_gib": 32.0,
+            "l2_display": f"{total_nodes} nodes · {round(getattr(self.engine, last, {}).get(l2_host_bytes, 0) / (1024**3), 2)} GiB (32 GiB cap)",
             
             # L3 NVMe Tier (DirectStorage Disk Snapshots)
             "l3_nvme_snapshots": l3_snapshots,

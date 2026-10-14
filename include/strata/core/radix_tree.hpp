@@ -271,6 +271,7 @@ struct RadixMatch {
 
 class RadixTree {
 public:
+    static inline std::atomic<int32_t> in_flight_l3_reads_{0};
     explicit RadixTree(size_t max_cached_snapshots = 4, size_t max_host_snapshots = 64);
     ~RadixTree();
 

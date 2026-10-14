@@ -281,7 +281,9 @@ void launch_moe_gpu_group(
 {
     if (total_tokens <= 0 || n_expert <= 0) return;
 
-    if (total_tokens <= 1024 || tables.block_hist == nullptr) {
+    // Task 5: Calibrated crossover threshold: single-CTA for tiny bursts (total_tokens < 2048, i.e. T < 256 for K=8)
+    // Multi-CTA 3-phase cooperative kernel engages for T >= 256 (standard micro-chunk ladders 512, 1024, 4096)
+    if (total_tokens < 2048 || tables.block_hist == nullptr) {
         // Small tokens: Single-CTA persistent kernel
         g_single_cta_count.fetch_add(1, std::memory_order_relaxed);
         if (tables.cnt) cudaMemsetAsync(tables.cnt, 0, n_expert * sizeof(int32_t), stream);

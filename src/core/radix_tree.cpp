@@ -353,6 +353,12 @@ bool RadixNode::hydrate_from_nvme(NVMeStorageTier& nvme) {
     if (!is_l3_offloaded) return true;
     if (l3_bytes == 0) return false;
 
+    // Task 4: RAII ScopedReadTracker to prioritize L3 reads over background writes
+    struct ScopedReadTracker {
+        ScopedReadTracker() { RadixTree::in_flight_l3_reads_.fetch_add(1, std::memory_order_relaxed); }
+        ~ScopedReadTracker() { RadixTree::in_flight_l3_reads_.fetch_sub(1, std::memory_order_relaxed); }
+    } read_guard;
+
     AlignedBuffer buffer(l3_bytes);
     if (!nvme.read_node_direct(id, buffer.data(), l3_bytes)) {
         return false;
@@ -562,6 +568,10 @@ void RadixTree::nvme_worker_loop() {
         }
 
         if (nvme_tier_ && task.payload.data() && task.total_payload > 0) {
+            // Task 4: I/O priority gate - yield background writes while active L3 read is in flight
+            while (in_flight_l3_reads_.load(std::memory_order_relaxed) > 0 && !nvme_stop_.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
             bool ok = nvme_tier_->write_node_direct(task.node_id, task.payload.data(), task.total_payload);
             if (auto node = task.node_weak.lock()) {
                 std::unique_lock<std::shared_mutex> lk(rw_lock_);

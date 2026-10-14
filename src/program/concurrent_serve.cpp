@@ -1180,9 +1180,11 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         // P4: the trailing field is reused_prefix_tokens (server.py _parse_done maps it to
         // `reused`/cached_tokens). Live retention fills it with the tokens this request resumed;
         // 0 = the request read its whole prompt (fresh admission - all of today's traffic).
-        std::printf("R %llu DONE %lld %zu %.1f %.1f %s %lld %lld %lld %s\n", (unsigned long long) s.request.id,
+        // Task 1: Expose byte-accurate host_snapshot_bytes() from RadixTree in DONE telemetry
+        const size_t live_l2_bytes = radix_tree.host_snapshot_bytes();
+        std::printf("R %llu DONE %lld %zu %.1f %.1f %s %lld %lld %lld %s %zu\n", (unsigned long long) s.request.id,
                     (long long) s.generated, s.request.tokens.size(), s.prompt_ms.load(), decode, reason,
-                    (long long) s.accepted, (long long) s.offered, (long long) s.reused_prefix, s.cache_tier.c_str());
+                    (long long) s.accepted, (long long) s.offered, (long long) s.reused_prefix, s.cache_tier.c_str(), live_l2_bytes);
         std::fflush(stdout);
         if (defer_snapshot) {
             pending_snapshots.push_back(&s);   // flushed with its snapshot at a safe point

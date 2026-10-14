@@ -657,6 +657,8 @@ def forced_call(tool_choice, tools: list[dict] | None) -> str | None:
 
 
 def fill_missing_tool_arguments(name: str, args: dict, schema: dict | None) -> dict:
+    """Restricts argument autocompletion strictly to schema properties that explicitly
+    define a 'default' field. Never synthesizes dummy or fabricated values for omitted required fields."""
     if not isinstance(args, dict) or not schema:
         return args
     params = schema.get("parameters") or {}
@@ -668,28 +670,11 @@ def fill_missing_tool_arguments(name: str, args: dict, schema: dict | None) -> d
     for req in required:
         if req in filled and filled[req] is not None:
             continue
-        p_type = (properties.get(req) or {}).get("type")
-        if req == "description":
-            cmd = str(filled.get("command") or filled.get("cmd") or "").strip()
-            if cmd:
-                first_line = cmd.splitlines()[0][:60].strip()
-                filled[req] = f"Execute {first_line}"
-            else:
-                filled[req] = f"Execute {name}"
-        elif req in ("summary", "thought", "explanation", "justification"):
-            filled[req] = f"Execute {name}"
-        elif p_type == "string":
-            filled[req] = ""
-        elif p_type in ("integer", "number"):
-            filled[req] = 0
-        elif p_type == "boolean":
-            filled[req] = False
-        elif p_type == "array":
-            filled[req] = []
-        elif p_type == "object":
-            filled[req] = {}
-        else:
-            filled[req] = ""
+        prop_def = properties.get(req) or {}
+        if "default" in prop_def:
+            filled[req] = prop_def["default"]
+        # If no explicit default was provided in the schema, do not synthesize arbitrary dummy values!
+        # The tool call emits with the missing argument so the client/agent harness can validate and retry.
     return filled
 
 def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
