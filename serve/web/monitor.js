@@ -98,7 +98,7 @@ function content() {
   if (pane === "output") { try { value = JSON.stringify(JSON.parse(value), null, 2); } catch (_) {} }
   text("content", value);
   const note = pane === "output" && detail.error ? "Raw model output retained for diagnosis. The API returned an error." : pane === "input" ? "Original request body." : pane === "output" ? "Model answer. JSON is formatted here for readability." : pane === "reasoning" ? "Separate reasoning content, when enabled." : "API response body.";
-  text("content-note", note + (detail[`${pane}_truncated`] ? " Monitor capture truncated at 256K characters; the API response was not shortened." : ""));
+  text("content-note", note + (detail[`${pane}_truncated`] ? " Monitor capture truncated (preview); the API response was not shortened." : ""));
 }
 async function showDetail() {
   if (!selected) return;

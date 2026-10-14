@@ -1,5 +1,6 @@
 """Request inspection through HTTP; no native model or GPU is required."""
 import json
+import os
 import threading
 import time
 import unittest
@@ -138,7 +139,8 @@ class Monitor(unittest.TestCase):
     def test_capture_is_bounded_and_eviction_returns_404(self):
         huge = "x" * 262200
         first = self.svc.begin_request("/v1/chat/completions", {"messages": [{"content": huge}]})
-        self.assertEqual(len(first["input"]), 262144)
+        expected_len = 262144 if os.environ.get("STRATA_MONITOR_FULL") == "1" else 4096
+        self.assertEqual(len(first["input"]), expected_len)
         self.assertTrue(first["input_truncated"])
         for _ in range(100):
             self.svc.begin_request("/v1/chat/completions", {"messages": []})

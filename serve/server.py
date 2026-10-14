@@ -1712,11 +1712,12 @@ class Service:
         if not self.api_monitor:
             return None
         raw = json.dumps(req, ensure_ascii=False, indent=2)
+        max_in = 262144 if os.environ.get("STRATA_MONITOR_FULL") == "1" else 4096
         record = {"id": uuid.uuid4().hex[:12], "path": path, "model": req.get("model") or self.model,
                   "started_at": time.time(), "state": "queued", "stream": bool(req.get("stream")),
                   "response_format": (req.get("response_format") or {}).get("type")
                   if isinstance(req.get("response_format"), dict) else None,
-                  "input": raw[:262144], "input_truncated": len(raw) > 262144,
+                  "input": raw[:max_in], "input_truncated": len(raw) > max_in,
                   "output": "", "reasoning": "", "output_truncated": False, "reasoning_truncated": False,
                   "queue_s": 0.0, "load_s": 0.0, "first_token_s": None,
                   "_clock": time.perf_counter()}
