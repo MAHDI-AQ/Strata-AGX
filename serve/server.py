@@ -1857,9 +1857,6 @@ class Service:
         gamma = 2.0
         denom = 1.0 - alpha + (alpha / gamma)
         speedup = round(1.0 / denom, 2) if denom > 0.01 else 1.0
-        l2_bytes = getattr(self.engine, "last", {}).get("l2_host_bytes", 0)
-        l2_gib = round(l2_bytes / (1024**3), 2)
-        l2_display_str = f"{total_nodes} nodes · {l2_gib} GiB (32 GiB cap)"
         return {
             "drafts_offered": offered,
             "drafts_accepted": accepted,
