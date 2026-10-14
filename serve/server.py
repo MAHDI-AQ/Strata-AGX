@@ -422,6 +422,8 @@ class StrataEngine:
         self._channels = {}
         self._shared_progress = {}
         self._shared_queue_wait = {}
+        self._prefill_candidates = {}   # request number -> prompt length
+        self.YIELDS_MAX = 3
         self._request_number = 0
         self.multiplex = False
         self.log_path = log
@@ -734,6 +736,13 @@ class StrataEngine:
         on = sampling.get("experimental_speed_projection")
         return f" cvec={int(on)}" if isinstance(on, bool) else ""
 
+    def _shorter_waiting(self, prompt_len: int, current_number: int) -> bool:
+        with self._channels_lock:
+            for num, plen in self._prefill_candidates.items():
+                if num != current_number and plen < 0.5 * prompt_len:
+                    return True
+        return False
+
     def _generate_multiplex(self, ids, max_new, sampling, cancel, embeddings=None):
         self.last = {}
         self.progress = None
@@ -742,8 +751,24 @@ class StrataEngine:
             self._request_number += 1
             number = self._request_number
             self._channels[number] = channel
+            self._prefill_candidates[number] = len(ids)
         done = False
         sent = False
+        yields = 0
+        last_yield = 0.0
+        prefill_start = time.monotonic()
+
+        def check_yield():
+            nonlocal yields, last_yield
+            now = time.monotonic()
+            if (yields < self.YIELDS_MAX and now - prefill_start >= 0.5 and
+                    now - last_yield >= 0.5 and self._shorter_waiting(len(ids), number)):
+                try:
+                    self._send(f"BYIELD {number}")
+                    yields += 1
+                    last_yield = now
+                except OSError:
+                    pass
         try:
             if embeddings:
                 head = f"CGENI {number} {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}"
@@ -761,6 +786,7 @@ class StrataEngine:
                 except queue.Empty:
                     if not self.alive():
                         raise EngineDied("the concurrent engine stopped")
+                    check_yield()
                     if time.monotonic() - heartbeat >= 10:
                         heartbeat = time.monotonic()
                         yield None
@@ -768,6 +794,8 @@ class StrataEngine:
                 if line is None:
                     raise EngineDied("the concurrent engine stopped")
                 if line.startswith("T "):
+                    with self._channels_lock:
+                        self._prefill_candidates.pop(number, None)
                     if number not in self._shared_queue_wait:   # D1: first PP/T ends the admission wait
                         self._shared_queue_wait[number] = round((time.monotonic() - sent_at) * 1000.0, 2)
                     yield int(line[2:])
@@ -786,6 +814,7 @@ class StrataEngine:
                     if chunk_rate > 0:
                         self.prefill_tok_s_mean = chunk_rate
                     self._shared_progress[number] = pr
+                    check_yield()
                     yield None
                 elif line.startswith("DONE "):
                     self._parse_done(line)
@@ -819,6 +848,7 @@ class StrataEngine:
                         break
             with self._channels_lock:
                 self._channels.pop(number, None)
+                self._prefill_candidates.pop(number, None)
             self._shared_progress.pop(number, None)          # lock-free (see progress)
             self._shared_queue_wait.pop(number, None)        # D1: lock-free (see progress)
 
