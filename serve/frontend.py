@@ -420,6 +420,15 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
             kwargs = {"enable_thinking": False}
         elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
             kwargs.update(effort_kwargs(v))
+
+    # Bug 3: Auto-disable thinking on short utility requests (e.g. title/summary generation)
+    # When max_tokens <= 128 and no tools, or single-line prompt without explicit thinking opt-in
+    max_tok = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)
+    has_explicit_thinking = bool(req.get("reasoning_effort") or req.get("reasoning") or 
+                                 (isinstance(req.get("chat_template_kwargs"), dict) and "enable_thinking" in req["chat_template_kwargs"]))
+    if not tools and 0 < max_tok <= 128 and not has_explicit_thinking:
+        kwargs["enable_thinking"] = False
+
     return _late_system_to_user(messages), tools, kwargs
 
 
@@ -1020,6 +1029,19 @@ class OutputParser:
                         self.buf = ""
                         return out
                     self.buf, self.lead = stripped, False
+                # Strip duplicate leading or orphan closing tool tags between calls
+                while True:
+                    s_buf = self.buf.lstrip()
+                    if s_buf.startswith(CALL_END):
+                        self.buf = s_buf[len(CALL_END):].lstrip()
+                    elif s_buf.startswith(CALL_START):
+                        after_probe = s_buf[len(CALL_START):].lstrip()
+                        if after_probe.startswith(CALL_START):
+                            self.buf = after_probe
+                        else:
+                            break
+                    else:
+                        break
                 i = self.buf.find(CALL_START)
                 if i < 0:
                     # Hold a partial tag AND the newlines before it: if a tool call follows, they are dropped,
@@ -1114,6 +1136,11 @@ class OutputParser:
             # an unfinished call inside the reasoning (#804) is reasoning text, never a call
             kind = {"reasoning": "reasoning", "rcall": "reasoning", "content": "content"}.get(self.state, "content")
             text = self.buf if self.state != "call" else CALL_START + self.buf
-            out.append(Event(kind, text))
+            # Bug 1 Guard: Never leak raw orphan tool delimiters as content deltas
+            cleaned_text = text.strip()
+            if kind == "content" and cleaned_text in (CALL_START, CALL_END, f"{CALL_START}{CALL_END}"):
+                text = ""
+            if text:
+                out.append(Event(kind, text))
             self.buf = ""
         return out
