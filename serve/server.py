@@ -1807,6 +1807,9 @@ class Service:
         ctx_k = int(eng_info.get("max_context", 262144) or 262144) // 1024
         # Clean, pure 3-tier memory stats
         max_vram_toks = conc_slots * ctx_k * 1024
+        l2_bytes = getattr(self.engine, "last", {}).get("l2_host_bytes", 0)
+        l2_gib = round(l2_bytes / (1024**3), 2)
+        l2_display_str = f"{total_nodes} nodes · {l2_gib} GiB (32 GiB cap)"
         return {
             # L1 VRAM Tier (Working KV Cache)
             "l1_slots": conc_slots,
@@ -1820,10 +1823,11 @@ class Service:
             # Task 1: Byte-accurate C++ telemetry from RadixTree::host_snapshot_bytes_locked()
             "l2_host_slots": 64,
             "l2_host_nodes": total_nodes,
-            "l2_host_bytes": getattr(self.engine, "last", {}).get("l2_host_bytes", 0),
-            "l2_host_gib": round(getattr(self.engine, "last", {}).get("l2_host_bytes", 0) / (1024**3), 2),
+            "l2_host_bytes": l2_bytes,
+            "l2_host_gib": l2_gib,
             "l2_host_limit_gib": 32.0,
-            "l2_display": f"{total_nodes} nodes · {round(getattr(self.engine, last, {}).get(l2_host_bytes, 0) / (1024**3), 2)} GiB (32 GiB cap)",
+            "l2_display": l2_display_str,
+            
             
             # L3 NVMe Tier (DirectStorage Disk Snapshots)
             "l3_nvme_snapshots": l3_snapshots,
@@ -1853,6 +1857,9 @@ class Service:
         gamma = 2.0
         denom = 1.0 - alpha + (alpha / gamma)
         speedup = round(1.0 / denom, 2) if denom > 0.01 else 1.0
+        l2_bytes = getattr(self.engine, "last", {}).get("l2_host_bytes", 0)
+        l2_gib = round(l2_bytes / (1024**3), 2)
+        l2_display_str = f"{total_nodes} nodes · {l2_gib} GiB (32 GiB cap)"
         return {
             "drafts_offered": offered,
             "drafts_accepted": accepted,
