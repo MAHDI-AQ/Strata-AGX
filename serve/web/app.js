@@ -395,14 +395,14 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, slots
       const poolDesc = radixData.l1_vram_pool || `${eng.concurrency || 2} slots · ${(eng.max_context || 262144)/1024}k (${(eng.kv || "q4_0").toUpperCase()})`;
       const activeTok = radixData.l1_active_tokens != null ? `${fmt(radixData.l1_active_tokens)} toks` : "0 toks";
       const l1Text = radixData.l1_vram_note || `${poolDesc} · ${activeTok} · ${expStr}`;
-      $("radix-l1-val").textContent = l1Text;
+      $("radix-l1-val").textContent = radixData.l1_display || (radixData.l1_vram_note || "2 slots · 0 toks");
     }
     if ($("radix-l2-val")) {
       const nodeCount = radixData.l2_host_nodes != null ? radixData.l2_host_nodes : (radixData.l2_host_active || 0);
       const hostGib = radixData.l2_host_gib != null ? fmt(radixData.l2_host_gib, 2) : "0.00";
-      $("radix-l2-val").textContent = `${nodeCount} nodes · ${hostGib} GiB (${radixData.l2_host_slots || 64} slots cap)`;
+      $("radix-l2-val").textContent = radixData.l2_display || `${nodeCount} nodes · ${hostGib} GiB`;
     }
-    if ($("radix-l3-val")) $("radix-l3-val").textContent = `${radixData.l3_nvme_snapshots || 0} snap · ${fmt(radixData.l3_nvme_gib || 0, 1)} GiB (${radixData.l3_nvme_limit_gib || 500} GiB cap)`;
+      $("radix-l3-val").textContent = radixData.l3_display || `${radixData.l3_nvme_snapshots || 0} snap · ${fmt(radixData.l3_nvme_gib || 0, 1)} GiB`;
     const rHit = radixData.hit_rate != null ? Number(radixData.hit_rate) : 0;
     if ($("radix-hit-rate")) $("radix-hit-rate").textContent = `${rHit.toFixed(1)}%`;
     if ($("radix-hit-bar")) $("radix-hit-bar").style.width = `${Math.min(100, rHit)}%`;

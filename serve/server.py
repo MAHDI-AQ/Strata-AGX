@@ -1775,27 +1775,36 @@ class Service:
         kv_quant = eng_info.get("kv", "q4_0").upper()
         conc_slots = eng_info.get("concurrency", len(slots_data) or 2)
         ctx_k = int(eng_info.get("max_context", 262144) or 262144) // 1024
+        # Clean, pure 3-tier memory stats
+        max_vram_toks = conc_slots * ctx_k * 1024
         return {
-            "l1_vram_snapshots": 0,
-            "l1_vram_desc": "Live KV Pool",
-            "l1_vram_pool": f"{conc_slots} slots · {ctx_k}k ctx ({kv_quant})",
+            # L1 VRAM Tier (Working KV Cache)
+            "l1_slots": conc_slots,
+            "l1_active_slots": active_slots,
             "l1_active_tokens": total_active_tokens,
-            "l1_vram_note": f"Live KV Pool: {conc_slots}x{ctx_k}k ({kv_quant}) · {total_active_tokens:,} toks · {exp_str} experts",
-            "l1_vram_experts": exp_cnt,
+            "l1_max_tokens": max_vram_toks,
+            "l1_kv_quant": kv_quant,
+            "l1_display": f"{active_slots}/{conc_slots} slots active · {total_active_tokens:,} toks",
+            
+            # L2 Host RAM Tier (Parked DDR4 Prefix Nodes)
             "l2_host_slots": 64,
-            "l2_host_active": total_nodes,
             "l2_host_nodes": total_nodes,
-            "l2_host_snapshots": max(0, total_nodes - l3_snapshots) if total_nodes >= l3_snapshots else total_nodes,
-            "l2_host_desc": f"{total_nodes}/64 parked snapshots ({active_slots} live)",
-            "l2_host_gib": round((max(0, total_nodes - l3_snapshots) * 0.125), 2) if total_nodes > 0 else 0.0,
-            "l2_host_limit_gib": 32.0,
+            "l2_host_gib": round(min(20.0, total_nodes * 0.117), 2) if total_nodes > 0 else 0.0,
+            "l2_host_limit_gib": 20.0,
+            "l2_display": f"{total_nodes} nodes · {round(min(20.0, total_nodes * 0.117), 1)} GiB",
+            
+            # L3 NVMe Tier (DirectStorage Disk Snapshots)
             "l3_nvme_snapshots": l3_snapshots,
-            "l3_nvme_gib": round(l3_bytes / (1024**3), 2),
+            "l3_nvme_gib": round(l3_bytes / (1024**3), 1),
             "l3_nvme_limit_gib": 500.0,
+            "l3_display": f"{l3_snapshots} snap · {round(l3_bytes / (1024**3), 1)} GiB",
+            
+            # Global MoE weights (separate from cache)
+            "resident_experts": exp_cnt,
             "total_nodes": total_nodes,
             "cached_prefix_tokens": p_reused,
             "hit_rate": hit_rate,
-            "cache_tier": "3-Tier (VRAM Pool -> Host RAM -> NVMe Disk)"
+            "cache_tier": "3-Tier (VRAM -> Host DDR4 -> NVMe SSD)"
         }
 
     def _mtp_stats(self) -> dict:

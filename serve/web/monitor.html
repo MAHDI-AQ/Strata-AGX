@@ -59,9 +59,9 @@ header{height:70px;padding:0 32px;display:flex;align-items:center;justify-conten
     <span class="small" id="radix-mon-tag" style="color: var(--st-ink-muted);">VRAM → Host → NVMe</span>
   </div>
   <div class="row" style="margin: 8px 0; justify-content: space-between;">
-    <div><span class="small" style="color: var(--st-ink-muted); display:block;">L1 VRAM (KV Pool)</span><b id="radix-mon-l1" style="font-size:13px">KV Working Pool (0 snap / Resident Experts)</b></div>
-    <div><span class="small" style="color: var(--st-ink-muted); display:block;">L2 Host</span><b id="radix-mon-l2">64 slots · 32.0 GiB</b></div>
-    <div><span class="small" style="color: var(--st-ink-muted); display:block;">L3 NVMe</span><b id="radix-mon-l3">388 snap · 90.1 GiB</b></div>
+    <div><span class="small" style="color: var(--st-ink); font-weight:600; display:block;">L1 VRAM · Context Pool</span><b id="radix-mon-l1" style="font-size:13px">KV Working Pool (0 snap / Resident Experts)</b></div>
+    <div><span class="small" style="color: var(--st-ink); font-weight:600; display:block;">L2 Host RAM · Prefix Cache</span><b id="radix-mon-l2">64 slots · 32.0 GiB</b></div>
+    <div><span class="small" style="color: var(--st-ink); font-weight:600; display:block;">L3 NVMe · DirectStorage</span><b id="radix-mon-l3">388 snap · 90.1 GiB</b></div>
   </div>
   <div class="small" style="color: var(--st-ink-muted); margin-top: 4px;">Hit Rate: <b id="radix-mon-hit" style="color: #10b981;">0.0%</b> · <span id="radix-mon-nodes">504 nodes</span></div>
 </div>
