@@ -1818,6 +1818,10 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         }
         for (const auto& line : commands) {
             if (line == "QUIT") { quit = true; break; }
+            if (line.rfind("BYIELD ", 0) == 0) {
+                // BYIELD <number>: cooperative preemption yield request from scheduler
+                continue;
+            }
             if (line.rfind("CSTOP ", 0) == 0) {
                 // Task 1.2: Thread-Safe Cancellation with pump synchronization
                 uint64_t id = 0; std::istringstream(line.substr(6)) >> id;
