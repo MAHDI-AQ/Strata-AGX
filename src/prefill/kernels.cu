@@ -250,6 +250,44 @@ __global__ void gdn_conv_tiled_kernel(const float* __restrict__ hist, const floa
         v0 = v1; v1 = v2; v2 = x;
     }
 }
+// Aurora (S23, opt-in STRATA_GDN_CONVL2=1): gdn_conv_tiled_kernel with gdn_l2_kernel folded in. A block's 128 threads
+// are the 128 channels of one head, so for the q / k heads (block < 2 HK) the norm's sum of squares is the block's:
+// the same warp_sum, the same four partials added in the same order, the same v * rsqrtf(ss + eps) on the same
+// stored value - the same bits, without writing h and reading it back (16 tokens per round).
+__global__ void gdn_conv_l2_kernel(const float* __restrict__ hist, const float* __restrict__ qkv,
+                                   const float* __restrict__ w, float* __restrict__ h, int64_t T, float eps) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t t0 = (int64_t) blockIdx.y * CONV_TILE;
+    if (t0 >= T) return;
+    const int64_t t1 = t0 + CONV_TILE < T ? t0 + CONV_TILE : T;
+    auto input = [&](int64_t t) -> float { return t >= 0 ? qkv[t * C + c] : hist[c * 3 + (int) (t + 3)]; };
+    float v0 = input(t0 - 3), v1 = input(t0 - 2), v2 = input(t0 - 1);
+    const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
+    for (int64_t t = t0; t < t1; ++t) {   // gdn_conv_tiled_kernel's loop, verbatim
+        const float x = qkv[t * C + c];
+        const float s = v0 * w0 + v1 * w1 + v2 * w2 + x * w3;
+        h[t * C + c] = s / (1.0f + __expf(-s));
+        v0 = v1; v1 = v2; v2 = x;
+    }
+    if (blockIdx.x >= 2 * HK) return;   // v channels: no norm
+    __shared__ float part[16][4];
+    for (int64_t tb = t0; tb < t1; tb += 16) {
+        const int n = (int) (t1 - tb < 16 ? t1 - tb : 16);
+        for (int j = 0; j < n; ++j) {   // (each thread reads back its own stored value)
+            const float v = h[(tb + j) * C + c];
+            float sq = __fmaf_rn(v, v, __shfl_xor_sync(0xffffffffu, __fmul_rn(v, v), 16));
+#pragma unroll
+            for (int o = 8; o > 0; o >>= 1) sq = __fadd_rn(sq, __shfl_xor_sync(0xffffffffu, sq, o));
+            if ((threadIdx.x & 31) == 0) part[j][threadIdx.x >> 5] = sq;
+        }
+        __syncthreads();
+        for (int j = 0; j < n; ++j) {
+            const float ss = part[j][0] + part[j][1] + part[j][2] + part[j][3];
+            h[(tb + j) * C + c] = h[(tb + j) * C + c] * rsqrtf(ss + eps);
+        }
+        __syncthreads();
+    }
+}
 // the history after the chunk: its last three inputs (the older history where the chunk is shorter than 3)
 __global__ void gdn_conv_hist_kernel(float* __restrict__ hist, const float* __restrict__ qkv, int64_t T) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1257,6 +1295,14 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
     if (serial || T <= CONV_TILE) {
         gdn_conv_kernel<<<C / 128, 128, 0, (cudaStream_t) stream>>>(history, qkv, conv_w, h, T);
     } else {
+        static const bool fused = [] { const char* v = std::getenv("STRATA_GDN_CONVL2"); return v && std::atoi(v) != 0; }();
+        if (fused) {
+            gdn_conv_l2_kernel<<<dim3(C / 128, (unsigned) ((T + CONV_TILE - 1) / CONV_TILE)), 128, 0,
+                                 (cudaStream_t) stream>>>(history, qkv, conv_w, h, T, eps);
+            gdn_conv_hist_kernel<<<C / 128, 128, 0, (cudaStream_t) stream>>>(history, qkv, T);
+            check("gdn_conv");
+            return;
+        }
         gdn_conv_tiled_kernel<<<dim3(C / 128, (unsigned) ((T + CONV_TILE - 1) / CONV_TILE)), 128, 0,
                                 (cudaStream_t) stream>>>(history, qkv, conv_w, h, T);
         gdn_conv_hist_kernel<<<C / 128, 128, 0, (cudaStream_t) stream>>>(history, qkv, T);
