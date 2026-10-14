@@ -675,9 +675,9 @@ class StrataEngine:
             self.last.update(drafts_accepted=int(f[6]), drafts_offered=int(f[7]), reused=int(f[8]))
         if len(f) >= 10 and not f[9].isdigit():           # trailing cache_tier from concurrent engine
             self.last.update(cache_tier=f[9])
-        if len(f) >= 11 and f[10].isdigit():              # live L2 Host RAM bytes from RadixTree
-            self.last.update(l2_host_bytes=int(f[10]))
-        if len(f) >= 11:                                  # decode hit rate fields
+            if len(f) >= 11 and f[10].isdigit():          # live L2 Host RAM bytes from RadixTree
+                self.last.update(l2_host_bytes=int(f[10]))
+        elif len(f) >= 11:                                # decode hit rate fields
             self.last.update(hits=int(f[9]), lookups=int(f[10]))
         if len(f) >= 14:                                  # the expert tiers (engine 0.1.31+): RAM / file blobs, file MB
             self.last.update(ram_blobs=int(f[11]), file_blobs=int(f[12]), file_mb=float(f[13]))
