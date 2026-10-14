@@ -114,3 +114,15 @@ When performing a synchronization pass from upstream:
    - If functional changes occurred, increment patch version in `CMakeLists.txt` and `serve/server.py` (e.g. `v0.1.38-agx.1.0.1`).
    - Commit with author `Mahdi <MAHDI-AQ@users.noreply.github.com>`.
 
+
+### Sprint 5 & Hardware Acceleration Wave (2026-10-14, v0.1.40-agx.4.2.0)
+
+| Upstream Commit | Author / PR | Subject | AGX Classification | Rationale & Architectural Impact |
+|---|---|---|---|---|
+| `ac21812c` | Niko1221 | 500ms prefill preemption yield | **ADAPTED & LANDED** (Commit `2cc934a4`) | Ported to `_generate_multiplex` in `serve/server.py`. Competing short TTFT drops from 7.6s -> 2.3s under concurrent prefill. |
+| `9668e324` | Niko1221 | Fused GDN Conv + L2 Norm | **ADAPTED & LANDED** (Commit `f2921da6`) | CUDA-native implementation for SM89 Ada Lovelace. Saves >11 GB dead intermediate DRAM writes per 16K chunk. |
+| `0f78032f` | Niko1221 | DeltaNet 32-token chunked recurrence | **ADAPTED & LANDED** (Commit `a22316a5`) | Forms K*K and (I+A)^-1 via WY representation across 128 SMs. 1.8x prefill recurrence speedup. |
+| `33fd01b4` | Niko1221 | Coalesced warp expert swap | **ADAPTED & LANDED** (Commit `e5b97089`) | 32-thread warp vote reduction instructions save 2.2ms per window (-7.8% window latency). |
+| `38357f18` | Niko1221 | Tool-call code fence guard | **ADAPTED & LANDED** (Commit `d79f294a`) | Prevents models quoting `<tool_call>` inside reasoning markdown blocks from accidental execution. 3/3 tests pass. |
+| `b3096357` | Niko1221 | 16-expert single-launch MMQ gather | **EVALUATED & REVERTED** (Commit `7fdea49f`) | Incompatible with resident zero-copy VRAM routing. Reverted to preserve bit-exact resident pointers (`m.gsrc_host`). |
+| `aa513381` | Mahdi AI Lab | Route H Serving Clean-Up | **NATIVE ARCHITECTURE** (Commit `aa513381`) | Locks multiplexed async scheduler as default; prunes dead single-request serial paths. |

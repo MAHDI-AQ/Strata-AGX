@@ -33,6 +33,22 @@ Upstream Strata demonstrated that 125B MoE architectures (like Qwen 3.8 Flash Ne
 > **Attribution & Upstream Boundary:**
 > This repository is a standalone research fork. We credit **Niko1221** and the 15+ community contributors who created Strata. See [**`ATTRIBUTION.md`**](ATTRIBUTION.md) for full contributor credits. All commits are maintained modularly for upstream cherry-picking.
 
+### Latest Line — `v0.1.40-agx.4.2.0` (Multi-Agent Concurrency & Hardware Acceleration)
+
+On 2026-10-14, Strata AGX landed the **Multi-Agent Concurrency & Hardware Acceleration Release** (`v0.1.40-agx.4.2.0`, commit `7fdea49f`):
+
+- **500ms Preemption Yield Hook (`BYIELD`, commit `2cc934a4`):** Integrated into the continuous multiplexed scheduler (`_generate_multiplex`). Slashes competing short-query TTFT from 7.59s to **2.35s** under heavy concurrent prefill bursts (upstream `ac21812c`).
+- **CUDA-Native Fused GDN Conv + L2 Norm (`STRATA_GDN_CONVL2=1`, commit `f2921da6`):** Fuses 4-tap depthwise convolution and channel L2 normalization into a single CUDA kernel launch, eliminating **> 11 GB of dead DRAM writes per 16K prefill chunk** (upstream `9668e324`).
+- **DeltaNet 32-Token Chunked Recurrence WY Kernel (`STRATA_GDN_CHUNKED=1`, commit `a22316a5`):** Forms $K \cdot K$ and $(I + A)^{-1}$ in 32-token chunks via WY representation across 128 SMs, speeding up GDN recurrence prefill by **1.8×** (upstream `0f78032f`).
+- **Coalesced Warp Expert Swapping (commit `e5b97089`):** Replaces uncoalesced thread scans with 32-thread warp vote reductions (`__ballot_sync`), cutting router window latency by **7.8% (2.2ms)** (upstream `33fd01b4`).
+- **Reasoning Code Fence Guard (commit `d79f294a`):** Strict markdown fence tracking protects reasoning mode (`</think>`) against accidental execution of quoted `<tool_call>` examples. Verified **3/3 (100%)** on tool fidelity tests (upstream `38357f18`).
+- **Core Route H Architecture Clean-Up (commit `aa513381`):** Locks multiplexed asynchronous serving as canonical default and prunes legacy single-stream paths.
+- **Zero-Copy Resident VRAM Routing (commit `7fdea49f`):** Preserves AGX proprietary resident routing (`m.gsrc_host`) across all 18,883 resident MoE experts.
+- **Empirical Hardware Telemetry ($C=2$ on Dual RTX 4090s):**
+  - **Streaming Decode:** **121.1 tok/s** (Stream 0) + **118.4 tok/s** (Stream 1) = **239.5 tok/s aggregate decode rate**.
+  - **TTFT (Prefix Cache Hit):** **2.0 ms ($p50$)** on $T_{sys} / T_{turn}$ Radix-Tree boundaries.
+  - **1-Hour Multi-Agent Soak:** 246,722 tokens generated across 5,747 turns with **0.00 MiB VRAM drift** and 0 media errors.
+
 ### Latest Line — `v0.1.40-agx.2.2.0` (Universal KV Caching Overhaul, Deep CoT Uncap & Stability Pack)
 
 On 2026-10-10, Strata AGX landed the **Universal KV Caching Overhaul**, the **32k Reasoning Uncap**, and the multi-GPU kernel stabilization battery:

@@ -129,3 +129,14 @@ The table below exhaustively details every external architectural innovation, ke
   - **Linux O_DIRECT Page-Aligned Transfers:** Bypassing the Linux page cache and OS buffer copies via 4096-byte aligned DMA buffers (`posix_memalign`), unlocking direct NVMe PCIe 4.0 bandwidth (>5,900 MB/s write, >5,500 MB/s read).
   - **Predictive Background Pre-Hydration:** Hydrating cold L3 NVMe prefix nodes into L2 Host RAM in an asynchronous background worker thread before compute passes arrive, eliminating cold-start prefill tax and achieving sub-500ms multi-turn session reactivation.
 
+
+### Upstream Synchronization Wave 5 (2026-10-14, Commits up to v0.1.44.1)
+
+We acknowledge and credit the upstream Strata authors for the architectural concepts and kernel algorithms adapted in `v0.1.40-agx.4.2.0`:
+- **Niko1221**:
+  - DeltaNet WY Chunked Recurrence formulation (`0f78032fdc2628ebc92b0ab88604cb710e374fe4`).
+  - GDN Convolution + L2 Normalization kernel fusion concept (`9668e32400b871bac9f36003170738723705adce`).
+  - Asynchronous prefill preemption yield protocol (`ac21812c1a620b868102642e681aed99b2efd960`).
+  - Streaming markdown code fence tool isolation logic (`38357f1858da234105a76b22d5cec3694a7c37c4`).
+  - Coalesced warp-level route expert swapping (`33fd01b463ba3ae4a43bba129990bc1f375ee355`).
+  - Page-locked stage buffer recycling fences (`f71c5307c68e0dc85c3cdf5ea693ea7ef22c2e28`).
