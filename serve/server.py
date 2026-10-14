@@ -425,7 +425,7 @@ class StrataEngine:
         self._prefill_candidates = {}   # request number -> prompt length
         self.YIELDS_MAX = 3
         self._request_number = 0
-        self.multiplex = False
+        self.multiplex = True
         self.log_path = log
         self.proc, self.pump, self.log = None, None, None
         self.ended, self.unloaded = True, True
@@ -877,9 +877,8 @@ class StrataEngine:
                     raise ValueError(line[4:].strip())
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
-        if getattr(self, "multiplex", False):
-            yield from self._generate_multiplex(ids, max_new, sampling, cancel, embeddings)
-            return
+        yield from self._generate_multiplex(ids, max_new, sampling, cancel, embeddings)
+        return
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
