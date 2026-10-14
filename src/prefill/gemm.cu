@@ -429,23 +429,46 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
         return;
     }
 #endif
-    const int64_t tile_step = resolve_streamk_tile_step(T, N);
-    if (tile_step < T && beta == 0.0f) {
-        // Stream-K dynamic tile decomposition across SM89
-        for (int64_t t0 = 0; t0 < T; t0 += tile_step) {
-            const int64_t cur_t = std::min(tile_step, T - t0);
-            ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) cur_t, (int) K,
+#if !defined(__HIPCC__)
+    const auto f16_gemm_tile = [&](cublasGemmAlgo_t algo, int64_t cur_t, int64_t t0) {
+        return cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) cur_t, (int) K,
                             &alpha, W, CUDA_R_16F, (int) K, X + t0 * K, CUDA_R_16F, (int) K,
                             &beta, Y + t0 * ldy, CUDA_R_32F, (int) ldy,
-                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
-               "cublasGemmEx f16 stream-k");
+                            CUBLAS_COMPUTE_32F, algo);
+    };
+    // Issue #1650: multi-device cuBLAS 12 workaround for narrow shapes
+    const int64_t shape = ((int64_t) K << 32) | (uint32_t) N;
+    cublasGemmAlgo_t algo = CUBLAS_GEMM_DEFAULT;
+    for (int i = 0; i < f16_algo_n_; ++i) {
+        if (f16_algo_shape_[i] == shape) { algo = CUBLAS_GEMM_ALGO2; break; }
+    }
+    const int64_t tile_step = resolve_streamk_tile_step(T, N);
+    if (tile_step < T && beta == 0.0f) {
+        for (int64_t t0 = 0; t0 < T; t0 += tile_step) {
+            const int64_t cur_t = std::min(tile_step, T - t0);
+            cublasStatus_t st = f16_gemm_tile(algo, cur_t, t0);
+            if (st == CUBLAS_STATUS_INTERNAL_ERROR && algo == CUBLAS_GEMM_DEFAULT) {
+                if (f16_algo_n_ < kF16AlgoSlots) f16_algo_shape_[f16_algo_n_++] = shape;
+                algo = CUBLAS_GEMM_ALGO2;
+                st = f16_gemm_tile(algo, cur_t, t0);
+            }
+            ck(st, "cublasGemmEx f16 stream-k");
         }
     } else {
-        ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
-                        CUDA_R_16F, (int) K, X, CUDA_R_16F, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,
-                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
-           "cublasGemmEx f16");
+        cublasStatus_t st = f16_gemm_tile(algo, T, 0);
+        if (st == CUBLAS_STATUS_INTERNAL_ERROR && algo == CUBLAS_GEMM_DEFAULT) {
+            if (f16_algo_n_ < kF16AlgoSlots) f16_algo_shape_[f16_algo_n_++] = shape;
+            algo = CUBLAS_GEMM_ALGO2;
+            st = f16_gemm_tile(algo, T, 0);
+        }
+        ck(st, "cublasGemmEx f16");
     }
+#else
+    ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
+                    CUDA_R_16F, (int) K, X, CUDA_R_16F, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+       "cublasGemmEx f16");
+#endif
     STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx f16");
 }
 

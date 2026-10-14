@@ -52,6 +52,12 @@ private:
     void* workspace_ = nullptr;
     bool external_ = false;
     void* hipblaslt_state_ = nullptr;
+    /// cuBLAS 12 answers the default FP16 algorithm of a few (N, K) shapes with CUBLAS_STATUS_INTERNAL_ERROR once
+    /// another CUDA device in the process has initialized its context (issue #1650). A fixed algorithm (ALGO2)
+    /// survives that state.
+    static constexpr int kF16AlgoSlots = 32;
+    int64_t f16_algo_shape_[kF16AlgoSlots] = {};
+    int f16_algo_n_ = 0;
 };
 
 
