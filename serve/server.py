@@ -1381,7 +1381,9 @@ class Service:
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
                        "prompt_ms": 0.0, "decode_ms": 0.0,
                        "drafts_offered": 0, "drafts_accepted": 0}   # #457: the MTP drafts, summed where reported
-        self.last_timings = None                         # the last finished request's, llama.cpp's names (/v1/status)
+        self.last_timings = None
+        from serve.prometheus import Latencies
+        self.latencies = Latencies()                         # the last finished request's, llama.cpp's names (/v1/status)
         self.last_request_at = None                      # when a request last started or finished
         self.started_at = time.time()
         self.status_lock = threading.Lock()
@@ -2207,6 +2209,8 @@ class Service:
                             t["decode_ms"] += last.get("decode_ms") or 0.0
                             t["drafts_offered"] += last.get("drafts_offered") or 0
                             t["drafts_accepted"] += last.get("drafts_accepted") or 0
+                            ft0 = self.status.get("first_token")
+                            self.latencies.observe(ft0 - self.status.get("started", time.time()) if ft0 else None, n, (last.get("decode_ms") or 0.0) / 1000, time.time() - self.status.get("started", time.time()))
                             fresh = getattr(self.engine, "last", None)
                             if fresh is not None and fresh is not before:      # the engine's clock for THIS request
                                 timings = request_timings(seen, n, last)
@@ -2815,6 +2819,17 @@ def make_handler(svc: Service):
                 self.wfile.write(body)
                 return
             if path == "/metrics":
+                from urllib.parse import urlsplit
+                from serve import prometheus
+                if prometheus.wants_prometheus(self.headers.get("Accept", ""), urlsplit(self.path).query):
+                    if self._authorized():
+                        body = prometheus.render(svc.metrics(), svc.latencies.snapshot()).encode()
+                        self.send_response(200)
+                        self.send_header("Content-Type", prometheus.CONTENT_TYPE)
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                    return
                 if self._authorized():
                     # the last 12 requests; `?requests=all` every one kept (the Monitor's "Show all", issue #35)
                     self._json(200, svc.metrics(all_requests="requests=all" in self.path))
