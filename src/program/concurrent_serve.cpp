@@ -85,17 +85,22 @@ bool parse_request(const std::string& line, const ConcurrentConfig& config, cons
     std::istringstream input(line);
     std::string command, id, maximum, token;
     input >> command >> id >> maximum;
-    auto integer = [](const std::string& s) -> int64_t {
+    auto integer = [](const std::string& s, const char* field = "integer") -> int64_t {
+        if (s.empty()) throw std::invalid_argument(std::string("empty ") + field);
         size_t end = 0;
-        const auto n = std::stoll(s, &end);
-        if (end != s.size()) throw std::invalid_argument("integer");
-        return n;
+        try {
+            const auto n = std::stoll(s, &end);
+            if (end != s.size()) throw std::invalid_argument(std::string("invalid ") + field + ": \x27" + s + "\x27");
+            return n;
+        } catch (const std::exception& e) {
+            throw std::invalid_argument(std::string("invalid ") + field + ": \x27" + s + "\x27 (" + e.what() + ")");
+        }
     };
     try {
-        const auto number = integer(id);
+        const auto number = integer(id, "request id");
         if (number < 1) throw std::invalid_argument("request id");
         r.id = (uint64_t) number;
-        r.max_new = integer(maximum);
+        r.max_new = integer(maximum, "max_new");
         const bool is_cgeni = (command == "CGENI");
         if ((command != "CGEN" && !is_cgeni) || r.max_new < 1 || r.max_new > config.context) throw std::invalid_argument("max_new");
         r.sampling.greedy = true;
@@ -117,7 +122,8 @@ bool parse_request(const std::string& line, const ConcurrentConfig& config, cons
                 std::istringstream ids(token);
                 std::string cell;
                 while (std::getline(ids, cell, ',')) {
-                    const auto value = integer(cell);
+                    if (cell.empty()) continue;
+                    const auto value = integer(cell, "token id");
                     if (value < 0 || value >= vocab || r.tokens.size() >= (size_t) config.context)
                         throw std::invalid_argument("token/context");
                     r.tokens.push_back(value);
@@ -133,9 +139,9 @@ bool parse_request(const std::string& line, const ConcurrentConfig& config, cons
             if (key == "temperature") { if (f < 0) throw std::invalid_argument(key); r.sampling.temperature = f; r.sampling.greedy = f == 0; }
             else if (key == "top_p") { if (f <= 0 || f > 1) throw std::invalid_argument(key); r.sampling.top_p = f; }
             else if (key == "min_p") { if (f < 0 || f > 1) throw std::invalid_argument(key); r.sampling.min_p = f; }
-            else if (key == "top_k") { const auto n = integer(value); if (n < 1 || n > 64) throw std::invalid_argument(key); r.sampling.top_k = (int) n; }
-            else if (key == "seed") { const auto n = integer(value); if (n < 0) throw std::invalid_argument(key); r.sampling.seed = (uint64_t) n; }
-            else if (key == "penalty_last_n") { const auto n = integer(value); if (n < 0 || n > 4096) throw std::invalid_argument(key); r.sampling.penalty_last_n = (int) n; }
+            else if (key == "top_k") { const auto n = integer(value, "top_k"); if (n < 1 || n > 64) throw std::invalid_argument(key); r.sampling.top_k = (int) n; }
+            else if (key == "seed") { const auto n = integer(value, "seed"); if (n < 0) throw std::invalid_argument(key); r.sampling.seed = (uint64_t) n; }
+            else if (key == "penalty_last_n") { const auto n = integer(value, "penalty_last_n"); if (n < 0 || n > 4096) throw std::invalid_argument(key); r.sampling.penalty_last_n = (int) n; }
             else if (key == "penalty_repeat") { if (f <= 0) throw std::invalid_argument(key); r.sampling.penalty_repeat = f; }
             else if (key == "penalty_freq") r.sampling.penalty_freq = f;
             else if (key == "penalty_present") r.sampling.penalty_present = f;
