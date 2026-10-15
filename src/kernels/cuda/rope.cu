@@ -105,8 +105,11 @@ __global__ void rope_neox_kernel(const float* __restrict__ x, float* __restrict_
     float* orow = out + r * head_dim;
 
     for (int d = n_rot; d < head_dim; ++d) orow[d] = xr[d];      // the PARTIAL rotation's untouched tail
+    const int p_raw = pos[r];
+    const int p_safe = p_raw >= 0 ? p_raw : 0;
     for (int i = 0; i < half; ++i) {
-        const size_t toff = (size_t) mrope_pos(mtab, pos[r], i) * half;   // the image path's per-pair position
+        const int pair_pos = mrope_pos(mtab, p_safe, i);
+        const size_t toff = (size_t)(pair_pos >= 0 ? pair_pos : 0) * half;   // the image path's per-pair position
         // THE PAIRING AND THE SIGNS COME FROM `rope_neox_pair`, shared with the indexer's pooling kernel.
         rope_neox_pair(xr[i], xr[half + i], cos_tab[toff + i], sin_tab[toff + i], orow[i], orow[half + i]);
     }

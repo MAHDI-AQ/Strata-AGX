@@ -2251,6 +2251,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             ChainGate* g;
                             ~GateRelease() { if (g != nullptr) g->release(); }
                         } release{gate};
+                        if (next_->impl_->device >= 0) {
+                            cudaSetDevice(next_->impl_->device);
+                        }
                         if (cudaEventSynchronize(ev_l24) != cudaSuccess) {
                             next_err = "prefill: micro-chunk hand-off event sync failed";
                             return false;
@@ -2259,6 +2262,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     });
                     hand_buf ^= 1;
                 }
+                if (!chain && next_run.valid() && !next_run.get()) { err = next_err; return false; }
                 if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
                 continue;   // the last stage reports the chunk (on_chunk)
             }
@@ -2295,6 +2299,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     ChainGate* g;
                     ~GateRelease() { if (g != nullptr) g->release(); }
                 } release{gate};
+                if (next_->impl_->device >= 0) {
+                    cudaSetDevice(next_->impl_->device);
+                }
                 if (cudaEventSynchronize(ev_l24) != cudaSuccess) {
                     next_err = "prefill: hand-off event sync failed";
                     return false;

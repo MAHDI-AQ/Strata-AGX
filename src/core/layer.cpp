@@ -1356,5 +1356,15 @@ bool block_layer(const WeightTable& tables, const ModelGeometry& g, int64_t laye
 // The two halves back to back.  `parts` must be THIS layer's experts and must be ready before the call -
 // which holds for `session_token`, where the caller supplies them, and does NOT hold for a host loop that
 // has only just seen the router.  That is why the captured path calls the halves separately.
-if (!block_layer_pre(tables, g, layer, pos, pos_base, gb, qst, qb, mb, k, bb, stream, err, db, ple))        return false;    return block_layer_post(tables, g, layer, k, mb, bb, parts, stream, err);}}
+if (!block_layer_pre(tables, g, layer, pos, pos_base, gb, qst, qb, mb, k, bb, stream, err, db, ple))        return false;    return block_layer_post(tables, g, layer, k, mb, bb, parts, stream, err);}
+void layer_device_rope_release(int dev) {
+    if (dev >= 0 && dev < 8) {
+        std::lock_guard<std::mutex> lock(g_device_rope_mutex);
+        g_device_cos[dev] = nullptr;
+        g_device_sin[dev] = nullptr;
+        g_device_rope_cells[dev] = 0;
+    }
+}
+
+}
 // namespace strata::core

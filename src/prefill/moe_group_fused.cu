@@ -151,10 +151,14 @@ __global__ void moe_block_histogram_kernel(
         unsigned active = __activemask();
         if (valid) {
             unsigned match_mask = __match_any_sync(active, e);
-            int leader = __ffs(match_mask) - 1;
-            int count = __popc(match_mask);
-            if (lane == leader) {
-                atomicAdd(&smem_hist[e], count);
+            if (match_mask != 0) {
+                int leader = __ffs(match_mask) - 1;
+                int count = __popc(match_mask);
+                if (lane == leader) {
+                    atomicAdd(&smem_hist[e], count);
+                }
+            } else {
+                atomicAdd(&smem_hist[e], 1);
             }
         }
     }

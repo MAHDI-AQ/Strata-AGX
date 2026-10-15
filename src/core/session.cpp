@@ -136,6 +136,10 @@ void session_release(SessionState& s) {
             strata::kernels::rope_table_release(s.qsa_states[j].cos_tab);
             s.qsa_states[j].owns_rope = false;
         }
+    int dev = 0;
+    if (cudaGetDevice(&dev) == cudaSuccess) {
+        layer_device_rope_release(dev);
+    }
 }
 
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream) {

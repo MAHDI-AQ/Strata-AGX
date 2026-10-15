@@ -310,6 +310,8 @@ void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* i
 /// Zeroes the pools AND the indexer, so a fresh sequence matches the reference's own `zeros()`.  The KV pool
 /// matters even for cells that are never attended, because `kv_gather` reads whatever the selection names.
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream);
+/// Release process-wide singleton device RoPE table for a device
+void layer_device_rope_release(int dev);
 
 // ================================ PER-STAGE TIMING, DEBUG ONLY ================================
 //

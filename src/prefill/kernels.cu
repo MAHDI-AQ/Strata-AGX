@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 
 namespace strata::prefill {
 namespace {
@@ -923,8 +924,10 @@ __global__ void __launch_bounds__(128 * VPK) gdn_chunk_scan_kernel(float* __rest
 // gdn_rec_kh_kernel).
 float* gdn_chunk_scratch() {
     static float* bufs[64] = {};
+    static std::mutex gdn_buf_mu;
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return nullptr; }
+    std::lock_guard<std::mutex> lk(gdn_buf_mu);
     if (bufs[dev] == nullptr) {
         const size_t n = (size_t) (GSB / GCH) * HV * (2 * GCH * GCH + GCH);
         if (cudaMalloc((void**) &bufs[dev], n * sizeof(float)) != cudaSuccess) {
