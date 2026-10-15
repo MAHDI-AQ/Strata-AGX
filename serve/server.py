@@ -750,12 +750,23 @@ class StrataEngine:
                 if line.startswith("T "):
                     if number not in self._shared_queue_wait:   # D1: first PP/T ends the admission wait
                         self._shared_queue_wait[number] = round((time.monotonic() - sent_at) * 1000.0, 2)
-                    yield int(line[2:])
+                    try:
+                        yield int(line[2:])
+                    except ValueError:
+                        done = True
+                        raise ValueError(f"engine sent non-numeric token id: {line!r}")
                 elif line.startswith("PP "):
                     if number not in self._shared_queue_wait:
                         self._shared_queue_wait[number] = round((time.monotonic() - sent_at) * 1000.0, 2)
                     fields = line.split()
-                    pr = (int(fields[1]), int(fields[2]))
+                    if len(fields) < 3:
+                        done = True
+                        raise ValueError(f"engine sent malformed progress line: {line!r}")
+                    try:
+                        pr = (int(fields[1]), int(fields[2]))
+                    except ValueError:
+                        done = True
+                        raise ValueError(f"engine sent non-numeric progress: {line!r}")
                     self.progress = pr                       # this reader's value (unchanged)
                     self._shared_progress[number] = pr       # /metrics snapshot; lock-free (see progress)
                     yield None
