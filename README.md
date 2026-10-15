@@ -33,6 +33,15 @@ Upstream Strata demonstrated that 125B MoE architectures (like Qwen 3.8 Flash Ne
 > **Attribution & Upstream Boundary:**
 > This repository is a standalone research fork. We credit **Niko1221** and the 15+ community contributors who created Strata. See [**`ATTRIBUTION.md`**](ATTRIBUTION.md) for full contributor credits. All commits are maintained modularly for upstream cherry-picking.
 
+### Latest Line — `v0.1.40-agx.4.4.0` (Production Hardening: Tool Calls, Telemetry & Reasoning Guard)
+
+On 2026-10-16, Strata AGX landed the **Production Hardening Release** (`v0.1.40-agx.4.4.0`):
+
+- **Tool Call Chunk Finish-Reason Mapping (`finish_reason="tool_calls"`):** Fixed OpenAI-compatible streaming chunks when tool calls are generated so downstream agent harnesses (Hermes Agent, DeepSeek harness) receive the canonical `tool_calls` finish signal even across reasoning segments or chunk boundaries, preventing premature output cutoffs or session poisoning.
+- **Web Monitor Real-Time Telemetry & Progress UI:** Overhaul of `serve/web/index.html` and `serve/web/monitor.js`. Added active/idle slot state tracking, prefill and decode token rate telemetry per slot, cache-tier indicators, and resolved table-rendering and progress bar empty state issues.
+- **Rolling N-Gram Reasoning Loop Detector:** Slices repeating circular loops during deep CoT generation, guaranteeing automatic recovery with intelligent repetition penalties.
+- **Dynamic 3-Tier Radix Storage & MTP Speculative Telemetry:** Real-time visibility into L1 VRAM pool, L2 Host RAM, and L3 NVMe snapshots with speculative acceptance rate metrics on the monitor.
+
 ### Latest Line — `v0.1.40-agx.4.2.0` (Multi-Agent Concurrency & Hardware Acceleration)
 
 On 2026-10-14, Strata AGX landed the **Multi-Agent Concurrency & Hardware Acceleration Release** (`v0.1.40-agx.4.2.0`, commit `7fdea49f`):

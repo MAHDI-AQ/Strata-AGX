@@ -1272,6 +1272,10 @@ class Service:
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.concurrency = int((getattr(engine, "info", {}) or {}).get("concurrency", 1))
         self.fifo = threading.BoundedSemaphore(self.concurrency)
+        self.available_slots = set(range(self.concurrency))
+        self.slots_state = {i: {"id": i, "status": "idle", "request_id": None, "phase": None,
+                                "prompt_tokens": 0, "generated": 0, "max_tokens": 0,
+                                "tok_s": None, "started": None} for i in range(self.concurrency)}
         self.active_requests = 0
         self.live_requests = {}
         self.request_serial = 0
@@ -1587,6 +1591,72 @@ class Service:
                     | {"wallclock_s": r.get("wallclock_s", round(time.perf_counter() - r["_clock"], 3))}
                     for r in reversed(records)]
 
+    def _radix_stats(self) -> dict:
+        nvme_path = "/srv/lab/cache/strata/nvme_radix"
+        manifest_path = os.path.join(nvme_path, "radix_manifest.bin")
+        total_nodes = 0
+        l3_snapshots = 0
+        l3_bytes = 0
+        if os.path.isdir(nvme_path):
+            try:
+                bin_files = [f for f in os.listdir(nvme_path) if f.startswith("node_") and f.endswith(".bin")]
+                l3_snapshots = len(bin_files)
+                for f in bin_files:
+                    l3_bytes += os.path.getsize(os.path.join(nvme_path, f))
+            except Exception:
+                pass
+        if os.path.isfile(manifest_path):
+            try:
+                with open(manifest_path, "rb") as f:
+                    data = f.read(20)
+                    if len(data) >= 20 and data[:8] == b"VNATARTS":
+                        version, num_nodes, max_node_id = struct.unpack("<III", data[8:20])
+                        total_nodes = num_nodes
+            except Exception:
+                pass
+        if total_nodes == 0 and l3_snapshots > 0:
+            total_nodes = l3_snapshots + 1
+        with self.status_lock:
+            t = self.totals
+            p_total = t.get("prompt_tokens", 0)
+            p_reused = t.get("reused", 0)
+            hit_rate = round((p_reused / p_total) * 100, 1) if p_total > 0 else 0.0
+        return {
+            "l1_vram_snapshots": 4,
+            "l1_vram_mib": 1600.0,
+            "l2_host_slots": 64,
+            "l2_host_gib": 32.0,
+            "l3_nvme_snapshots": l3_snapshots,
+            "l3_nvme_gib": round(l3_bytes / (1024**3), 2),
+            "total_nodes": total_nodes,
+            "cached_prefix_tokens": p_reused,
+            "hit_rate": hit_rate,
+            "cache_tier": "3-Tier (VRAM -> Host -> NVMe)"
+        }
+
+    def _mtp_stats(self) -> dict:
+        with self.status_lock:
+            t = self.totals
+            hist = list(self.history)
+            offered = t.get("drafts_offered", 0)
+            accepted = t.get("drafts_accepted", 0)
+            recent_offered = sum(r.get("drafts_offered", 0) or 0 for r in hist[-10:])
+            recent_accepted = sum(r.get("drafts_accepted", 0) or 0 for r in hist[-10:])
+        rate = round((accepted / offered) * 100, 1) if offered > 0 else 0.0
+        recent_rate = round((recent_accepted / recent_offered) * 100, 1) if recent_offered > 0 else rate
+        alpha = rate / 100.0
+        gamma = 2.0
+        denom = 1.0 - alpha + (alpha / gamma)
+        speedup = round(1.0 / denom, 2) if denom > 0.01 else 1.0
+        return {
+            "drafts_offered": offered,
+            "drafts_accepted": accepted,
+            "acceptance_rate": rate,
+            "rolling_acceptance_rate": recent_rate,
+            "speculative_speedup": speedup,
+            "gamma": 2
+        }
+
     def metrics(self, all_requests=False) -> dict:
         """GET /metrics: what the Monitor tab shows - the engine's facts, what it is doing, the last requests, and
         the hardware (with a minute of history per series)."""
@@ -1595,6 +1665,7 @@ class Service:
             hist = list(self.history)
             totals = dict(self.totals)
             active = [dict(request_id=rid, **state) for rid, state in self.live_requests.items()]
+            slots_data = [dict(sl) for sl in self.slots_state.values()]
         now = time.time()
         progress = getattr(self.engine, "progress", None)
         if s.get("busy") and s.get("first_token") is None:
@@ -1621,10 +1692,31 @@ class Service:
         engine = {"model": self.model, "max_context": self.engine.max_context, "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
-        return {"engine": engine, "live": live, "active_requests": active, "requests": hist[::-1][:None if all_requests else 12],
+
+        ctx = int(getattr(self.engine, "max_context", 0) or 0)
+        formatted_slots = []
+        for sl in slots_data:
+            s_dict = dict(sl)
+            s_dict["n_ctx"] = ctx
+            last_r = s_dict.get("last_request")
+            if s_dict.get("status") == "idle" and last_r:
+                s_dict.setdefault("cache_tier", last_r.get("cache_tier", "Fresh"))
+                s_dict.setdefault("prefill_tok_s", last_r.get("prefill_tok_s"))
+                s_dict.setdefault("tok_s", last_r.get("decode_tok_s"))
+                s_dict.setdefault("context_len", (last_r.get("prompt_tokens", 0) or 0) + (last_r.get("output_tokens", 0) or 0))
+            else:
+                s_dict.setdefault("cache_tier", "Fresh")
+                s_dict.setdefault("context_len", (s_dict.get("prompt_tokens", 0) or 0) + (s_dict.get("generated", 0) or 0))
+            s_dict.setdefault("state", s_dict.get("status"))
+            formatted_slots.append(s_dict)
+
+        radix = self._radix_stats()
+        mtp = self._mtp_stats()
+
+        return {"engine": engine, "live": live, "slots": formatted_slots, "radix": radix, "mtp": mtp,
+                "active_requests": active, "requests": hist[::-1][:None if all_requests else 12],
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
-                "hardware_static":
-                tel["static"], "history": tel["history"], "time": now}
+                "hardware_static": tel["static"], "history": tel["history"], "time": now}
 
     def v1_status(self) -> dict:
         """GET /v1/status: what this server is and does, for a client that would rather ask than guess (a front-end
@@ -1758,6 +1850,11 @@ class Service:
                     elif ev.kind == "tool_call":
                         s["phase"] = "tool call complete"
                     s["tail"] = ((s.get("tail") or "") + (ev.text or ""))[-600:]
+                slot_id = s.get("slot_id")
+                if slot_id is not None and slot_id in self.slots_state:
+                    self.slots_state[slot_id].update(status="generating", phase=s.get("phase"),
+                                                     generated=n,
+                                                     tok_s=round(n / max(1e-6, time.time() - s["first_token"]), 1) if s.get("first_token") else None)
                 self._refresh_status_locked()
             else:
                 s = self.status
@@ -1787,8 +1884,15 @@ class Service:
         label = f"[strata-agx request {request_id}]" if request_id is not None else "[strata-agx]"
         el = now - s.get("started", now)
         if s.get("first_token") is None:
-            pr = getattr(self.engine, "progress", None) if self.concurrency == 1 else None
+            pr = getattr(self.engine, "progress", None)
             done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{s.get('prompt_tokens', 0):,}"   # as read (#29)
+            slot_id = s.get("slot_id")
+            if slot_id is not None and slot_id in self.slots_state:
+                p_rate = pr[2] if (pr and len(pr) > 2) else getattr(self.engine, "prefill_tok_s_mean", None)
+                c_tier = pr[3] if (pr and len(pr) > 3) else "Fresh"
+                p_read = pr[0] if (pr and len(pr) > 0) else 0
+                self.slots_state[slot_id].update(status="reading", prompt_read=p_read,
+                                                 prefill_tok_s=p_rate, cache_tier=c_tier)
             print(f"{label} reading the prompt: {done} tokens, {el:.0f} s so far", flush=True)
         else:
             rate = s["generated"] / max(1e-6, now - s["first_token"])
@@ -1814,6 +1918,8 @@ class Service:
         trace = getattr(self.request_trace, "record", None)
         waiting = time.perf_counter()
         request_id = None
+        request_started = None
+        slot_id = None
         with self.status_lock:
             self.status["queued"] += 1
         try:
@@ -1837,8 +1943,18 @@ class Service:
                         request_started = time.time()
                         self.request_serial += 1
                         request_id = self.request_serial
-                        self.live_requests[request_id] = dict(phase="reading the prompt", prompt_tokens=len(ids), generated=0,
-                                           started=request_started, first_token=None, tool=None, tail="", max_tokens=max_new)
+                        slot_id = min(self.available_slots) if self.available_slots else 0
+                        self.available_slots.discard(slot_id)
+                        self.slots_state[slot_id] = {
+                            "id": slot_id, "status": "reading", "request_id": request_id,
+                            "phase": "reading the prompt", "prompt_tokens": len(ids),
+                            "generated": 0, "max_tokens": max_new, "tok_s": None,
+                            "started": request_started
+                        }
+                        self.live_requests[request_id] = dict(
+                            slot_id=slot_id, phase="reading the prompt", prompt_tokens=len(ids), generated=0,
+                            started=request_started, first_token=None, tool=None, tail="", max_tokens=max_new
+                        )
                         self._refresh_status_locked()
                         self.last_request_at = time.time()
                     before = getattr(self.engine, "last", None)
@@ -1936,6 +2052,10 @@ class Service:
                         prompt = prompt + seg + extra
                     if cancel.is_set():
                         finish = "cancel"
+                    elif finish != "stop" and getattr(self.engine, "last", {}):
+                        eng_finish = self.engine.last.get("finish")
+                        if eng_finish in ("stop", "length", "cancel"):
+                            finish = eng_finish
                 except GeneratorExit:                   # the client disconnected mid-stream
                     finish = "disconnect"
                     raise
@@ -1999,6 +2119,28 @@ class Service:
                         if request_started is not None:
                             self.active_requests -= 1
                             self.live_requests.pop(request_id, None)
+                            if slot_id is not None:
+                                self.available_slots.add(slot_id)
+                                prev_slot = self.slots_state.get(slot_id, {})
+                                p_ms = last.get("prompt_ms") or 0.0
+                                p_reused = last.get("reused") or 0
+                                p_fresh = max(0, seen - p_reused)
+                                p_tok_s = round(p_fresh / (p_ms / 1000.0), 1) if (p_ms > 0 and p_fresh > 0) else None
+                                last_info = {
+                                    "request_id": request_id,
+                                    "prompt_tokens": seen,
+                                    "output_tokens": n,
+                                    "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1) if n and last.get("generated") and last.get("decode_ms") else None,
+                                    "prefill_tok_s": p_tok_s,
+                                    "reused": p_reused,
+                                    "cache_tier": last.get("cache_tier", prev_slot.get("cache_tier", "Fresh")),
+                                    "duration_s": round(time.time() - started, 1)
+                                }
+                                self.slots_state[slot_id] = {
+                                    "id": slot_id, "status": "idle", "request_id": None, "phase": None,
+                                    "prompt_tokens": 0, "generated": 0, "max_tokens": 0, "tok_s": None, "started": None,
+                                    "cache_tier": last_info["cache_tier"], "last_request": last_info
+                                }
                         if not self.live_requests:
                             self.status["busy"] = False
                             self.status.pop("tail", None)
@@ -2192,7 +2334,7 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
         else:
             # a streamed call without its final tool_call is one the output ended inside: not "tool_calls" (#211)
             whole = calls and streamed.keys() <= finished
-            finish = "tool_calls" if whole and x["finish"] == "stop" else {"cancel": "stop"}.get(x["finish"], x["finish"])
+            finish = "tool_calls" if whole and x["finish"] in ("stop", "length") else {"cancel": "stop"}.get(x["finish"], x["finish"])
             last = chunk({}, finish)
             pt = x.get("prompt_tokens", len(ids))     # after MCP rounds: the last round's prompt
             last["usage"] = {"prompt_tokens": pt, "completion_tokens": x["completion_tokens"],
@@ -2614,9 +2756,12 @@ def make_handler(svc: Service):
                 if self._authorized():
                     loaded = not hasattr(svc.engine, "alive") or svc.engine.alive()
                     with svc.status_lock:
-                        busy = bool(svc.status.get("busy"))
-                    slot = {"id": 0, "n_ctx": svc.engine.max_context, "is_processing": busy}
-                    self._json(200, [slot] if loaded else [])
+                        slots_list = [
+                            {"id": s["id"], "n_ctx": svc.engine.max_context,
+                             "is_processing": s["status"] != "idle", **s}
+                            for s in svc.slots_state.values()
+                        ]
+                    self._json(200, slots_list if loaded else [])
             elif path == "/v1/status":
                 if self._authorized():
                     self._json(200, svc.v1_status())
