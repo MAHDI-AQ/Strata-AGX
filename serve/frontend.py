@@ -1137,9 +1137,10 @@ class OutputParser:
             kind = {"reasoning": "reasoning", "rcall": "reasoning", "content": "content"}.get(self.state, "content")
             text = self.buf if self.state != "call" else CALL_START + self.buf
             # Bug 1 Guard: Never leak raw orphan tool delimiters as content deltas
-            cleaned_text = text.strip()
-            if kind == "content" and cleaned_text in (CALL_START, CALL_END, f"{CALL_START}{CALL_END}"):
-                text = ""
+            if self.state == "call":
+                cleaned_text = text.strip()
+                if kind == "content" and cleaned_text in (CALL_START, CALL_END, f"{CALL_START}{CALL_END}"):
+                    text = ""
             if text:
                 out.append(Event(kind, text))
             self.buf = ""

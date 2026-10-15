@@ -319,7 +319,6 @@ def session_hint(ids, session_id: str = None) -> int:
     else:
         max_scan = min(len(ids), 1024)
         h.update(",".join(str(int(t)) for t in ids[:max_scan]).encode())
-        h.update(f":len={len(ids)}".encode())
     return int.from_bytes(h.digest(), "big")
 
 class ShmConsumer:
@@ -1400,6 +1399,11 @@ class Detokenizer:
         delta, self.sent = text[self.sent:], len(text)
         return delta
 
+    def flush(self, final: bool = True) -> str:
+        if self.inc is not None:
+            return self.inc.decode(b"", final=final)
+        return ""
+
 
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
@@ -2358,6 +2362,10 @@ class Service:
         finally:
             if emb:
                 Path(emb).unlink(missing_ok=True)
+        flushed_text = detok.flush(final=True)
+        if flushed_text:
+            for ev in parser.feed(flushed_text):
+                yield "event", ev
         for ev in parser.finish():
             yield "event", ev
         yield "done", {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),

@@ -1482,7 +1482,9 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 if (retire_slot_idx >= 0) continuous_sched.step_token(retire_slot_idx, s.output[t], (t == keep - 1 && p.eos));
                 s.consumed.push_back(s.window[t]); s.suffix.append(s.output[t]); ++s.generated;
                 if (ipc::ShmProducer::instance()->is_active()) {
-                    ipc::ShmProducer::instance()->write_token(s.request.id, s.output[t]);
+                    if (!ipc::ShmProducer::instance()->write_token(s.request.id, s.output[t])) {
+                        std::printf("R %llu T %d\n", (unsigned long long) s.request.id, s.output[t]);
+                    }
                 } else {
                     std::printf("R %llu T %d\n", (unsigned long long) s.request.id, s.output[t]);
                 }

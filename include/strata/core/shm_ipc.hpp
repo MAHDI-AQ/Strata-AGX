@@ -6,6 +6,7 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <mutex>
 
 namespace strata::ipc {
 
@@ -64,6 +65,7 @@ public:
 
     bool write_token(uint64_t id, int32_t token) {
         if (!active_ || !ring_) return false;
+        std::lock_guard<std::mutex> lock(mutex_);
         uint32_t h = ring_->head.load(std::memory_order_relaxed);
         // Task 1.3: Bounded backpressure spin instead of silent drop
         int spins = 0;
@@ -92,6 +94,7 @@ public:
 
     bool write_progress(uint64_t id, int64_t read, int64_t total) {
         if (!active_ || !ring_) return false;
+        std::lock_guard<std::mutex> lock(mutex_);
         uint32_t h = ring_->head.load(std::memory_order_relaxed);
         uint32_t t = ring_->tail.load(std::memory_order_acquire);
         if (h - t >= ring_->capacity) return false;
@@ -118,6 +121,7 @@ private:
     ShmRing* ring_{nullptr};
     std::string name_;
     bool active_{false};
+    std::mutex mutex_;
 };
 
 } // namespace strata::ipc

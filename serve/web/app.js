@@ -591,7 +591,7 @@ function blocks(text) {
       out.push(html + "</tbody></table>");
       continue;
     }
-    if ((m = l.match(/^\s*(?:[-*+]|(\d+)[.)])\s+(.*)$/))) {
+    if ((m = l.match(/^\s*(?:[-*+]|(\d+)[.)])\s+(\S.*)$/))) {
       flushPara();
       const tag = m[1] ? "ol" : "ul";
       if (!list || list.tag !== tag) { flushList(); list = {tag, items: []}; }
