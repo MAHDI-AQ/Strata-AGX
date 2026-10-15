@@ -311,10 +311,15 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
 
 
 
-def session_hint(ids) -> int:
+def session_hint(ids, session_id: str = None) -> int:
     h = hashlib.blake2b(digest_size=8)
     h.update(b"strata-sess:")
-    h.update(",".join(str(int(t)) for t in ids[:256]).encode())
+    if session_id:
+        h.update(str(session_id).encode())
+    else:
+        max_scan = min(len(ids), 1024)
+        h.update(",".join(str(int(t)) for t in ids[:max_scan]).encode())
+        h.update(f":len={len(ids)}".encode())
     return int.from_bytes(h.digest(), "big")
 
 class ShmConsumer:
@@ -777,7 +782,7 @@ class StrataEngine:
             else:
                 head = f"CGEN {number} {int(max_new)}{self.sampling_keys(sampling or {})}"
                 if (self.info or {}).get("admission"):    # D1: only an engine that advertises the hint
-                    head += f" sess={session_hint(ids)}"
+                    head += f" sess={session_hint(ids, session_id=(sampling or {}).get('session_id'))}"
             sent_at = time.monotonic()
             self._send(head + " " + ",".join(str(int(t)) for t in ids))
             sent = True

@@ -989,6 +989,9 @@ RadixMatch RadixTree::match_prefix(const int32_t* tokens, size_t n) const {
             break;
         }
     }
+    if (best.node) {
+        const_cast<RadixTree*>(this)->acquire(best.node);
+    }
     return best;
 }
 
@@ -1047,6 +1050,9 @@ RadixMatch RadixTree::match_prefix(const int64_t* tokens, size_t n) const {
             // pollution from ghost tokens of divergent requests. Exact node snapshot match is required.
             break;
         }
+    }
+    if (best.node) {
+        const_cast<RadixTree*>(this)->acquire(best.node);
     }
     return best;
 }

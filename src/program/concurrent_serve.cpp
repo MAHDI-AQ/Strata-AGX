@@ -1204,8 +1204,13 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         }
     };
     auto finish = [&](Impl::Slot& s, const char* reason) {
+        const bool is_cancelled = (reason && (std::strcmp(reason, "cancel") == 0 ||
+                                              std::strcmp(reason, "abort") == 0 ||
+                                              std::strcmp(reason, "cstop") == 0));
         const bool defer_snapshot = defer_snapshots;
-        if (!defer_snapshot) save_slot_snapshot(s, (int64_t) s.consumed.size(), s.consumed);
+        if (!is_cancelled) {
+            if (!defer_snapshot) save_slot_snapshot(s, (int64_t) s.consumed.size(), s.consumed);
+        }
         const double decode = s.first ? 0 : elapsed(s.decode_start);
         // P4: the trailing field is reused_prefix_tokens (server.py _parse_done maps it to
         // `reused`/cached_tokens). Live retention fills it with the tokens this request resumed;
@@ -1216,7 +1221,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                     (long long) s.generated, s.request.tokens.size(), s.prompt_ms.load(), decode, reason,
                     (long long) s.accepted, (long long) s.offered, (long long) s.reused_prefix, s.cache_tier.c_str(), live_l2_bytes);
         std::fflush(stdout);
-        if (defer_snapshot) {
+        if (defer_snapshot && !is_cancelled) {
             pending_snapshots.push_back(&s);   // flushed with its snapshot at a safe point
         } else if (s.radix_node) {
             radix_tree.release(s.radix_node);
@@ -1790,7 +1795,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 }
                 s.draft->kv_restore(reused);
             }
-            s.cache_tier = "VRAM";
+            s.cache_tier = (parent == &s ? "VRAM-Warm" : "VRAM");
             std::fprintf(stderr, "strata-agx concurrent: snapshot fork: slot forks %lld tokens from %s (saved=%lld)\n",
                          (long long) reused, (parent == &s ? "self" : "parent"), (long long) parent->saved_prefix);
         } else {
@@ -1910,8 +1915,49 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         constexpr size_t kAdmissionScanQueue = 32;   // the pending deque's own cap (see the overflow check above; M2 raise 16->32 for burst headroom)
         const auto admit_start = retain ? Clock::now() : Clock::time_point{};
         std::vector<Impl::Slot*> admitted_this_round;
-        // Pass 1: Intra-slot retention is gated on verified snapshot integrity (handled by Pass 3 & RadixTree).
-        // Bare LCP rollback without snapshot restore corrupts recurrent GDN/PLE state in hybrid models.
+        // Pass 0: Intra-Slot VRAM Warm Snapshot Retention (0ms TTFT, zero PCIe transfer, zero session_zero wipe)
+        while (retain && !pending.empty()) {
+            Impl::Slot* pick = nullptr;
+            size_t pick_q = 0;
+            int64_t best = 0;
+            const size_t qn = std::min<size_t>(pending.size(), kAdmissionScanQueue);
+            for (size_t q = 0; q < qn; ++q) {
+                const auto& tokens = pending[q].tokens;
+                const int64_t nmax = (int64_t) tokens.size() - 1;
+                if (nmax < 64 || nmax <= best) continue;
+
+                for (auto& ptr : m.slots) {
+                    auto* p = ptr.get();
+                    if (p->active.load() || (int64_t) tokens.size() >= p->max_context) continue;
+                    if (std::find(admitted_this_round.begin(), admitted_this_round.end(), p) != admitted_this_round.end()) continue;
+                    // Enforce session affinity: intra-slot retention requires matching session
+                    if (pending[q].session != 0 && p->session != 0 && p->session != pending[q].session) continue;
+
+                    const int64_t saved_len = p->saved_prefix;
+                    if (saved_len < 64 || saved_len > nmax || saved_len <= best) continue;
+                    if (!p->stages[0].gdn_saved) continue;
+
+                    // Exact token prefix match against slot's verified VRAM snapshot
+                    bool exact_match = true;
+                    for (int64_t i = 0; i < saved_len && exact_match; ++i) {
+                        exact_match = (p->saved_consumed[(size_t) i] == (int32_t) tokens[(size_t) i]);
+                    }
+                    if (exact_match && saved_len > best) {
+                        best = saved_len;
+                        pick = p;
+                        pick_q = q;
+                    }
+                }
+            }
+            if (pick == nullptr || best == 0) break;
+
+            auto& s = *pick;
+            s.request = std::move(pending[pick_q]);
+            pending.erase(pending.begin() + (std::ptrdiff_t) pick_q);
+            // Admit slot with parent == &s to trigger instant VRAM snapshot restore!
+            if (!admit_slot(s, best, &s)) return 1;
+            admitted_this_round.push_back(&s);
+        }
 
         // SPRINT 4: Dynamic RadixTree prefix fork pass
         while (retain && !pending.empty()) {
