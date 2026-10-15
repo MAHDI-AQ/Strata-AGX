@@ -73,6 +73,32 @@ public:
 
     /// Find and allocate an available slot for an incoming request.
     /// Returns slot_id, or -1 if no suitable slot is idle.
+    int allocate_slot_at(int slot_id, uint64_t request_id, int64_t prompt_tokens, int64_t max_new,
+                         int64_t max_context) {
+        if (max_context > 0 && prompt_tokens + std::max<int64_t>(0, max_new) > max_context) {
+            return -1;
+        }
+        if (slot_id < 0 || slot_id >= num_slots_) return -1;
+        std::lock_guard<std::mutex> lock(sched_mutex_);
+        const auto t0 = std::chrono::steady_clock::now();
+
+        int pick = slot_id;
+        auto& s = slots_[pick];
+        s.request_id = request_id;
+        s.state = SlotState::PREFILL;
+        s.prompt_tokens = prompt_tokens;
+        s.tokens_generated = 0;
+        s.max_new = max_new;
+        s.position = prompt_tokens > 0 ? prompt_tokens - 1 : 0;
+        s.max_context = max_context;
+        s.last_token = -1;
+        s.admit_time = std::chrono::steady_clock::now();
+        ++total_admissions_;
+
+        record_overhead(t0);
+        return pick;
+    }
+
     int allocate_slot(uint64_t request_id, int64_t prompt_tokens, int64_t max_new,
                       int64_t max_context) {
         if (max_context > 0 && prompt_tokens + std::max<int64_t>(0, max_new) > max_context) {

@@ -378,6 +378,7 @@ bool RadixNode::offload_to_nvme(NVMeStorageTier& nvme) {
 }
 
 bool RadixNode::hydrate_from_nvme(NVMeStorageTier& nvme) {
+    std::lock_guard<std::mutex> h_lock(hydrate_mutex_);
     if (!is_l3_offloaded) return true;
     if (l3_bytes == 0) return false;
 
@@ -632,8 +633,9 @@ void RadixTree::nvme_worker_loop() {
                     node->l3_bytes = task.total_payload;
                     node->is_l3_offloaded = true;
                     node->has_l3_persisted = true;
-                    // Continuous write-through: do NOT call node->free_host()!
-                    // Node remains hot in L2 Host RAM for sub-5ms restore while backed up to L3.
+                    if (task.free_host_on_write) {
+                        node->free_host();
+                    }
                 } else {
                     if (cached_nvme_snapshots_ > 0) --cached_nvme_snapshots_;
                 }
@@ -959,11 +961,17 @@ RadixMatch RadixTree::match_prefix(const int32_t* tokens, size_t n) const {
         const size_t max_comp = std::min(edge.size(), n - matched_len);
         const size_t num_chunks = max_comp / kRadixChunkTokens;
 
-        // Task 2.1: 64-token chunk hash comparison
+        // Task 2.1: 64-token chunk hash comparison + vectorized raw token verification against CRC32C collisions
         size_t c = 0;
         for (; c < num_chunks && c < chunk_hashes.size(); ++c) {
             const uint64_t q_hash = compute_token_chunk_hash(tokens + matched_len + c * kRadixChunkTokens, kRadixChunkTokens);
             if (chunk_hashes[c] != q_hash) break;
+            // Enforce raw token verification across matched chunk
+            if (std::memcmp(edge.data() + c * kRadixChunkTokens,
+                            tokens + matched_len + c * kRadixChunkTokens,
+                            kRadixChunkTokens * sizeof(int32_t)) != 0) {
+                break;
+            }
             match_edge += kRadixChunkTokens;
         }
 
@@ -1801,7 +1809,8 @@ size_t RadixTree::evict_lru_locked(size_t max_snapshots, size_t min_free_vram_mi
                     host_victim->id,
                     host_victim,
                     std::move(buffer),
-                    total_payload
+                    total_payload,
+                    /*free_host_on_write=*/true
                 });
             }
             nvme_cv_.notify_one();

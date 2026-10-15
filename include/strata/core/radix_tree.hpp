@@ -236,6 +236,7 @@ struct RadixNode : public std::enable_shared_from_this<RadixNode> {
     bool is_l3_offloaded = false;
     std::atomic<bool> is_staging_to_nvme{false};
     size_t l3_bytes = 0;
+    std::mutex hydrate_mutex_;
 
     void update_chunk_hashes() {
         edge_chunk_hashes.clear();
@@ -413,6 +414,7 @@ private:
         std::weak_ptr<RadixNode> node_weak;
         AlignedBuffer payload;
         size_t total_payload = 0;
+        bool free_host_on_write = false;
     };
 
     std::queue<NVMeStagingTask> nvme_queue_;

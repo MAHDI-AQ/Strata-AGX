@@ -1829,7 +1829,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             if (m.slots[si].get() == &s) { admit_slot_idx = (int) si; break; }
         }
         if (admit_slot_idx >= 0) {
-            continuous_sched.allocate_slot(s.request.id, (int64_t) s.request.tokens.size(), s.request.max_new, s.max_context);
+            continuous_sched.allocate_slot_at(admit_slot_idx, s.request.id, (int64_t) s.request.tokens.size(), s.request.max_new, s.max_context);
         }
         return true;
     };
