@@ -692,8 +692,8 @@ class StrataEngine:
                 keys += f" penalty_last_n={pln}"
             else:
                 keys += " penalty_last_n=128"
-        elif rp is None and pf is None and pp is None:
-            # Safe conservative server fallback when client sends no penalty:
+        elif not rp_on and not pf_on and not pp_on:
+            # Safe conservative server fallback when client sends no penalty or penalties == 1.0/0.0:
             # Prevents catastrophic degenerate repetition loops in deep reasoning/thinking
             keys += " penalty_repeat=1.04 penalty_last_n=128"
         seed = sampling.get("seed")
@@ -1844,6 +1844,7 @@ class Service:
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
+                    reasoning_window = []               # rolling token history to detect degenerate repetition loops
                     while True:
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
@@ -1869,12 +1870,30 @@ class Service:
                                 last_print = self._progress(last_print, request_id=request_id)
                                 for ev in evs:
                                     yield "event", ev
-                                if budget and parser.state == "reasoning":
-                                    thought += 1
-                                    # at a clean point: no tag held back, no character split across tokens
-                                    if thought >= budget and not parser.buf and not detok.pending():
-                                        wrap = True
-                                        break
+                                if parser.state == "reasoning":
+                                    reasoning_window.append(t)
+                                    if len(reasoning_window) > 256:
+                                        reasoning_window.pop(0)
+                                    # Loop detector: detect identical n-grams (length 8..32) repeated >= 3 times
+                                    rw_len = len(reasoning_window)
+                                    if rw_len >= 32:
+                                        for n_gram in (8, 12, 16, 24, 32):
+                                            if rw_len >= n_gram * 3:
+                                                tail_gram = reasoning_window[-n_gram:]
+                                                if (reasoning_window[-n_gram*2:-n_gram] == tail_gram and
+                                                    reasoning_window[-n_gram*3:-n_gram*2] == tail_gram):
+                                                    if not parser.buf and not detok.pending():
+                                                        print(f"[strata-agx] runaway repetition loop detected in reasoning ({n_gram}-gram repeated 3x): wrapping up thinking", flush=True)
+                                                        wrap = True
+                                                        break
+                                        if wrap:
+                                            break
+                                    if budget:
+                                        thought += 1
+                                        # at a clean point: no tag held back, no character split across tokens
+                                        if thought >= budget and not parser.buf and not detok.pending():
+                                            wrap = True
+                                            break
                         except EngineDied as e:
                             finish = "error"
                             self._say_died(e)
