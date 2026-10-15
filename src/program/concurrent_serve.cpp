@@ -277,6 +277,8 @@ struct ConcurrentServe::Impl {
         int64_t saved_prefix = 0;
         int64_t root_at = -1;            // Phase 1: End of system prompt (<|im_start|>user boundary)
         int64_t turn_at = -1;            // Phase 1: Last turn boundary
+        std::vector<int64_t> turn_boundaries;
+        size_t next_turn_snap_idx = 0;
         bool root_snap_done = false;     // Phase 1: System root snapshot captured to L2 Host RAM
         bool turn_snap_done = false;     // Phase 3: Conversational turn boundary snapshot
         bool prompt_snap_done = false;   // P18 L1: the prompt-end snapshot was captured this admission
@@ -877,11 +879,22 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         }
         int64_t n = std::min<int64_t>(dynamic_chunk, rem);
 
-        // Phase 1 & 3: Boundary-aligned prefill clamping at T_sys and T_turn
+        // Phase 1 & 3: Boundary-aligned prefill clamping at T_sys and intermediate turn boundaries
+        while (s.next_turn_snap_idx < s.turn_boundaries.size() && s.turn_boundaries[s.next_turn_snap_idx] <= read0) {
+            s.next_turn_snap_idx++;
+        }
         if (s.root_at > 0 && !s.root_snap_done && read0 < s.root_at) {
             const int64_t dist_to_root = s.root_at - read0;
             if (dist_to_root > 0 && n > dist_to_root) {
                 n = dist_to_root;
+            }
+        } else if (s.next_turn_snap_idx < s.turn_boundaries.size()) {
+            const int64_t b = s.turn_boundaries[s.next_turn_snap_idx];
+            if (b > read0) {
+                const int64_t dist_to_b = b - read0;
+                if (dist_to_b > 0 && n > dist_to_b) {
+                    n = dist_to_b;
+                }
             }
         } else if (s.turn_at > 0 && !s.turn_snap_done && s.turn_at > s.root_at && read0 < s.turn_at) {
             const int64_t dist_to_turn = s.turn_at - read0;
@@ -1071,7 +1084,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     // and evictions can park those copies to pinned host RAM; the 3x254K acceptance host-OOM'd
     // once with captures on (2026-10-07).  Prompts above the ceiling stay capture-free (the
     // pre-capture memory profile), which is the acceptance's own shape.
-    constexpr int64_t kSnapshotMaxPrefixTokens = 131072;
+    constexpr int64_t kSnapshotMaxPrefixTokens = 262144;
     std::vector<Impl::Slot*> pending_snapshots;
     bool defer_snapshots = false;   // set from the overlap gate below (finish() is defined earlier)
     bool pipeline_in_flight = true; // S26f3: maintained by the round loop; gates admission-time flushes
@@ -1158,7 +1171,18 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 std::fprintf(stderr, "strata-agx concurrent: captured SYSTEM_ROOT boundary snapshot at T_sys=%lld (req=%llu)\n",
                              (long long) s.root_at, (unsigned long long) s.request.id);
             }
-            // Phase 3: Boundary snapshot capture at T_turn
+            // Phase 3: Intermediate turn boundary snapshot capture
+            while (s.next_turn_snap_idx < s.turn_boundaries.size()) {
+                const int64_t b = s.turn_boundaries[s.next_turn_snap_idx];
+                if (cur_read >= b && (int64_t) s.consumed.size() >= b) {
+                    save_slot_snapshot(s, b, s.consumed, /*safe_no_evict=*/false);
+                    std::fprintf(stderr, "strata-agx concurrent: captured INTERMEDIATE TURN_BOUNDARY snapshot at T=%lld (req=%llu)\n",
+                                 (long long) b, (unsigned long long) s.request.id);
+                    s.next_turn_snap_idx++;
+                } else {
+                    break;
+                }
+            }
             if (s.turn_at > 0 && !s.turn_snap_done && s.turn_at > s.root_at && cur_read >= s.turn_at && (int64_t) s.consumed.size() >= s.turn_at) {
                 s.turn_snap_done = true;
                 save_slot_snapshot(s, s.turn_at, s.consumed, /*safe_no_evict=*/false);
@@ -1660,6 +1684,8 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         s.turn_snap_done = false;
         s.root_at = -1;
         s.turn_at = -1;
+        s.turn_boundaries.clear();
+        s.next_turn_snap_idx = 0;
 
         // Phase 1: Semantic boundary detection for Qwen chat format (<|im_start|> = 248045)
         // System prompt root ends at the second <|im_start|> (the start of the first user turn)
@@ -1671,6 +1697,9 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 ++im_start_count;
                 if (im_start_count == 2) {
                     if (idx >= 64) s.root_at = idx;
+                }
+                if (idx >= 64 && idx > reused) {
+                    s.turn_boundaries.push_back(idx);
                 }
                 s.turn_at = idx;
             }

@@ -129,6 +129,18 @@ struct PinnedBuffer {
     bool empty() const noexcept { return ptr_ == nullptr || size_ == 0; }
 };
 
+struct PinnedSpan {
+    uint8_t* ptr_ = nullptr;
+    size_t size_ = 0;
+    PinnedSpan() = default;
+    PinnedSpan(uint8_t* p, size_t sz) : ptr_(p), size_(sz) {}
+    uint8_t* data() noexcept { return ptr_; }
+    const uint8_t* data() const noexcept { return ptr_; }
+    size_t size() const noexcept { return size_; }
+    bool empty() const noexcept { return ptr_ == nullptr || size_ == 0; }
+    void reset(uint8_t* p = nullptr, size_t sz = 0) { ptr_ = p; size_ = sz; }
+};
+
 struct RadixQsaSlice {
     void* k_q = nullptr;
     void* v_q4 = nullptr;
@@ -171,24 +183,25 @@ struct RadixStageSnapshot {
     void free_device();
 };
 
-// HiCache L2 Tier: Host-RAM parking structures with zero-copy pinned DMA memory
+// HiCache L2 Tier: Host-RAM parking structures with zero-copy pinned DMA memory (Coalesced Slab)
 struct RadixQsaHostSlice {
-    PinnedBuffer k_q;
-    PinnedBuffer v_q4;
-    PinnedBuffer k_scale;
-    PinnedBuffer v_scale;
-    PinnedBuffer idx_tail;
-    PinnedBuffer idx_dead;
-    PinnedBuffer idx_pooled;
+    PinnedSpan k_q;
+    PinnedSpan v_q4;
+    PinnedSpan k_scale;
+    PinnedSpan v_scale;
+    PinnedSpan idx_tail;
+    PinnedSpan idx_dead;
+    PinnedSpan idx_pooled;
     int32_t idx_block_pos_val = 0;
     bool has_idx_block_pos = false;
 };
 
 struct RadixStageHostSnapshot {
     int device = -1;
-    PinnedBuffer gdn_data;
-    PinnedBuffer ple_data;
-    PinnedBuffer R_data;
+    PinnedBuffer slab_;
+    PinnedSpan gdn_data;
+    PinnedSpan ple_data;
+    PinnedSpan R_data;
     int32_t ple_prev_saved[2] = {-1, -1};
     int32_t ple_token_saved = -1;
     int64_t qsa_ord0 = 0;

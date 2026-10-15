@@ -1,6 +1,13 @@
 
 // src/core/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
 #include "strata/core/layer.hpp"
+#include <mutex>
+
+// Process-wide singleton device RoPE tables per GPU device (reclaims 192+ MiB across concurrent slots)
+static std::mutex g_device_rope_mutex;
+static float* g_device_cos[8] = {nullptr};
+static float* g_device_sin[8] = {nullptr};
+static int64_t g_device_rope_cells[8] = {0};
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
@@ -609,9 +616,23 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.idx_pooled_rows = p.pooled_rows;
     st.idx_pooled = c.take<float>((uint64_t) p.pooled_rows * s.idx_dim);
     st.idx_block_pos = c.take<int32_t>(1);
+    int dev = 0;
+    cudaGetDevice(&dev);
+    float* dev_cos_ptr = nullptr;
+    float* dev_sin_ptr = nullptr;
+    if (share_rope == nullptr && dev >= 0 && dev < 8) {
+        std::lock_guard<std::mutex> lock(g_device_rope_mutex);
+        if (g_device_cos[dev] != nullptr && g_device_rope_cells[dev] >= max_cells) {
+            dev_cos_ptr = g_device_cos[dev];
+            dev_sin_ptr = g_device_sin[dev];
+        }
+    }
     if (share_rope != nullptr) {
         st.cos_tab = share_rope->cos_tab;
         st.sin_tab = share_rope->sin_tab;
+    } else if (dev_cos_ptr != nullptr) {
+        st.cos_tab = dev_cos_ptr;
+        st.sin_tab = dev_sin_ptr;
     } else {
         st.cos_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));
         st.sin_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));
@@ -663,14 +684,24 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     // agree with the host's libm.  A table shorter than the sequence would have the rotation read past it.
     // The process's rope scaling (none by default) is INSIDE the table - the rotation kernels cannot tell.
     if (share_rope == nullptr) {
-        std::vector<float> hc((size_t) max_cells * (s.n_rot / 2)), hs((size_t) max_cells * (s.n_rot / 2));
-        strata::kernels::build_rope_table((int) s.n_rot, strata::kernels::rope_scaling(), (int) max_cells,
-                                          hc.data(), hs.data());
-        cudaMemcpy(st.cos_tab, hc.data(), hc.size() * 4, cudaMemcpyHostToDevice);
-        cudaMemcpy(st.sin_tab, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice);
-        st.owns_rope = true;
-        if (s.n_rot == 64)   // the native and prompt-path rope kernels read it (mrope.hpp, STRATA_ROPE_TABLE=1)
-            strata::kernels::rope_table_set(st.cos_tab, st.sin_tab, (int) max_cells, strata::kernels::rope_scaling());
+        if (dev_cos_ptr != nullptr) {
+            st.owns_rope = false;
+        } else {
+            std::vector<float> hc((size_t) max_cells * (s.n_rot / 2)), hs((size_t) max_cells * (s.n_rot / 2));
+            strata::kernels::build_rope_table((int) s.n_rot, strata::kernels::rope_scaling(), (int) max_cells,
+                                              hc.data(), hs.data());
+            cudaMemcpy(st.cos_tab, hc.data(), hc.size() * 4, cudaMemcpyHostToDevice);
+            cudaMemcpy(st.sin_tab, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice);
+            st.owns_rope = true;
+            if (dev >= 0 && dev < 8) {
+                std::lock_guard<std::mutex> lock(g_device_rope_mutex);
+                g_device_cos[dev] = st.cos_tab;
+                g_device_sin[dev] = st.sin_tab;
+                g_device_rope_cells[dev] = max_cells;
+            }
+            if (s.n_rot == 64)   // the native and prompt-path rope kernels read it (mrope.hpp, STRATA_ROPE_TABLE=1)
+                strata::kernels::rope_table_set(st.cos_tab, st.sin_tab, (int) max_cells, strata::kernels::rope_scaling());
+        }
     }
     // the page table starts as the IDENTITY, which is the simplest legal mapping and what a caller that does
     // not page at all wants; a streamed state starts with nothing resident, a ring at `block % n_slots`.

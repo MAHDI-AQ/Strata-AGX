@@ -96,7 +96,7 @@ bool RadixNode::unpark_to_device() {
         ss.qsa_alloc = hss.qsa_alloc;
         if (ss.device < 0) continue;
         const core::OnDevice on(ss.device);
-        auto up = [](PinnedBuffer& h, void** d, size_t& bytes) {
+        auto up = [](const PinnedSpan& h, void** d, size_t& bytes) {
             if (h.empty()) return;
             bytes = h.size();
             if (cudaMalloc(d, bytes) != cudaSuccess) { *d = nullptr; bytes = 0; return; }
@@ -142,49 +142,77 @@ void RadixNode::park_to_host() {
 
         if (ss.device >= 0) {
             const core::OnDevice on(ss.device);
+            size_t total_stage_bytes = 0;
+            if (ss.gdn_saved && ss.gdn_bytes > 0) total_stage_bytes += ss.gdn_bytes;
+            if (ss.ple_saved && ss.ple_bytes > 0) total_stage_bytes += ss.ple_bytes;
+            if (ss.R_saved && ss.R_bytes > 0) total_stage_bytes += ss.R_bytes;
+            for (const auto& src : ss.qsa_slices) {
+                if (src.k_q && src.k_bytes > 0) total_stage_bytes += src.k_bytes;
+                if (src.v_q4 && src.v_bytes > 0) total_stage_bytes += src.v_bytes;
+                if (src.k_scale && src.k_scale_bytes > 0) total_stage_bytes += src.k_scale_bytes;
+                if (src.v_scale && src.v_scale_bytes > 0) total_stage_bytes += src.v_scale_bytes;
+                if (src.idx_tail && src.idx_tail_bytes > 0) total_stage_bytes += src.idx_tail_bytes;
+                if (src.idx_dead && src.idx_dead_bytes > 0) total_stage_bytes += src.idx_dead_bytes;
+                if (src.idx_pooled && src.idx_pooled_bytes > 0) total_stage_bytes += src.idx_pooled_bytes;
+            }
+
+            hss.slab_.allocate(total_stage_bytes);
+            uint8_t* slab_cursor = hss.slab_.data();
+
             if (ss.gdn_saved && ss.gdn_bytes > 0) {
-                hss.gdn_data.resize(ss.gdn_bytes);
+                hss.gdn_data.reset(slab_cursor, ss.gdn_bytes);
                 cudaMemcpy(hss.gdn_data.data(), ss.gdn_saved, ss.gdn_bytes, cudaMemcpyDeviceToHost);
+                slab_cursor += ss.gdn_bytes;
             }
             if (ss.ple_saved && ss.ple_bytes > 0) {
-                hss.ple_data.resize(ss.ple_bytes);
+                hss.ple_data.reset(slab_cursor, ss.ple_bytes);
                 cudaMemcpy(hss.ple_data.data(), ss.ple_saved, ss.ple_bytes, cudaMemcpyDeviceToHost);
+                slab_cursor += ss.ple_bytes;
             }
             if (ss.R_saved && ss.R_bytes > 0) {
-                hss.R_data.resize(ss.R_bytes);
+                hss.R_data.reset(slab_cursor, ss.R_bytes);
                 cudaMemcpy(hss.R_data.data(), ss.R_saved, ss.R_bytes, cudaMemcpyDeviceToHost);
+                slab_cursor += ss.R_bytes;
             }
+
             hss.qsa_slices.resize(ss.qsa_slices.size());
             for (size_t j = 0; j < ss.qsa_slices.size(); ++j) {
                 const auto& src = ss.qsa_slices[j];
                 auto& dst = hss.qsa_slices[j];
                 if (src.k_q && src.k_bytes > 0) {
-                    dst.k_q.resize(src.k_bytes);
+                    dst.k_q.reset(slab_cursor, src.k_bytes);
                     cudaMemcpy(dst.k_q.data(), src.k_q, src.k_bytes, cudaMemcpyDeviceToHost);
+                    slab_cursor += src.k_bytes;
                 }
                 if (src.v_q4 && src.v_bytes > 0) {
-                    dst.v_q4.resize(src.v_bytes);
+                    dst.v_q4.reset(slab_cursor, src.v_bytes);
                     cudaMemcpy(dst.v_q4.data(), src.v_q4, src.v_bytes, cudaMemcpyDeviceToHost);
+                    slab_cursor += src.v_bytes;
                 }
                 if (src.k_scale && src.k_scale_bytes > 0) {
-                    dst.k_scale.resize(src.k_scale_bytes);
+                    dst.k_scale.reset(slab_cursor, src.k_scale_bytes);
                     cudaMemcpy(dst.k_scale.data(), src.k_scale, src.k_scale_bytes, cudaMemcpyDeviceToHost);
+                    slab_cursor += src.k_scale_bytes;
                 }
                 if (src.v_scale && src.v_scale_bytes > 0) {
-                    dst.v_scale.resize(src.v_scale_bytes);
+                    dst.v_scale.reset(slab_cursor, src.v_scale_bytes);
                     cudaMemcpy(dst.v_scale.data(), src.v_scale, src.v_scale_bytes, cudaMemcpyDeviceToHost);
+                    slab_cursor += src.v_scale_bytes;
                 }
                 if (src.idx_tail && src.idx_tail_bytes > 0) {
-                    dst.idx_tail.resize(src.idx_tail_bytes);
+                    dst.idx_tail.reset(slab_cursor, src.idx_tail_bytes);
                     cudaMemcpy(dst.idx_tail.data(), src.idx_tail, src.idx_tail_bytes, cudaMemcpyDeviceToHost);
+                    slab_cursor += src.idx_tail_bytes;
                 }
                 if (src.idx_dead && src.idx_dead_bytes > 0) {
-                    dst.idx_dead.resize(src.idx_dead_bytes);
+                    dst.idx_dead.reset(slab_cursor, src.idx_dead_bytes);
                     cudaMemcpy(dst.idx_dead.data(), src.idx_dead, src.idx_dead_bytes, cudaMemcpyDeviceToHost);
+                    slab_cursor += src.idx_dead_bytes;
                 }
                 if (src.idx_pooled && src.idx_pooled_bytes > 0) {
-                    dst.idx_pooled.resize(src.idx_pooled_bytes);
+                    dst.idx_pooled.reset(slab_cursor, src.idx_pooled_bytes);
                     cudaMemcpy(dst.idx_pooled.data(), src.idx_pooled, src.idx_pooled_bytes, cudaMemcpyDeviceToHost);
+                    slab_cursor += src.idx_pooled_bytes;
                 }
                 if (src.idx_block_pos) {
                     dst.has_idx_block_pos = true;
@@ -418,20 +446,38 @@ bool RadixNode::hydrate_from_nvme(NVMeStorageTier& nvme) {
         hss.qsa_ord0 = shdr.qsa_ord0;
         hss.qsa_alloc = shdr.qsa_alloc;
 
+        size_t stage_slab_bytes = shdr.gdn_bytes + shdr.ple_bytes + shdr.R_bytes;
+        size_t peek_offset = offset + shdr.gdn_bytes + shdr.ple_bytes + shdr.R_bytes;
+        for (uint32_t j = 0; j < shdr.n_qsa_slices; ++j) {
+            NVMeQsaSliceHeader qhdr;
+            std::memcpy(&qhdr, p + peek_offset, sizeof(qhdr));
+            peek_offset += sizeof(qhdr);
+            stage_slab_bytes += qhdr.k_bytes + qhdr.v_bytes + qhdr.k_scale_bytes + qhdr.v_scale_bytes +
+                                qhdr.idx_tail_bytes + qhdr.idx_dead_bytes + qhdr.idx_pooled_bytes;
+            peek_offset += qhdr.k_bytes + qhdr.v_bytes + qhdr.k_scale_bytes + qhdr.v_scale_bytes +
+                           qhdr.idx_tail_bytes + qhdr.idx_dead_bytes + qhdr.idx_pooled_bytes;
+        }
+
+        hss.slab_.allocate(stage_slab_bytes);
+        uint8_t* slab_cursor = hss.slab_.data();
+
         if (shdr.gdn_bytes > 0) {
-            hss.gdn_data.resize(shdr.gdn_bytes);
+            hss.gdn_data.reset(slab_cursor, shdr.gdn_bytes);
             std::memcpy(hss.gdn_data.data(), p + offset, shdr.gdn_bytes);
             offset += shdr.gdn_bytes;
+            slab_cursor += shdr.gdn_bytes;
         }
         if (shdr.ple_bytes > 0) {
-            hss.ple_data.resize(shdr.ple_bytes);
+            hss.ple_data.reset(slab_cursor, shdr.ple_bytes);
             std::memcpy(hss.ple_data.data(), p + offset, shdr.ple_bytes);
             offset += shdr.ple_bytes;
+            slab_cursor += shdr.ple_bytes;
         }
         if (shdr.R_bytes > 0) {
-            hss.R_data.resize(shdr.R_bytes);
+            hss.R_data.reset(slab_cursor, shdr.R_bytes);
             std::memcpy(hss.R_data.data(), p + offset, shdr.R_bytes);
             offset += shdr.R_bytes;
+            slab_cursor += shdr.R_bytes;
         }
 
         hss.qsa_slices.resize(shdr.n_qsa_slices);
@@ -445,39 +491,46 @@ bool RadixNode::hydrate_from_nvme(NVMeStorageTier& nvme) {
             slice.has_idx_block_pos = qhdr.has_idx_block_pos != 0;
 
             if (qhdr.k_bytes > 0) {
-                slice.k_q.resize(qhdr.k_bytes);
+                slice.k_q.reset(slab_cursor, qhdr.k_bytes);
                 std::memcpy(slice.k_q.data(), p + offset, qhdr.k_bytes);
                 offset += qhdr.k_bytes;
+                slab_cursor += qhdr.k_bytes;
             }
             if (qhdr.v_bytes > 0) {
-                slice.v_q4.resize(qhdr.v_bytes);
+                slice.v_q4.reset(slab_cursor, qhdr.v_bytes);
                 std::memcpy(slice.v_q4.data(), p + offset, qhdr.v_bytes);
                 offset += qhdr.v_bytes;
+                slab_cursor += qhdr.v_bytes;
             }
             if (qhdr.k_scale_bytes > 0) {
-                slice.k_scale.resize(qhdr.k_scale_bytes);
+                slice.k_scale.reset(slab_cursor, qhdr.k_scale_bytes);
                 std::memcpy(slice.k_scale.data(), p + offset, qhdr.k_scale_bytes);
                 offset += qhdr.k_scale_bytes;
+                slab_cursor += qhdr.k_scale_bytes;
             }
             if (qhdr.v_scale_bytes > 0) {
-                slice.v_scale.resize(qhdr.v_scale_bytes);
+                slice.v_scale.reset(slab_cursor, qhdr.v_scale_bytes);
                 std::memcpy(slice.v_scale.data(), p + offset, qhdr.v_scale_bytes);
                 offset += qhdr.v_scale_bytes;
+                slab_cursor += qhdr.v_scale_bytes;
             }
             if (qhdr.idx_tail_bytes > 0) {
-                slice.idx_tail.resize(qhdr.idx_tail_bytes);
+                slice.idx_tail.reset(slab_cursor, qhdr.idx_tail_bytes);
                 std::memcpy(slice.idx_tail.data(), p + offset, qhdr.idx_tail_bytes);
                 offset += qhdr.idx_tail_bytes;
+                slab_cursor += qhdr.idx_tail_bytes;
             }
             if (qhdr.idx_dead_bytes > 0) {
-                slice.idx_dead.resize(qhdr.idx_dead_bytes);
+                slice.idx_dead.reset(slab_cursor, qhdr.idx_dead_bytes);
                 std::memcpy(slice.idx_dead.data(), p + offset, qhdr.idx_dead_bytes);
                 offset += qhdr.idx_dead_bytes;
+                slab_cursor += qhdr.idx_dead_bytes;
             }
             if (qhdr.idx_pooled_bytes > 0) {
-                slice.idx_pooled.resize(qhdr.idx_pooled_bytes);
+                slice.idx_pooled.reset(slab_cursor, qhdr.idx_pooled_bytes);
                 std::memcpy(slice.idx_pooled.data(), p + offset, qhdr.idx_pooled_bytes);
                 offset += qhdr.idx_pooled_bytes;
+                slab_cursor += qhdr.idx_pooled_bytes;
             }
         }
     }
@@ -1999,26 +2052,69 @@ std::shared_ptr<RadixNode> RadixTree::insert_direct_device_to_host(
             cudaStream_t cs = (cudaStream_t) streams[st];
             const auto* s = states[st];
 
-            if (s->gdn_alloc > 0 && s->gdn_state) {
-                const size_t gdn_bytes = (size_t) s->gdn_alloc * core::gdn_state_floats(g) * sizeof(float);
-                hss.gdn_data.resize(gdn_bytes);
-                cudaMemcpyAsync(hss.gdn_data.data(), s->gdn_state, gdn_bytes, cudaMemcpyDeviceToHost, cs);
+            // Pass 1: Compute total stage bytes for single coalesced slab allocation
+            size_t total_stage_bytes = 0;
+            size_t gdn_bytes = (s->gdn_alloc > 0 && s->gdn_state) ? ((size_t) s->gdn_alloc * core::gdn_state_floats(g) * sizeof(float)) : 0;
+            size_t ple_bytes = s->ple_hist ? ((size_t) core::ple_hist_bytes()) : 0;
+            const float* src_R = R_ptrs[st] ? R_ptrs[st] : s->block.R;
+            size_t R_bytes = src_R ? ((size_t) g.hc * g.n_embd * sizeof(float)) : 0;
+
+            total_stage_bytes += gdn_bytes + ple_bytes + R_bytes;
+
+            const int64_t pooled_rows = prefix_len / qs.idx_block;
+            const size_t idx_tail_bytes = (size_t) (qs.idx_block - 1) * qs.idx_dim * sizeof(float);
+            const size_t idx_dead_bytes = (size_t) qs.idx_dim * sizeof(float);
+            const size_t idx_pooled_bytes = (pooled_rows > 0) ? ((size_t) (pooled_rows + 1) * qs.idx_dim * sizeof(float)) : 0;
+
+            for (int64_t j = 0; j < s->qsa_alloc; ++j) {
+                const QsaState& qst = s->qsa_states[s->qsa_ord0 + j];
+                if (qst.kv_q4) {
+                    const size_t k_bytes = qsa_rows * strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
+                    if (qst.k_q4) total_stage_bytes += k_bytes;
+                    if (qst.v_q4) total_stage_bytes += k_bytes;
+                } else if (qst.kv_hybrid) {
+                    const size_t k_bytes = qsa_rows * qs.head_dim;
+                    const size_t sc_bytes = qsa_rows * (qs.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
+                    const size_t v_bytes = qsa_rows * strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
+                    if (qst.k_q) total_stage_bytes += k_bytes;
+                    if (qst.k_scale) total_stage_bytes += sc_bytes;
+                    if (qst.v_q4) total_stage_bytes += v_bytes;
+                } else if (qst.kv_int8) {
+                    const size_t k_bytes = qsa_rows * qs.head_dim;
+                    const size_t sc_bytes = qsa_rows * (qs.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
+                    if (qst.k_q) total_stage_bytes += k_bytes;
+                    if (qst.v_q) total_stage_bytes += k_bytes;
+                    if (qst.k_scale) total_stage_bytes += sc_bytes;
+                    if (qst.v_scale) total_stage_bytes += sc_bytes;
+                }
+                if (qst.idx_tail) total_stage_bytes += idx_tail_bytes;
+                if (qst.idx_dead) total_stage_bytes += idx_dead_bytes;
+                if (pooled_rows > 0 && qst.idx_pooled) total_stage_bytes += idx_pooled_bytes;
             }
 
-            if (s->ple_hist) {
-                const size_t ple_bytes = (size_t) core::ple_hist_bytes();
-                hss.ple_data.resize(ple_bytes);
+            hss.slab_.allocate(total_stage_bytes);
+            uint8_t* slab_cursor = hss.slab_.data();
+
+            // Pass 2: Carve PinnedSpan views from slab_ and issue async D2H transfers
+            if (gdn_bytes > 0) {
+                hss.gdn_data.reset(slab_cursor, gdn_bytes);
+                cudaMemcpyAsync(hss.gdn_data.data(), s->gdn_state, gdn_bytes, cudaMemcpyDeviceToHost, cs);
+                slab_cursor += gdn_bytes;
+            }
+
+            if (ple_bytes > 0) {
+                hss.ple_data.reset(slab_cursor, ple_bytes);
                 cudaMemcpyAsync(hss.ple_data.data(), s->ple_hist, ple_bytes, cudaMemcpyDeviceToHost, cs);
                 hss.ple_prev_saved[0] = s->ple_prev[0];
                 hss.ple_prev_saved[1] = s->ple_prev[1];
                 hss.ple_token_saved = s->ple_token;
+                slab_cursor += ple_bytes;
             }
 
-            const float* src_R = R_ptrs[st] ? R_ptrs[st] : s->block.R;
-            if (src_R) {
-                const size_t R_bytes = (size_t) g.hc * g.n_embd * sizeof(float);
-                hss.R_data.resize(R_bytes);
+            if (R_bytes > 0) {
+                hss.R_data.reset(slab_cursor, R_bytes);
                 cudaMemcpyAsync(hss.R_data.data(), src_R, R_bytes, cudaMemcpyDeviceToHost, cs);
+                slab_cursor += R_bytes;
             }
 
             hss.qsa_ord0 = s->qsa_ord0;
@@ -2033,71 +2129,79 @@ std::shared_ptr<RadixNode> RadixTree::insert_direct_device_to_host(
                     const size_t k_bytes = qsa_rows * strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
                     const size_t v_bytes = k_bytes;
                     if (qst.k_q4) {
-                        slice.k_q.resize(k_bytes);
+                        slice.k_q.reset(slab_cursor, k_bytes);
                         cudaMemcpyAsync(slice.k_q.data(), qst.k_q4, k_bytes, cudaMemcpyDeviceToHost, cs);
+                        slab_cursor += k_bytes;
                     }
                     if (qst.v_q4) {
-                        slice.v_q4.resize(v_bytes);
+                        slice.v_q4.reset(slab_cursor, v_bytes);
                         cudaMemcpyAsync(slice.v_q4.data(), qst.v_q4, v_bytes, cudaMemcpyDeviceToHost, cs);
+                        slab_cursor += v_bytes;
                     }
                 } else if (qst.kv_hybrid) {
                     const size_t k_bytes = qsa_rows * qs.head_dim;
                     const size_t sc_bytes = qsa_rows * (qs.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
                     const size_t v_bytes = qsa_rows * strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
                     if (qst.k_q) {
-                        slice.k_q.resize(k_bytes);
+                        slice.k_q.reset(slab_cursor, k_bytes);
                         cudaMemcpyAsync(slice.k_q.data(), qst.k_q, k_bytes, cudaMemcpyDeviceToHost, cs);
+                        slab_cursor += k_bytes;
                     }
                     if (qst.k_scale) {
-                        slice.k_scale.resize(sc_bytes);
+                        slice.k_scale.reset(slab_cursor, sc_bytes);
                         cudaMemcpyAsync(slice.k_scale.data(), qst.k_scale, sc_bytes, cudaMemcpyDeviceToHost, cs);
+                        slab_cursor += sc_bytes;
                     }
                     if (qst.v_q4) {
-                        slice.v_q4.resize(v_bytes);
+                        slice.v_q4.reset(slab_cursor, v_bytes);
                         cudaMemcpyAsync(slice.v_q4.data(), qst.v_q4, v_bytes, cudaMemcpyDeviceToHost, cs);
+                        slab_cursor += v_bytes;
                     }
                 } else if (qst.kv_int8) {
                     const size_t k_bytes = qsa_rows * qs.head_dim;
                     const size_t sc_bytes = qsa_rows * (qs.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
                     if (qst.k_q) {
-                        slice.k_q.resize(k_bytes);
+                        slice.k_q.reset(slab_cursor, k_bytes);
                         cudaMemcpyAsync(slice.k_q.data(), qst.k_q, k_bytes, cudaMemcpyDeviceToHost, cs);
+                        slab_cursor += k_bytes;
                     }
                     if (qst.v_q) {
-                        slice.v_q4.resize(k_bytes);
+                        slice.v_q4.reset(slab_cursor, k_bytes);
                         cudaMemcpyAsync(slice.v_q4.data(), qst.v_q, k_bytes, cudaMemcpyDeviceToHost, cs);
+                        slab_cursor += k_bytes;
                     }
                     if (qst.k_scale) {
-                        slice.k_scale.resize(sc_bytes);
+                        slice.k_scale.reset(slab_cursor, sc_bytes);
                         cudaMemcpyAsync(slice.k_scale.data(), qst.k_scale, sc_bytes, cudaMemcpyDeviceToHost, cs);
+                        slab_cursor += sc_bytes;
                     }
                     if (qst.v_scale) {
-                        slice.v_scale.resize(sc_bytes);
+                        slice.v_scale.reset(slab_cursor, sc_bytes);
                         cudaMemcpyAsync(slice.v_scale.data(), qst.v_scale, sc_bytes, cudaMemcpyDeviceToHost, cs);
+                        slab_cursor += sc_bytes;
                     }
                 }
 
-                const size_t idx_tail_bytes = (size_t) (qs.idx_block - 1) * qs.idx_dim * sizeof(float);
-                const size_t idx_dead_bytes = (size_t) qs.idx_dim * sizeof(float);
                 if (qst.idx_tail) {
-                    slice.idx_tail.resize(idx_tail_bytes);
+                    slice.idx_tail.reset(slab_cursor, idx_tail_bytes);
                     cudaMemcpyAsync(slice.idx_tail.data(), qst.idx_tail, idx_tail_bytes, cudaMemcpyDeviceToHost, cs);
+                    slab_cursor += idx_tail_bytes;
                 }
                 if (qst.idx_dead) {
-                    slice.idx_dead.resize(idx_dead_bytes);
+                    slice.idx_dead.reset(slab_cursor, idx_dead_bytes);
                     cudaMemcpyAsync(slice.idx_dead.data(), qst.idx_dead, idx_dead_bytes, cudaMemcpyDeviceToHost, cs);
+                    slab_cursor += idx_dead_bytes;
                 }
                 if (qst.idx_block_pos) {
                     slice.has_idx_block_pos = true;
                     cudaMemcpyAsync(&slice.idx_block_pos_val, qst.idx_block_pos, sizeof(int32_t), cudaMemcpyDeviceToHost, cs);
                 }
-                const int64_t pooled_rows = prefix_len / qs.idx_block;
                 if (pooled_rows > 0 && qst.idx_pooled) {
-                    const size_t idx_pooled_bytes = (size_t) (pooled_rows + 1) * qs.idx_dim * sizeof(float);
-                    slice.idx_pooled.resize(idx_pooled_bytes);
+                    slice.idx_pooled.reset(slab_cursor, idx_pooled_bytes);
                     cudaMemcpyAsync(slice.idx_pooled.data(), qst.idx_pooled, (size_t) pooled_rows * qs.idx_dim * sizeof(float), cudaMemcpyDeviceToHost, cs);
                     cudaMemcpyAsync((char*) slice.idx_pooled.data() + pooled_rows * qs.idx_dim * sizeof(float),
                                     qst.idx_dead, idx_dead_bytes, cudaMemcpyDeviceToHost, cs);
+                    slab_cursor += idx_pooled_bytes;
                 }
             }
         }
@@ -2121,12 +2225,6 @@ std::shared_ptr<RadixNode> RadixTree::insert_direct_device_to_host(
             }
         }
         if (!snap_ok) {
-            for (auto& hss2 : curr->stage_host_snapshots) {
-                hss2.gdn_data.free();
-                hss2.ple_data.free();
-                hss2.R_data.free();
-                hss2.qsa_slices.clear();
-            }
             curr->stage_host_snapshots.clear();
             return curr;
         }
