@@ -627,7 +627,10 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         // single path) - it is called when the prompt chunk has crossed every stage.
         s.stages.back().prompt.on_chunk = [slot](const float* residual, int64_t n, int64_t position, std::string& e) {
             std::vector<int32_t> next((size_t) n);
-            for (int64_t j = 0; j < n; ++j) next[(size_t) j] = (int32_t) slot->request.tokens[(size_t) (position + j + 1)];
+            for (int64_t j = 0; j < n; ++j)
+                next[(size_t) j] = (int32_t) (position + j + 1 < (int64_t) slot->request.tokens.size()
+                                                  ? slot->request.tokens[(size_t) (position + j + 1)]
+                                                  : 0);
             // Use the existing draft implementation; both slots share only immutable weights.
             return slot->draft->prefill(residual, next.data(), n, position, e);
         };
@@ -1664,7 +1667,10 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         auto* slot = &s;
         s.stages.back().prompt.on_chunk = [slot](const float* residual, int64_t n, int64_t position, std::string& e) {
             std::vector<int32_t> next((size_t) n);
-            for (int64_t j = 0; j < n; ++j) next[(size_t) j] = (int32_t) slot->request.tokens[(size_t) (position + j + 1)];
+            for (int64_t j = 0; j < n; ++j)
+                next[(size_t) j] = (int32_t) (position + j + 1 < (int64_t) slot->request.tokens.size()
+                                                  ? slot->request.tokens[(size_t) (position + j + 1)]
+                                                  : 0);
             return slot->draft->prefill(residual, next.data(), n, position, e);
         };
         s.brought_up = true;
@@ -2432,19 +2438,16 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 if (!core::Verifier::drive_passes(u.lane0, prev.valid ? prev.lane1 : nullptr, err)) return 1;
                 if (u.single) { if (!u.lane0->end_pass_window(u.T, nullptr, err)) return 1; }
                 else { if (!u.lane0->end_pass_batch(u.windows, err)) return 1; }
-                // LANE hostloop (epilogue-hide): freeze the previous unit's stage-1 outputs here, but
-                // run its epilogue (commit + drafts + prints) AFTER the new stage-1 launch below: the
-                // commit tail syncs and the draft chain's per-step syncs are host-bound and used to
-                // leave BOTH devices idle between the two drives.  Same calls, same per-object order,
-                // and the unit's slots are its own - the in-flight pass never touches them.
-                Unit ret;
+                // Stream Synchronization / Epilogue Decoupling: retire the previous unit HERE
+                // BEFORE launching the next stage-1 pass. Running retire_unit while stage-1 is in
+                // flight causes cudaStreamSynchronize(cs_) on CUDA 1 to hang while lane0 on CUDA 0
+                // waits on m_flagA_ (the #31 class: host in CUDA call while GPU spins on flag).
                 if (prev.valid) {
                     if (prev.single) { if (!prev.lane1->end_pass_window(prev.T, prev.out, err)) return 1; }
                     else { if (!prev.lane1->end_pass_batch(prev.chain, err)) return 1; }
                     target_ms += elapsed(prev.t_start);
                     target_rows += prev.single ? prev.T : [&] { int64_t r = 0; for (const auto& w : prev.windows) r += w.count; return r; }();
-                    ret = std::move(prev);
-                    ret.valid = true;
+                    if (!retire_unit(prev)) return 1;
                     prev.valid = false;
                     pipeline_in_flight = false;   // S26f4: a unit just retired; safe window until the next launch
                     // S26f6: the inter-unit moment is the only safe point that sees a slot whose prefill
@@ -2482,7 +2485,6 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                         // previous unit was already retired, so nothing is in flight; unit_parity is
                         // not advanced and the next round retries.
                         if (err.find("below VRAM reserve") == std::string::npos) return 1;
-                        if (ret.valid && !retire_unit(ret)) return 1;   // H3: do not drop the captured unit's epilogue
                         refuse_round(u.ready, err);
                         rotation = (rotation + 1) % m.slots.size();
                         continue;
@@ -2493,9 +2495,6 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 } else {
                     prev.valid = false;
                 }
-                // LANE hostloop: the previous unit's epilogue runs now - while u's stage-1 pass is in
-                // flight and the next stage-0 is being built - instead of idling both devices.
-                if (ret.valid && !retire_unit(ret)) return 1;
                 unit_parity = (unit_parity + 1) % 3;
                 ++rounds;
                 core::progress_beat();

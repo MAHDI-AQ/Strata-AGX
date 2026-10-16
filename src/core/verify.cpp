@@ -1748,6 +1748,7 @@ bool Verifier::launch_pass(int T, cudaEvent_t done, std::string& err) {
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
+    cur_layer_ = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     VDBG("staged; launching\n");
     // (sync invariant, rebased): the launch-time fetch count; end_pass_* syncs copy_
