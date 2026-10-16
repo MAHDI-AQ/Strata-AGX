@@ -558,9 +558,9 @@ def param_end(text: str, final: bool = False) -> int:
     at = text.find(PARAM_END)
     while at >= 0:
         after = text[at + len(PARAM_END):].lstrip()
-        if after.startswith(("<parameter=", FUNC_END)):
+        if after.startswith(("<parameter=", FUNC_END, CALL_END)):
             return at
-        if not after or "<parameter=".startswith(after) or FUNC_END.startswith(after):
+        if not after or "<parameter=".startswith(after) or FUNC_END.startswith(after) or CALL_END.startswith(after):
             return at if final else -2
         at = text.find(PARAM_END, at + 1)
     return -1
@@ -969,9 +969,16 @@ class OutputParser:
         out: list[Event] = []
         while True:
             if self.state == "rcall":
-                # #804: a `<tool_call>` inside the reasoning, with tools declared.  It is held whole (never streamed
-                # as a call) until it ends: a declared name is then a tool call, anything else stays reasoning text.
+                # #804: a `<tool_call>` inside the reasoning, with tools declared.
                 body = self.buf[len(CALL_START):]
+                if not self.fence and not self.ticks and self.line.strip() == "":
+                    name = extract_call_name(body)
+                    if name and name in self.schemas:
+                        out += self._release(False)
+                        self.buf = body
+                        self._reset_scan()
+                        self.state, self.lead = "call", False
+                        continue
                 end, think = call_end(body), body.find(THINK_END)
                 if end >= 0 and (think < 0 or think >= end):
                     call = None
@@ -1034,6 +1041,8 @@ class OutputParser:
                     s_buf = self.buf.lstrip()
                     if s_buf.startswith(CALL_END):
                         self.buf = s_buf[len(CALL_END):].lstrip()
+                    elif s_buf.startswith(THINK_END):
+                        self.buf = s_buf[len(THINK_END):].lstrip()
                     elif s_buf.startswith(CALL_START):
                         after_probe = s_buf[len(CALL_START):].lstrip()
                         if after_probe.startswith(CALL_START):
