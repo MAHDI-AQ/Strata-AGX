@@ -16,6 +16,7 @@
 // Layout: activations are (n_in/32) ggml Q8_0 blocks, 34 bytes each - `fp16 d` then `int8 qs[32]` - produced by
 // `strata::kernels::quantize_q8_0`.  A quad of four elements lies inside one 32-element block, so the block
 // scale is constant across it and is loaded once.
+#include <unistd.h>
 #include "strata/kernels/s2_gemv_q8.hpp"
 
 #include <cuda_fp16.h>
@@ -79,7 +80,7 @@ void s2_gemv_q8(const uint8_t* act, const uint8_t* codes, const float* scales, f
     if (n_in <= 0 || n_out <= 0) return;
     if (n_in % QK8_0 != 0 || n_in % QK_S2 != 0) {
         std::fprintf(stderr, "s2_gemv_q8: n_in %lld must be a multiple of %d\n", (long long) n_in, QK_S2);
-        std::exit(1);
+        _exit(1);
     }
     const size_t smem = (size_t) threads_per_row * sizeof(float);
     s2_gemv_q8_kernel<<<(unsigned) n_out, threads_per_row, smem, (cudaStream_t) stream>>>(act, codes, scales, y,
@@ -88,7 +89,7 @@ void s2_gemv_q8(const uint8_t* act, const uint8_t* codes, const float* scales, f
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "s2_gemv_q8 launch: %s\n", cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
     if (stream == nullptr) cudaDeviceSynchronize();
 }

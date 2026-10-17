@@ -3,6 +3,7 @@
 // Naive per the phase rule: dequantize on the fly, FP32 accumulation inside the row, no shared memory, no
 // vector loads, no __ldg hints.  Phase 3 changes this file; the parity test is what says whether a change is
 // still right.
+#include <unistd.h>
 #include "strata/kernels/s2_gemv.hpp"
 
 #include <cuda_fp16.h>
@@ -48,7 +49,7 @@ void s2_gemv(const uint16_t* x, const uint8_t* codes, const float* scales, float
     if (n_in <= 0 || n_out <= 0) return;
     if (n_in % QK != 0) {
         std::fprintf(stderr, "s2_gemv: n_in %lld is not a multiple of %d\n", (long long) n_in, QK);
-        std::exit(1);
+        _exit(1);
     }
     const int threads = 128;
     const long long blocks = (n_out + threads - 1) / threads;
@@ -56,7 +57,7 @@ void s2_gemv(const uint16_t* x, const uint8_t* codes, const float* scales, float
     const cudaError_t e = cudaDeviceSynchronize();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "s2_gemv: %s\n", cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
 }
 

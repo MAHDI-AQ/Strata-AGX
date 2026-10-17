@@ -120,6 +120,8 @@ public:
     void set_batch_parallel(bool enabled) { batch_parallel_ = enabled; }
     /// Diagnostics: row `t` of the last window's head logits (n_vocab floats) to the host. Valid after run().
     bool copy_logits(int t, float* host) const;
+    /// Target draft probability for draft token t in the last window (Leviathan residual sampling). Valid after run().
+    float target_draft_prob(int t) const;
     int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
     /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
     /// request; greedy by default.  The sampling itself runs OUTSIDE the captured graph - its
@@ -335,6 +337,7 @@ private:
     int32_t* h_commit_ = nullptr; int32_t* m_commit_ = nullptr; // [n_keep, n_keep-1, pos_0 .. pos_{T-1}]
     float* h_ple_ = nullptr;     float* m_ple_ = nullptr;       // T * n_embd
     int32_t* h_out_ = nullptr;   int32_t* m_out_ = nullptr;     // T argmax ids
+    float* h_probs_ = nullptr;   float* m_probs_ = nullptr;     // T target draft probabilities (ALGO-02)
     float* h_x_ = nullptr;       float* m_x_ = nullptr;         // doorbell payload: T * n_embd
     int32_t* h_ids_ = nullptr;   int32_t* m_ids_ = nullptr;     // T * k
     float* h_w_ = nullptr;       float* m_w_ = nullptr;         // T * k
@@ -371,6 +374,8 @@ private:
     float *qfull_ = nullptr, *qcur_ = nullptr, *kcur_ = nullptr, *vcur_ = nullptr, *idx_raw_L_ = nullptr;
     float *qidx_ = nullptr, *scores_ = nullptr, *attn_ = nullptr, *attn32_ = nullptr, *attn_scratch_ = nullptr;
     float* tail_snap_ = nullptr;                              // per QSA layer
+    int32_t* block_pos_snap_ = nullptr;                       // per QSA layer (ALGO-03)
+    float* pooled_snap_ = nullptr;                            // per QSA layer (ALGO-03)
     int32_t* sel_ = nullptr;
     float *logits_ = nullptr, *w_ = nullptr, *shared_ = nullptr, *parts_ = nullptr, *hit_out_ = nullptr;
     int32_t *ids_ = nullptr, *hit_slot_ = nullptr, *hit_dst_ = nullptr, *hit_count_ = nullptr;

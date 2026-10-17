@@ -117,7 +117,7 @@ void native_rope_set_enabled(bool value) { enabled.store(value, std::memory_orde
 bool native_rope_enabled() { return enabled.load(std::memory_order_relaxed); }
 void native_rope_apply(const float* x, float* out, int rows, int head_dim,
                        int n_rot, const RopeScaling& scaling, const int* positions, void* stream) {
-    if (!x || !out || !positions || !stream || rows < 1 || rows > 65535 ||
+    if (!x || !out || !positions || !stream || rows < 1 || rows > 1048576 ||
         (head_dim != 128 && head_dim != 256) || n_rot != 64 ||
         rope_scaling_invalid(scaling) != nullptr ||
         reinterpret_cast<uintptr_t>(x) % 4 || reinterpret_cast<uintptr_t>(out) % 4 ||

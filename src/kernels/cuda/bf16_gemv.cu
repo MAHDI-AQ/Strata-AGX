@@ -1,4 +1,5 @@
 // src/kernels/cuda/bf16_gemv.cu - the BF16 GEMV.  See the header for why it is not `s_gemv`.
+#include <unistd.h>
 #include "strata/kernels/bf16_gemv.hpp"
 
 #include "strata/kernels/bf16_bits.hpp"
@@ -69,13 +70,13 @@ inline void finish(void* stream, const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "%s launch: %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
     if (stream != nullptr) return;
     const cudaError_t s = cudaDeviceSynchronize();
     if (s != cudaSuccess) {
         std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(s));
-        std::exit(1);
+        _exit(1);
     }
 }
 
@@ -130,7 +131,7 @@ void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_i
     if (threads_per_row <= 0 || (threads_per_row & (threads_per_row - 1)) != 0) {
         std::fprintf(stderr, "bf16_gemv_split: threads_per_row %d must be a power of two (32 selects the "
                              "warp-per-row path)\n", threads_per_row);
-        std::exit(1);
+        _exit(1);
     }
     const unsigned grid = (unsigned) n_out;
     bf16_gemv_split_kernel<<<grid, threads_per_row, (size_t) threads_per_row * sizeof(float),

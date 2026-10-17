@@ -2,6 +2,7 @@
 //
 // See include/strata/kernels/gdn.hpp for the state layout (S, h_v, S) and for why the recurrence needs no
 // barrier at all: every line of it touches only one (j, h) column, so one thread owns a column end to end.
+#include <unistd.h>
 #include "strata/kernels/gdn.hpp"
 
 #include <cuda_runtime.h>
@@ -156,7 +157,7 @@ void gdn_step(float* state, const float* q, const float* k, const float* v, cons
     if (s.S > 128) {
         std::fprintf(stderr, "gdn_step: S = %lld exceeds the staged 128 (`ks`/`qs` are [8][128])\n",
                      (long long) s.S);
-        std::exit(1);
+        _exit(1);
     }
     const dim3 grid((unsigned) ((s.S + JTHREADS - 1) / JTHREADS),
                     (unsigned) ((s.h_v + MAX_H - 1) / MAX_H));
@@ -166,7 +167,7 @@ void gdn_step(float* state, const float* q, const float* k, const float* v, cons
         const cudaError_t e = cudaDeviceSynchronize();
         if (e != cudaSuccess) {
             std::fprintf(stderr, "gdn_step: %s\n", cudaGetErrorString(e));
-            std::exit(1);
+            _exit(1);
         }
     }
 }
@@ -181,7 +182,7 @@ void gdn_conv_step(float* conv_state, const float* x, const float* kW, float* ou
         const cudaError_t e = cudaDeviceSynchronize();
         if (e != cudaSuccess) {
             std::fprintf(stderr, "gdn_conv_step: %s\n", cudaGetErrorString(e));
-            std::exit(1);
+            _exit(1);
         }
     }
 }
@@ -190,14 +191,14 @@ void gdn_l2_norm(float* x, int64_t rows, int64_t cols, float eps, void* stream) 
     if (rows <= 0 || cols <= 0) return;
     if (cols > 1024) {
         std::fprintf(stderr, "gdn_l2_norm: cols = %lld exceeds the 1024-wide warp reduction\n", (long long) cols);
-        std::exit(1);
+        _exit(1);
     }
     gdn_l2_kernel<<<(unsigned) rows, 32, 0, (cudaStream_t) stream>>>(x, (int) cols, eps);
     if (stream == nullptr) {
         const cudaError_t e = cudaDeviceSynchronize();
         if (e != cudaSuccess) {
             std::fprintf(stderr, "gdn_l2_norm: %s\n", cudaGetErrorString(e));
-            std::exit(1);
+            _exit(1);
         }
     }
 }
@@ -227,7 +228,7 @@ void gdn_beta_gate(float* beta, int64_t h_v, void* stream) {
         const cudaError_t e = cudaDeviceSynchronize();
         if (e != cudaSuccess) {
             std::fprintf(stderr, "gdn_beta_gate: %s\n", cudaGetErrorString(e));
-            std::exit(1);
+            _exit(1);
         }
     }
 }
@@ -240,7 +241,7 @@ void gdn_out_norm(const float* o, const float* z, const float* ssm_norm, float* 
         const cudaError_t e = cudaDeviceSynchronize();
         if (e != cudaSuccess) {
             std::fprintf(stderr, "gdn_out_norm: %s\n", cudaGetErrorString(e));
-            std::exit(1);
+            _exit(1);
         }
     }
 }

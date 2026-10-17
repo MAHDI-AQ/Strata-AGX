@@ -26,6 +26,7 @@
 // Both changes alter the summation order or the expression, so this kernel is checked against the naive
 // reference like every other one - being faster is never a reason to be trusted, and being neutral is not
 // either.
+#include <unistd.h>
 #include "strata/kernels/s_gemv.hpp"
 
 #include <cuda_fp16.h>
@@ -59,7 +60,7 @@ void ensure_lut() {
     const cudaError_t e = cudaMemcpyToSymbol(c_codes, host, sizeof(host));
     if (e != cudaSuccess) {
         std::fprintf(stderr, "s2_gemv_fast: cudaMemcpyToSymbol failed: %s\n", cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
     g_lut_ready[dev] = true;
 }
@@ -126,13 +127,13 @@ void s2_gemv_fast(const uint16_t* x, const uint8_t* codes, const float* scales, 
     if (n_in <= 0 || n_out <= 0) return;
     if (n_in % 4 != 0 || n_in % QK_S2 != 0) {
         std::fprintf(stderr, "s2_gemv_fast: n_in %lld must be a multiple of %d\n", (long long) n_in, QK_S2);
-        std::exit(1);
+        _exit(1);
     }
     ensure_lut();
     if (stage_x && n_in > MAX_SHARED_HALVES) {
         std::fprintf(stderr, "s2_gemv_fast: n_in %lld exceeds the %d-half shared staging limit\n",
                      (long long) n_in, MAX_SHARED_HALVES);
-        std::exit(1);
+        _exit(1);
     }
     const size_t smem = (stage_x ? MAX_SHARED_HALVES * sizeof(__half) : 0) +
                         (size_t) threads_per_row * sizeof(float);
@@ -146,7 +147,7 @@ void s2_gemv_fast(const uint16_t* x, const uint8_t* codes, const float* scales, 
     const cudaError_t e = cudaDeviceSynchronize();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "s2_gemv_fast: %s\n", cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
 }
 

@@ -4,6 +4,7 @@
 // (ggml/src/ggml-cuda/vecdotq.cuh, dequantize.cuh, quantize.cu at the commit in third_party/ggml/VERSION.txt;
 // MIT license, third_party/ggml/LICENSE).  The block structs and codebook grids come from its ggml-common.h,
 // included unchanged.
+#include <unistd.h>
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/dp4a.hpp"
 
@@ -22,7 +23,7 @@ namespace {
 
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e)); _exit(1); }
 }
 
 // ---------------------------------------------------------------- llama.cpp helpers (vecdotq.cuh)
@@ -1462,13 +1463,13 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
 #define STRATA_MMVQ(T) case T: launch_mmvq<T>(W, rb, X, y, n_in, n_out, ncols, s); break;
         STRATA_MMVQ_FMTS(STRATA_MMVQ)
 #undef STRATA_MMVQ
-        default: std::fprintf(stderr, "iq_mmvq: type %d is not supported\n", t); std::exit(1);
+        default: std::fprintf(stderr, "iq_mmvq: type %d is not supported\n", t); _exit(1);
     }
     check("iq_mmvq");
 }
 
 void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream) {
-    if (n % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
+    if (n % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); _exit(1); }
     dequant_flat_kernel<__half><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(t, src, (__half*) dst);
     check("iq_dequant_f16");
 }
@@ -1486,21 +1487,21 @@ __global__ void embed_rows_kernel(int ty, const uint8_t* __restrict__ table, siz
 void iq_embed_rows(int t, const void* table, size_t row_bytes, const int32_t* tokens, int64_t n_tok, int64_t n_embd,
                    float* out, void* stream) {
     if (n_tok <= 0) return;
-    if (n_embd % 256 != 0 || !embed_type_supported(t)) { std::fprintf(stderr, "iq_embed_rows: bad arguments\n"); std::exit(1); }
+    if (n_embd % 256 != 0 || !embed_type_supported(t)) { std::fprintf(stderr, "iq_embed_rows: bad arguments\n"); _exit(1); }
     embed_rows_kernel<<<dim3((unsigned) (n_embd / 256), (unsigned) n_tok), 32, 0, (cudaStream_t) stream>>>(
         t, (const uint8_t*) table, row_bytes, tokens, n_embd, out);
     check("iq_embed_rows");
 }
 
 void iq_dequant_f32(int t, const void* src, int64_t n, float* dst, void* stream) {
-    if (n % 256 != 0 || !embed_type_supported(t)) { std::fprintf(stderr, "iq_dequant_f32: bad arguments\n"); std::exit(1); }
+    if (n % 256 != 0 || !embed_type_supported(t)) { std::fprintf(stderr, "iq_dequant_f32: bad arguments\n"); _exit(1); }
     dequant_flat_kernel<float><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(t, src, dst);
     check("iq_dequant_f32");
 }
 
 void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst, void* stream) {
     // checked like the other entry points: an unknown type used to leave `dst` unwritten, a wrong prompt and no error
-    if (n_embd % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_gu_f16: type %d / %lld\n", t, (long long) n_embd); std::exit(1); }
+    if (n_embd % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_gu_f16: type %d / %lld\n", t, (long long) n_embd); _exit(1); }
     const int64_t per_row = n_embd / 256;
     dequant_gu_kernel<<<dim3((unsigned) (n_ff * per_row), 2), 32, 0, (cudaStream_t) stream>>>(t, gate, up, per_row,
                                                                                            (__half*) dst);
@@ -1543,7 +1544,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                            int64_t grid_groups) {
     if (cap_groups <= 0 || cap_entries <= 0) return;
-    if (L.n_ff % 32 != 0) { std::fprintf(stderr, "native_expert_grouped: n_ff %lld\n", (long long) L.n_ff); std::exit(1); }
+    if (L.n_ff % 32 != 0) { std::fprintf(stderr, "native_expert_grouped: n_ff %lld\n", (long long) L.n_ff); _exit(1); }
     cudaStream_t s = (cudaStream_t) stream;
     const size_t f = (size_t) cap_entries * (size_t) L.n_ff * sizeof(float), fa = (f + 255) & ~(size_t) 255;
     float* gate = (float*) scratch;
@@ -1558,7 +1559,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #define STRATA_GU(T) case T: launch_gu<T>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         STRATA_GU_FMTS(STRATA_GU)
 #undef STRATA_GU
-        default: std::fprintf(stderr, "native_expert_grouped: gate/up type %d\n", L.gu_type); std::exit(1);
+        default: std::fprintf(stderr, "native_expert_grouped: gate/up type %d\n", L.gu_type); _exit(1);
     }
     check("native_expert_grouped/gu");
     const long long nh = (long long) cap_entries * L.n_ff;
@@ -1575,7 +1576,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #define STRATA_DOWN(T) case T: launch_down<T>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         STRATA_D_FMTS(STRATA_DOWN)
 #undef STRATA_DOWN
-        default: std::fprintf(stderr, "native_expert_grouped: down type %d\n", L.d_type); std::exit(1);
+        default: std::fprintf(stderr, "native_expert_grouped: down type %d\n", L.d_type); _exit(1);
     }
     check("native_expert_grouped/down");
 }

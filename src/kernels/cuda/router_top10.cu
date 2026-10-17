@@ -58,6 +58,7 @@
 //     produced - computed in ONE parallel pass over the experts instead of k serial ones.  It is O(n^2)
 //     comparisons and that is the right trade here: n = 512, every comparison is independent, and the old
 //     version was O(k*n) with a serial `exp` inside.
+#include <unistd.h>
 #include "strata/kernels/router_top10.hpp"
 
 #include <cuda_runtime.h>
@@ -353,13 +354,13 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
             const cudaError_t e = cudaGetLastError();
             if (e != cudaSuccess) {
                 std::fprintf(stderr, "router_top10 launch: %s\n", cudaGetErrorString(e));
-                std::exit(1);
+                _exit(1);
             }
             if (stream == nullptr) {
                 const cudaError_t s = cudaDeviceSynchronize();
                 if (s != cudaSuccess) {
                     std::fprintf(stderr, "router_top10: %s\n", cudaGetErrorString(s));
-                    std::exit(1);
+                    _exit(1);
                 }
             }
             return;
@@ -369,12 +370,12 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
     if (n_tokens <= 0 || n_expert <= 0 || k <= 0) return;
     if (k > 64) {
         std::fprintf(stderr, "router_top10: k %d exceeds the kernel's 64\n", k);
-        std::exit(1);
+        _exit(1);
     }
     if (n_expert > RT_MAX_THREADS * 64) {
         std::fprintf(stderr, "router_top10: n_expert %d is past the kernel's %d\n", n_expert,
                      RT_MAX_THREADS * 64);
-        std::exit(1);
+        _exit(1);
     }
     int threads = n_expert < RT_MAX_THREADS ? n_expert : RT_MAX_THREADS;
     threads = (threads + 31) & ~31;                  // at least one full warp, for the reductions
@@ -388,13 +389,13 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "router_top10 launch: %s\n", cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
     if (stream == nullptr) {
         const cudaError_t s = cudaDeviceSynchronize();
         if (s != cudaSuccess) {
             std::fprintf(stderr, "router_top10: %s\n", cudaGetErrorString(s));
-            std::exit(1);
+            _exit(1);
         }
     }
 }

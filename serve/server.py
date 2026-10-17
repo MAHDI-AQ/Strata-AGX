@@ -49,7 +49,7 @@ from typing import Iterator, Protocol
 from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
-STRATA_AGX_VERSION = "0.1.38-agx.1.0.5"
+STRATA_AGX_VERSION = "0.1.40-agx.4.5.0"
 
 def get_git_commit() -> str:
     commit = os.environ.get("STRATA_COMMIT")
@@ -502,7 +502,12 @@ class StrataEngine:
                             try:
                                 channel.put_nowait(payload)
                             except queue.Full:
-                                pass
+                                # CRIT-05: Do not drop tokens silently under SHM backpressure.
+                                # Send error sentinel so consumer terminates cleanly rather than corrupting context.
+                                try:
+                                    channel.put_nowait("ERR queue_full\n")
+                                except Exception:
+                                    pass
             if not had_any:
                 time.sleep(0.0002)
 
@@ -516,7 +521,7 @@ class StrataEngine:
             if len(fields) != 3 or fields[0] != "R" or not fields[1].isdigit():
                 continue
             number, payload = int(fields[1]), fields[2]
-            if getattr(self, "_shm_active", False) and (payload.startswith("T ") or payload.startswith("PP ")):
+            if getattr(self, "_shm_active", False) and payload.startswith("PP "):
                 continue
             overflow = False
             with self._channels_lock:
@@ -1260,6 +1265,65 @@ class Detokenizer:
         return delta
 
 
+class _StreamWithHeartbeat:
+    """Ensure heartbeat comment frames (: keep-alive\n\n) are sent every 3s during prompt prefill
+    or engine stalls so clients never stall or trigger a 60s timeout."""
+    def __init__(self, items, interval: float = 3.0):
+        self.items = items
+        self.interval = interval
+        self.q = queue.Queue(maxsize=64)
+        self.done = object()
+        self.exc = []
+        self.closed = False
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        try:
+            for item in self.items:
+                if self.closed:
+                    break
+                while not self.closed:
+                    try:
+                        self.q.put((True, item), timeout=0.5)
+                        break
+                    except queue.Full:
+                        continue
+        except BaseException as e:
+            self.exc.append(e)
+        finally:
+            while not self.closed:
+                try:
+                    self.q.put((False, self.done), timeout=0.5)
+                    break
+                except queue.Full:
+                    continue
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        while not self.closed:
+            try:
+                ok, val = self.q.get(timeout=self.interval)
+                if not ok and val is self.done:
+                    if self.exc:
+                        raise self.exc[0]
+                    raise StopIteration
+                return val
+            except queue.Empty:
+                return None
+        raise StopIteration
+
+    def close(self):
+        self.closed = True
+        try:
+            if hasattr(self.items, "close"):
+                self.items.close()
+        except Exception:
+            pass
+
+
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
@@ -1621,17 +1685,60 @@ class Service:
             p_total = t.get("prompt_tokens", 0)
             p_reused = t.get("reused", 0)
             hit_rate = round((p_reused / p_total) * 100, 1) if p_total > 0 else 0.0
+        with self.status_lock:
+            slots_data = list(self.slots_state.values())
+            active_slots = sum(1 for sl in slots_data if sl.get("status") in ("reading", "generating"))
+            # Track both live in-flight tokens and retained KV cache tokens residing in slots
+            inflight_tokens = sum((sl.get("prompt_tokens", 0) or 0) + (sl.get("generated", 0) or 0)
+                                  for sl in slots_data if sl.get("status") in ("reading", "generating"))
+            retained_tokens = sum((sl.get("last_request", {}).get("prompt_tokens", 0) or 0) +
+                                  (sl.get("last_request", {}).get("output_tokens", 0) or 0)
+                                  for sl in slots_data if sl.get("status") == "idle" and sl.get("last_request"))
+            total_active_tokens = inflight_tokens if inflight_tokens > 0 else retained_tokens
+        exp_cnt = int(getattr(self.engine, "info", {}).get("expert_slots", 0) or 0)
+        eng_info = getattr(self.engine, "info", {})
+        kv_quant = eng_info.get("kv", "q4_0").upper()
+        conc_slots = eng_info.get("concurrency", len(slots_data) or 2)
+        ctx_k = int(eng_info.get("max_context", 262144) or 262144) // 1024
+        max_vram_toks = conc_slots * ctx_k * 1024
+        l2_cap_gib = float(os.environ.get("STRATA_RADIX_HOST_GIB") or 4.0)
+        l3_cap_gib = float(os.environ.get("STRATA_RADIX_NVME_MAX_GIB") or 128.0)
+
+        l2_bytes = getattr(self.engine, "last", {}).get("l2_host_bytes", 0)
+        l2_gib = round(l2_bytes / (1024**3), 2)
+        l3_gib = round(l3_bytes / (1024**3), 1)
+        l2_active_nodes = 0 if l2_bytes == 0 else total_nodes
+
         return {
-            "l1_vram_snapshots": 4,
-            "l1_vram_mib": 1600.0,
-            "l2_host_slots": 64,
-            "l2_host_gib": 32.0,
+            # L1 VRAM Tier (Working KV Cache)
+            "l1_slots": conc_slots,
+            "l1_active_slots": active_slots,
+            "l1_active_tokens": total_active_tokens,
+            "l1_total_tokens": max_vram_toks,
+            "l1_max_tokens": max_vram_toks,
+            "l1_kv_quant": kv_quant,
+            "l1_display": f"{total_active_tokens:,} / {max_vram_toks:,} toks ({active_slots}/{conc_slots} slots)" if active_slots > 0 else f"{total_active_tokens:,} / {max_vram_toks:,} toks (retained)",
+
+            # L2 Host RAM Tier (Parked DDR4 Prefix Nodes)
+            "l2_host_slots": 16,
+            "l2_host_nodes": l2_active_nodes,
+            "l2_host_bytes": l2_bytes,
+            "l2_host_gib": l2_gib,
+            "l2_host_limit_gib": l2_cap_gib,
+            "l2_display": f"{l2_active_nodes} nodes · {l2_gib} GiB ({int(l2_cap_gib)} GiB cap)",
+
+            # L3 NVMe Tier (DirectStorage Disk Snapshots)
             "l3_nvme_snapshots": l3_snapshots,
-            "l3_nvme_gib": round(l3_bytes / (1024**3), 2),
+            "l3_nvme_gib": l3_gib,
+            "l3_nvme_limit_gib": l3_cap_gib,
+            "l3_display": f"{total_nodes} nodes · {l3_snapshots} snap · {l3_gib} GiB ({int(l3_cap_gib)} GiB cap)",
+
+            # Global metrics
+            "resident_experts": exp_cnt,
             "total_nodes": total_nodes,
             "cached_prefix_tokens": p_reused,
             "hit_rate": hit_rate,
-            "cache_tier": "3-Tier (VRAM -> Host -> NVMe)"
+            "cache_tier": "3-Tier (VRAM -> Host DDR4 -> NVMe SSD)"
         }
 
     def _mtp_stats(self) -> dict:
@@ -1756,11 +1863,50 @@ class Service:
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
+    def encode_prompt(self, messages, tools, kwargs):
+        """Render and encode messages so that template structural tokens become control tokens,
+        while user prompt text cannot synthesize <|im_start|> or <|im_end|> control tokens."""
+        specials = (
+            "<|im_start|>", "<|im_end|>", "<|endoftext|>",
+            "<|vision_start|>", "<|vision_end|>", "<|video_start|>", "<|video_end|>",
+            "<|image_pad|>", "<|video_pad|>",
+            "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>"
+        )
+        token_sub = {s: f"\x00_STRATA_RAW_{i}_{uuid.uuid4().hex}_\x00" for i, s in enumerate(specials)}
+
+        def _escape(obj):
+            if isinstance(obj, str):
+                for s, sub in token_sub.items():
+                    if s in obj:
+                        obj = obj.replace(s, sub)
+                return obj
+            elif isinstance(obj, list):
+                return [_escape(x) for x in obj]
+            elif isinstance(obj, dict):
+                return {k: _escape(v) for k, v in obj.items()}
+            return obj
+
+        esc_messages = _escape(messages)
+        esc_tools = _escape(tools) if tools else None
+        prompt = self.template.render(esc_messages, tools=esc_tools, **kwargs)
+
+        pattern = re.compile("(" + "|".join(re.escape(sub) for sub in token_sub.values()) + ")")
+        parts = pattern.split(prompt)
+        rev = {sub: s for s, sub in token_sub.items()}
+        ids = []
+        for part in parts:
+            if not part:
+                continue
+            if part in rev:
+                ids.extend(self.tok.encode(rev[part], parse_special=False))
+            else:
+                ids.extend(self.tok.encode(part, parse_special=True))
+        return ids
+
     def prepare(self, messages, tools, kwargs, max_new=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context."""
-        prompt = self.template.render(messages, tools=tools, **kwargs)
-        ids = self.tok.encode(prompt, parse_special=True)
+        ids = self.encode_prompt(messages, tools, kwargs)
         self.embeddings.path = None
         images = images_of(messages)
         if images:
@@ -2991,6 +3137,7 @@ def make_handler(svc: Service):
             chunks = self._capture(chunks, "openai")
             if not req.get("stream"):
                 return self._json(200, openai_collect(chunks))
+            chunks = _StreamWithHeartbeat(chunks, 3.0)
             self._sse()
             try:
                 for c in chunks:
@@ -3022,8 +3169,7 @@ def make_handler(svc: Service):
             read for the same request, rendered and tokenized - the model does not run."""
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
-            prompt = svc.template.render(messages, tools=tools, **kw)
-            self._json(200, {"input_tokens": len(svc.tok.encode(prompt, parse_special=True))})
+            self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
 
         def _anthropic(self, req):
             svc.load()
@@ -3039,6 +3185,7 @@ def make_handler(svc: Service):
             events = self._capture(events, "anthropic")
             if not req.get("stream"):
                 return self._json(200, anthropic_collect(events))
+            events = _StreamWithHeartbeat(events, 3.0)
             self._sse()
             try:
                 for item in events:

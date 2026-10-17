@@ -19,6 +19,7 @@
 //     block per token, `top_k` block-argmax rounds, each over the logits after the previous pick;
 //   - `sampler_kernel` (`STRATA_OLD_SAMPLER=1`), the kernel of engine 0.1.20, kept as the reference.
 // The two new ones share `sampled_tail_warp` (top_p / min_p / temperature / draw on one warp).
+#include <unistd.h>
 #include "strata/kernels/sampler.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/emulate.hpp"
@@ -973,7 +974,7 @@ bool sample_greedy_cluster(const float* logits, int n_tokens, int n_vocab, int* 
     const cudaError_t e = cudaLaunchKernelEx(&cfg, sampler_greedy_cluster_kernel, logits, n_vocab, out);
     if (e != cudaSuccess) {
         std::fprintf(stderr, "sample_tokens cluster launch: %s\n", cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
     return true;
 #endif
@@ -990,7 +991,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
     if (p.penalty_last_n > 0 && (history == nullptr || history_len <= 0)) {
         std::fprintf(stderr, "sample_tokens: penalty_last_n %d needs a history (got %p, len %d)\n",
                      p.penalty_last_n, (const void*) history, history_len);
-        std::exit(1);
+        _exit(1);
     }
     const unsigned shmem = (history != nullptr && history_len > 0 && p.penalty_last_n > 0)
                                ? (unsigned) ((n_vocab + 31) / 32) * sizeof(unsigned)   // the penalty bitmap
@@ -1038,7 +1039,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "sample_tokens launch: %s\n", cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
     if (stream == nullptr) cudaDeviceSynchronize();
 }
@@ -1050,7 +1051,7 @@ void coupled_check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "%s launch: %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
 }
 }  // namespace
@@ -1073,7 +1074,7 @@ void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const
     const int n_blocks = coupled_blocks(nv), kpart = coupled_kpart(nv);
     if (nv <= 0 || n_blocks > kSplitMaxBlocks || scratch == nullptr) {
         std::fprintf(stderr, "coupled_draft_sample: %d logits need scratch and at most %d blocks\n", nv, kSplitMaxBlocks);
-        std::exit(1);
+        _exit(1);
     }
     coupled_penalize_kernel<<<1, 1024, (unsigned) ((nv + 31) / 32) * sizeof(unsigned), s>>>(logits, nv, id_to_sub,
                                                                                            id_vocab, params, ring, cap, j);

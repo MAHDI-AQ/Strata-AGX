@@ -86,16 +86,21 @@ void test_radix_node_l3_offload_and_hydration(NVMeStorageTier& nvme) {
         hss.ple_prev_saved[0] = 1234;
         hss.ple_prev_saved[1] = 5678;
         hss.ple_token_saved = 999;
-        hss.gdn_data.resize(65536);
+        hss.slab_.allocate(65536 + 3 * 2 * 16384);
+        uint8_t* cur = hss.slab_.data();
+        hss.gdn_data.reset(cur, 65536);
         std::memset(hss.gdn_data.data(), static_cast<int>(st + 1), 65536);
+        cur += 65536;
 
         hss.qsa_slices.resize(3);
         for (size_t j = 0; j < 3; ++j) {
             auto& slice = hss.qsa_slices[j];
-            slice.k_q.resize(16384);
+            slice.k_q.reset(cur, 16384);
             std::memset(slice.k_q.data(), static_cast<int>(st * 10 + j), 16384);
-            slice.v_q4.resize(16384);
+            cur += 16384;
+            slice.v_q4.reset(cur, 16384);
             std::memset(slice.v_q4.data(), static_cast<int>(st * 20 + j), 16384);
+            cur += 16384;
         }
     }
     node->is_host_parked = true;
@@ -176,7 +181,8 @@ void test_hydration_queue_and_registry(NVMeStorageTier& nvme) {
     node->id = 777;
     node->prefix_len = 128;
     node->stage_host_snapshots.resize(1);
-    node->stage_host_snapshots[0].gdn_data.resize(4096);
+    node->stage_host_snapshots[0].slab_.allocate(4096);
+    node->stage_host_snapshots[0].gdn_data.reset(node->stage_host_snapshots[0].slab_.data(), 4096);
     std::memset(node->stage_host_snapshots[0].gdn_data.data(), 0xEE, 4096);
     node->is_host_parked = true;
 

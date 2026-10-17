@@ -18,6 +18,7 @@
 // The legacy canonical projections use their explicit Q8_0/Q8_K activation images. The optional native
 // BF16 path affects only the scalar gate: it reads the original F32 input and uses pinned CUDA MMVF plus
 // an FP32 sigmoid. Native projection overrides independently select CUDA Q8_1 MMVQ and FP32 SwiGLU.
+#include <unistd.h>
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/bf16_bits.hpp"
@@ -230,7 +231,7 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
     if (scratch == nullptr) {
         std::fprintf(stderr, "shared_expert: scratch is null; the caller owns it "
                              "(see shared_expert_scratch_bytes)\n");
-        std::exit(1);
+        _exit(1);
     }
     // CARVED FROM THE CALLER'S SCRATCH.  This used to be four `cudaMalloc`s and four `cudaFree`s per call, which
     // is illegal during stream capture AND a token-path allocation - P2.T10 forbids both.
@@ -288,7 +289,7 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
         if (n_ff % 256 != 0) {
             std::fprintf(stderr, "shared_expert: the down weight wants Q8_K but n_ff %lld is not a multiple "
                                  "of 256; Q8_K is structurally impossible here\n", (long long) n_ff);
-            std::exit(1);
+            _exit(1);
         }
         quantize_q8_K(gate, h_q8k, n_ff, stream);
         gemv(down_form, down_codes, down_scales, down_off, h_q8_0, h_q8k, out, n_ff, n_embd);
@@ -318,7 +319,7 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
         const cudaError_t e = cudaDeviceSynchronize();
         if (e != cudaSuccess) {
             std::fprintf(stderr, "shared_expert: %s\n", cudaGetErrorString(e));
-            std::exit(1);
+            _exit(1);
         }
     }
 }
@@ -330,7 +331,7 @@ void moe_combine(const float* parts, const float* weights, const float* shared, 
     // wrong answer that looks like a right one, and no geometry in this artifact comes close to it.
     if (k > 64) {
         std::fprintf(stderr, "moe_combine: k = %lld exceeds 64\n", (long long) k);
-        std::exit(1);
+        _exit(1);
     }
     const unsigned grid = (unsigned) ((n_embd + THREADS - 1) / THREADS);
     moe_combine_kernel<<<grid, THREADS, 0, (cudaStream_t) stream>>>(parts, weights, shared, y, (int) n_embd,
@@ -339,7 +340,7 @@ void moe_combine(const float* parts, const float* weights, const float* shared, 
         const cudaError_t e = cudaDeviceSynchronize();
         if (e != cudaSuccess) {
             std::fprintf(stderr, "moe_combine: %s\n", cudaGetErrorString(e));
-            std::exit(1);
+            _exit(1);
         }
     }
 }

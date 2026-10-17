@@ -1,4 +1,5 @@
 // src/kernels/cuda/kv_q8.cu - see include/strata/kernels/kv_q8.hpp.
+#include <unistd.h>
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
@@ -14,7 +15,7 @@ void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "kv_q8: %s: %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
 }
 
@@ -22,7 +23,7 @@ void validate(const QsaShapes& s, const char* what) {
     if (s.head_dim % KV_Q8_GROUP != 0 || s.n_head_kv <= 0 || s.page_size <= 0) {
         std::fprintf(stderr, "kv_q8: %s: head_dim %lld must be a multiple of %d\n", what, (long long) s.head_dim,
                      KV_Q8_GROUP);
-        std::exit(1);
+        _exit(1);
     }
 }
 

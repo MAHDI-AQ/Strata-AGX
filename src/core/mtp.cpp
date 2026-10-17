@@ -1023,6 +1023,8 @@ bool MtpDrafter::draft_begin(int T, const int32_t* tokens, int64_t p, int a, std
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
     const bool cp = coupled_active_;   // coupled draft sampling for this request: its own graphs
     const bool fused = fuse_chain_env();
+    // Ghost token KV cache fix: only commit accepted tokens (a + 1) to MTP drafter KV cache
+    const int N_ack = a + 1;
     int L = 1;
     if (fused) {
         // S1c-FIXED: the cap reads the round's fair per-slot row allocation (alloc_share_, set by
@@ -1033,10 +1035,10 @@ bool MtpDrafter::draft_begin(int T, const int32_t* tokens, int64_t p, int a, std
         // draft 0 (max_t_ <= 2, max_drafts_ <= 1 / context exhausted, or a 1-row share).  Draft 0 rides
         // the captured round (its catch-up K/V the next window needs regardless).  L keys the graph.
         L = std::max(1, std::min(std::min(max_t_ - 1, max_drafts_), alloc_share_));
-        if (!capture_fused(T, L, cp, err)) return false;
-    } else if (!capture_round(T, cp, err)) return false;
+        if (!capture_fused(N_ack, L, cp, err)) return false;
+    } else if (!capture_round(N_ack, cp, err)) return false;
     const Clock::time_point t0 = Clock::now();
-    for (int t = 0; t < T; ++t) {
+    for (int t = 0; t < N_ack; ++t) {
         h_tok_[t] = tokens[t];
         put_row(t, p + t);
     }
@@ -1045,8 +1047,8 @@ bool MtpDrafter::draft_begin(int T, const int32_t* tokens, int64_t p, int a, std
     h_row_[0] = a;
     h_row_[1] = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    const cudaGraphExec_t exec = fused ? (cp ? fused_exec_c_[T][L] : fused_exec_[T][L])
-                                       : (cp ? round_exec_c_[T] : round_exec_[T]);
+    const cudaGraphExec_t exec = fused ? (cp ? fused_exec_c_[N_ack][L] : fused_exec_[N_ack][L])
+                                       : (cp ? round_exec_c_[N_ack] : round_exec_[N_ack]);
     if (cudaGraphLaunch(exec, cs_) != cudaSuccess) {
         err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
         return false;
@@ -1128,10 +1130,11 @@ bool MtpDrafter::draft_tree(int T, const int32_t* tokens, int64_t p, int a,
     // Run first step from row a to produce logits for Depth 1
     // Draft 0 rides the captured round
     const bool cp = coupled_active_;
-    if (!capture_round(T, cp, err)) return false;
+    const int N_ack = a + 1;
+    if (!capture_round(N_ack, cp, err)) return false;
 
     const Clock::time_point t0 = Clock::now();
-    for (int t = 0; t < T; ++t) {
+    for (int t = 0; t < N_ack; ++t) {
         h_tok_[t] = tokens[t];
         put_row(t, p + t);
     }
@@ -1140,7 +1143,7 @@ bool MtpDrafter::draft_tree(int T, const int32_t* tokens, int64_t p, int a,
     h_row_[1] = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
 
-    const cudaGraphExec_t exec = cp ? round_exec_c_[T] : round_exec_[T];
+    const cudaGraphExec_t exec = cp ? round_exec_c_[N_ack] : round_exec_[N_ack];
     if (cudaGraphLaunch(exec, cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess) {
         err = std::string("mtp draft_tree round: ") + cudaGetErrorString(cudaGetLastError());
         return false;

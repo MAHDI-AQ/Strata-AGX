@@ -25,6 +25,7 @@
 // `freq_scale`; YaRN blends extrapolation and interpolation along the pairs (ggml's `rope_yarn`) and folds
 // the mscale magnitude correction into the same cos/sin values.  All of it float64, in the reference's
 // order, so `rope_parity` can hold every variant to a bit-exact float64 transcription of the same spec.
+#include <unistd.h>
 #include "strata/kernels/rope.hpp"
 #include "strata/kernels/mrope.hpp"
 
@@ -122,7 +123,7 @@ void rope_neox_apply(const float* x, float* out, int64_t rows, int head_dim, int
     if (rows <= 0 || n_rot <= 0) return;
     if (n_rot % 2 != 0 || n_rot > head_dim) {
         std::fprintf(stderr, "rope_neox_apply: n_rot %d must be even and <= head_dim %d\n", n_rot, head_dim);
-        std::exit(1);
+        _exit(1);
     }
     const int threads = 128;
     const unsigned grid = (unsigned) ((rows + threads - 1) / threads);
@@ -131,7 +132,7 @@ void rope_neox_apply(const float* x, float* out, int64_t rows, int head_dim, int
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "rope_neox_apply launch: %s\n", cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
     if (stream == nullptr) cudaDeviceSynchronize();
 }

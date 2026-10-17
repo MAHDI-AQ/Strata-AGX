@@ -1,4 +1,5 @@
 // src/kernels/cuda/kv_stream.cu - see include/strata/kernels/kv_stream.hpp.
+#include <unistd.h>
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
@@ -16,7 +17,7 @@ void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "kv_stream: %s: %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
 }
 
@@ -207,7 +208,7 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
     if (n_q <= 0) return;
     if (s.n_head_kv * s.page_size * (s.head_dim / KV_Q8_GROUP) * 2 % 16 != 0) {
         std::fprintf(stderr, "kv_stream: a block's scale run must be a multiple of 16 bytes\n");
-        std::exit(1);
+        _exit(1);
     }
     // one sweep step looks at RT consecutive slots `(hand + thread) % n_slots`; with fewer slots than RT two
     // threads see the same slot and may both take it for two different misses.  The engine never streams with fewer
@@ -215,7 +216,7 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
     if (m.n_slots < RT) {
         std::fprintf(stderr, "kv_stream: %lld slots is fewer than the resolve block (%d): the clock sweep would take a "
                              "slot twice\n", (long long) m.n_slots, RT);
-        std::exit(1);
+        _exit(1);
     }
     resolve_kernel<<<1, RT, 0, (cudaStream_t) stream>>>(m, ids, steps, (int) n_q, (int) cap, (int) s.page_size);
     check("resolve");

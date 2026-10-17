@@ -4,6 +4,7 @@
 // vector loads.  The kernel is templated on the code WIDTH (a compile-time property of the unpacking loop) and
 // takes the rest of the per-type attributes as run-time arguments, because the manifest supplies them per
 // tensor and a 13-way switch inside the inner loop would be the naive-but-wrong kind of naive.
+#include <unistd.h>
 #include "strata/kernels/s_gemv.hpp"
 
 #include <cuda_fp16.h>
@@ -347,11 +348,11 @@ void s_gemv(const uint16_t* x, const uint8_t* codes, const float* scales, const 
     if (form.group_elems <= 0 || n_in % form.group_elems != 0) {
         std::fprintf(stderr, "s_gemv: n_in %lld is not a multiple of group_elems %d\n", (long long) n_in,
                      form.group_elems);
-        std::exit(1);
+        _exit(1);
     }
     if (form.has_offset && offset == nullptr) {
         std::fprintf(stderr, "s_gemv: form says has_offset but offset is null\n");
-        std::exit(1);
+        _exit(1);
     }
     const int threads = 128;
     const long long blocks = (n_out + threads - 1) / threads;
@@ -374,12 +375,12 @@ void s_gemv(const uint16_t* x, const uint8_t* codes, const float* scales, const 
             break;
         default:
             std::fprintf(stderr, "s_gemv: unsupported code_bits %d\n", form.code_bits);
-            std::exit(1);
+            _exit(1);
     }
     const cudaError_t e = cudaDeviceSynchronize();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "s_gemv: %s\n", cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
 }
 
@@ -482,20 +483,20 @@ static void s_gemv_split_impl(const uint16_t* x, const uint8_t* codes, const flo
     if (threads_per_row < 1 || (threads_per_row & (threads_per_row - 1)) != 0 || threads_per_row > 1024) {
         std::fprintf(stderr, "s_gemv_split: threads_per_row must be a power of two in 1..1024, got %d\n",
                      threads_per_row);
-        std::exit(1);
+        _exit(1);
     }
     const int cb = (int) form.codebook;
     // Every group size this format defines is a power of two, which is what lets the per-element group index
     // be a shift.  Refuse anything else rather than compute a wrong index quietly.
     if (form.group_elems <= 0 || (form.group_elems & (form.group_elems - 1)) != 0) {
         std::fprintf(stderr, "s_gemv_split: group_elems must be a power of two, got %d\n", form.group_elems);
-        std::exit(1);
+        _exit(1);
     }
     // AND THE QUAD MUST FIT INSIDE ONE GROUP: four consecutive elements share a scale and the kernel reads
     // exactly one.  Every group size this format defines is 16, 32 or 64, so this cannot fire on a real pack.
     if (form.group_elems % 4 != 0) {
         std::fprintf(stderr, "s_gemv_split: group_elems %d is not a multiple of 4\n", form.group_elems);
-        std::exit(1);
+        _exit(1);
     }
     int group_shift = 0;
     while ((1 << group_shift) < form.group_elems) ++group_shift;
@@ -519,13 +520,13 @@ static void s_gemv_split_impl(const uint16_t* x, const uint8_t* codes, const flo
             break;
         default:
             std::fprintf(stderr, "s_gemv_split: unsupported code_bits %d\n", form.code_bits);
-            std::exit(1);
+            _exit(1);
     }
     if (sync) {
         const cudaError_t e = cudaDeviceSynchronize();
         if (e != cudaSuccess) {
             std::fprintf(stderr, "s_gemv_split: %s\n", cudaGetErrorString(e));
-            std::exit(1);
+            _exit(1);
         }
     }
 }
@@ -565,13 +566,13 @@ void finish(const char* who, void* stream) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "%s launch: %s\n", who, cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
     if (stream != nullptr) return;
     const cudaError_t s = cudaDeviceSynchronize();
     if (s != cudaSuccess) {
         std::fprintf(stderr, "%s: %s\n", who, cudaGetErrorString(s));
-        std::exit(1);
+        _exit(1);
     }
 }
 
@@ -580,7 +581,7 @@ void finish(const char* who, void* stream) {
 void s_gemv_q8k(const uint8_t* x_q8k, const uint8_t* codes, const float* scales, const float* offset, float* y,
                 int64_t n_in, int64_t n_out, const SForm& form, void* stream) {
     if (n_in <= 0 || n_out <= 0) return;
-    if (!q8k_form_ok(form, n_in, "s_gemv_q8k")) std::exit(1);
+    if (!q8k_form_ok(form, n_in, "s_gemv_q8k")) _exit(1);
     const int threads = 128;
     const unsigned blocks = (unsigned) ((n_out + threads - 1) / threads);
     const int cb = (int) form.codebook;
@@ -599,7 +600,7 @@ void s_gemv_q8k(const uint8_t* x_q8k, const uint8_t* codes, const float* scales,
             // running a kernel that would be numerically wrong in a way the caller cannot see.
             std::fprintf(stderr, "s_gemv_q8k: code_bits %d has no Q8_K contract "
                                  "(S2 uses Q8_0; see docs/activation-contract.md)\n", form.code_bits);
-            std::exit(1);
+            _exit(1);
     }
     finish("s_gemv_q8k", stream);
 }
@@ -607,21 +608,21 @@ void s_gemv_q8k(const uint8_t* x_q8k, const uint8_t* codes, const float* scales,
 void s_gemv_q8k_split(const uint8_t* x_q8k, const uint8_t* codes, const float* scales, const float* offset,
                       float* y, int64_t n_in, int64_t n_out, const SForm& form, void* stream) {
     if (n_in <= 0 || n_out <= 0) return;
-    if (!q8k_form_ok(form, n_in, "s_gemv_q8k_split")) std::exit(1);
+    if (!q8k_form_ok(form, n_in, "s_gemv_q8k_split")) _exit(1);
     // THE GROUP SIZE IS PASSED AS ITS LOGARITHM: see the note on the kernel.  A non-power-of-two group would
     // make the shift a WRONG INDEX rather than a slow one, so it is refused here.
     int group_shift = 0;
     while ((1 << group_shift) < form.group_elems) ++group_shift;
     if ((1 << group_shift) != form.group_elems) {
         std::fprintf(stderr, "s_gemv_q8k_split: group_elems %d is not a power of two\n", form.group_elems);
-        std::exit(1);
+        _exit(1);
     }
     // AND THE QUAD MUST FIT INSIDE ONE GROUP.  Four consecutive elements share a scale, so a group smaller
     // than four would need two of them and the kernel reads exactly one.  Every group size this format
     // defines is 16, 32 or 64, so this cannot fire on a real pack - it is here because a future one could.
     if (form.group_elems % 16 != 0) {
         std::fprintf(stderr, "s_gemv_q8k_split: group_elems %d is not a multiple of 16\n", form.group_elems);
-        std::exit(1);
+        _exit(1);
     }
     const int threads = 256;
     const int warps = threads / 32;
@@ -639,7 +640,7 @@ void s_gemv_q8k_split(const uint8_t* x_q8k, const uint8_t* codes, const float* s
             break;
         default:
             std::fprintf(stderr, "s_gemv_q8k_split: code_bits %d has no Q8_K contract\n", form.code_bits);
-            std::exit(1);
+            _exit(1);
     }
     finish("s_gemv_q8k_split", stream);
 }
@@ -653,19 +654,19 @@ void s_gemv_q8_0_split(const uint8_t* x_q8_0, const uint8_t* codes, const float*
     if (n_in % Q8_0_BLOCK_ELEMS != 0) {
         std::fprintf(stderr, "s_gemv_q8_0_split: n_in %lld is not a multiple of %d\n", (long long) n_in,
                      Q8_0_BLOCK_ELEMS);
-        std::exit(1);
+        _exit(1);
     }
     // the same two checks `s_gemv_q8k_split` makes, for the same reasons - see the notes there
     if (form.group_elems <= 0 || (form.group_elems & (form.group_elems - 1)) != 0) {
         std::fprintf(stderr, "s_gemv_q8_0_split: group_elems must be a power of two, got %d\n",
                      form.group_elems);
-        std::exit(1);
+        _exit(1);
     }
     // SIXTEEN, NOT FOUR: a lane-iteration takes QE = 16 consecutive elements under ONE scale (see the kernel),
     // so a group of 4 or 8 would read the wrong scale for most of them.  The Q8_K launcher already said 16.
     if (form.group_elems % 16 != 0) {
         std::fprintf(stderr, "s_gemv_q8_0_split: group_elems %d is not a multiple of 16\n", form.group_elems);
-        std::exit(1);
+        _exit(1);
     }
     int group_shift = 0;
     while ((1 << group_shift) < form.group_elems) ++group_shift;
@@ -686,7 +687,7 @@ void s_gemv_q8_0_split(const uint8_t* x_q8_0, const uint8_t* codes, const float*
             break;
         default:
             std::fprintf(stderr, "s_gemv_q8_0_split: code_bits %d has no Q8_0 contract\n", form.code_bits);
-            std::exit(1);
+            _exit(1);
     }
     finish("s_gemv_q8_0_split", stream);
 }

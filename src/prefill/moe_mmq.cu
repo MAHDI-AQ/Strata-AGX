@@ -1,3 +1,4 @@
+#include <unistd.h>
 // src/prefill/moe_mmq.cu - see include/strata/prefill/moe_mmq.hpp.  llama.cpp's MMQ (ggml-cuda, MIT) is compiled
 // from the pinned llama.cpp checkout the build already takes ggml from; src/prefill/ggml_cuda_host.cu supplies the
 // few host symbols of ggml-cuda.cu it references.
@@ -16,7 +17,7 @@ namespace {
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
         std::fprintf(stderr, "prefill mmq: %s: %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
 }
 
@@ -172,7 +173,7 @@ size_t q8_bytes(int64_t rows, int64_t cols) {
 }
 
 void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream) {
-    if (rows <= 0) return;
+    if (rows <= 0 || x == nullptr || xq == nullptr) return;
     quantize_mmq_q8_1_cuda(x, ids, xq, (ggml_type) t, cols, ld, rows * ld, rows * ld, pad512(cols), rows, 1, 1,
                            (cudaStream_t) stream);
     ck(cudaGetLastError(), "quantize");
@@ -217,7 +218,7 @@ void Context::run(const Product& p, void* stream) {
 #endif
         default:
             std::fprintf(stderr, "prefill mmq: type %d is not covered\n", (int) t);
-            std::exit(1);
+            _exit(1);
     }
     ck(cudaGetLastError(), "mul_mat_q");
 }

@@ -233,10 +233,16 @@ async function refresh() {
         if ($("radix-mon-l1")) {
           const eng = (metrics.engine && typeof metrics.engine === "object") ? metrics.engine : {};
           const expStr = eng.expert_slots ? `${eng.expert_slots.toLocaleString()} Exp` : "Resident Exp";
-          const poolDesc = rx.l1_vram_pool || `${eng.concurrency || 2} slots · ${(eng.max_context || 262144)/1024}k (${(eng.kv || "q4_0").toUpperCase()})`;
-          const activeTok = rx.l1_active_tokens != null ? `${rx.l1_active_tokens.toLocaleString()} toks` : "0 toks";
-          const l1Text = rx.l1_vram_note || `${poolDesc} · ${activeTok} · ${expStr}`;
-          $("radix-mon-l1").textContent = rx.l1_display || l1Text;
+          if (rx.l1_display) {
+            $("radix-mon-l1").textContent = rx.l1_display;
+          } else if (rx.l1_active_tokens != null && rx.l1_total_tokens != null) {
+            $("radix-mon-l1").textContent = `${eng.concurrency || 2} slots · ${rx.l1_active_tokens.toLocaleString()} / ${rx.l1_total_tokens.toLocaleString()} toks`;
+          } else {
+            const poolDesc = rx.l1_vram_pool || `${eng.concurrency || 2} slots · ${(eng.max_context || 262144)/1024}k (${(eng.kv || "q4_0").toUpperCase()})`;
+            const activeTok = rx.l1_active_tokens != null ? `${rx.l1_active_tokens.toLocaleString()} toks` : "0 toks";
+            const l1Text = rx.l1_vram_note || `${poolDesc} · ${activeTok} · ${expStr}`;
+            $("radix-mon-l1").textContent = l1Text;
+          }
         }
         if ($("radix-mon-l2")) {
           const nodeCount = rx.l2_host_nodes != null ? rx.l2_host_nodes : (rx.l2_host_active || 0);

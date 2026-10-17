@@ -21,6 +21,7 @@
 // `w_down[k][i]` with i contiguous - `ref/gr.py`'s (hc_lr, hc*n_embd) row-major.  `hc_attn_up.weight` is
 // [320, 10240] so it holds `w_up[i][k]` with k contiguous - `ref/gr.py`'s (hc*n_embd, hc_lr) row-major.  Both
 // index with no permutation at all.
+#include <unistd.h>
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
@@ -347,12 +348,12 @@ void gr_read(const float* R, const float* w_norm, const uint16_t* w_down, const 
     if (s.n_embd <= 0 || s.hc <= 0 || s.hc_lr <= 0) return;
     if (ws.xn == nullptr || ws.xq == nullptr || ws.lq == nullptr || ws.gated == nullptr || ws.lo == nullptr) {
         std::fprintf(stderr, "gr_read: GrWorkspace is not initialised (see gr_workspace_init)\n");
-        std::exit(1);
+        _exit(1);
     }
     if (ws.bytes < gr_workspace_bytes(s)) {
         std::fprintf(stderr, "gr_read: GrWorkspace is %zu bytes but this geometry needs %zu\n",
                      ws.bytes, gr_workspace_bytes(s));
-        std::exit(1);
+        _exit(1);
     }
     const int n_embd = (int) s.n_embd, hc = (int) s.hc, hc_lr = (int) s.hc_lr;
     const int hc_dim = (int) (s.hc * s.n_embd);
@@ -399,13 +400,13 @@ void gr_read(const float* R, const float* w_norm, const uint16_t* w_down, const 
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "gr_read launch: %s\n", cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
     if (stream == nullptr) {
         const cudaError_t se = cudaDeviceSynchronize();
         if (se != cudaSuccess) {
             std::fprintf(stderr, "gr_read: %s\n", cudaGetErrorString(se));
-            std::exit(1);
+            _exit(1);
         }
     }
 }
@@ -424,7 +425,7 @@ void gr_write(const float* R, const float* block_out, const float* inject, const
         const cudaError_t e = cudaDeviceSynchronize();
         if (e != cudaSuccess) {
             std::fprintf(stderr, "gr_write: %s\n", cudaGetErrorString(e));
-            std::exit(1);
+            _exit(1);
         }
     }
 }

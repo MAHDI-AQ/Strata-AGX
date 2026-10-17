@@ -2,6 +2,7 @@
 //
 // The per-token arithmetic of every kernel here is transcribed from its single-token original (fused_gdn.cu,
 // elementwise.cu) with the same operation order, so a verify window reproduces plain decode bit for bit.
+#include <unistd.h>
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/dp4a.hpp"
 
@@ -20,7 +21,7 @@ constexpr int RPG = S / RG;
 
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e)); _exit(1); }
 }
 
 __global__ void __launch_bounds__(S) gdn_conv_l2_multi_kernel(const float* __restrict__ hist,
@@ -263,13 +264,13 @@ __global__ void map_ids_kernel(int32_t* ids, const int32_t* __restrict__ table, 
 }
 
 __global__ void row_top_prob_kernel(const float* __restrict__ logits, int n_vocab, const int32_t* __restrict__ ids,
-                                    float* __restrict__ probs) {
+                                    float* __restrict__ probs, float inv_temp = 1.0f) {
     __shared__ float part[32];
     const int t = blockIdx.x;
     const float* l = logits + (size_t) t * n_vocab;
     const float m = l[ids[t]];
     float s = 0.0f;
-    for (int i = threadIdx.x; i < n_vocab; i += blockDim.x) s += __expf(l[i] - m);
+    for (int i = threadIdx.x; i < n_vocab; i += blockDim.x) s += __expf((l[i] - m) * inv_temp);
     for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
     if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = s;
     __syncthreads();
@@ -308,7 +309,7 @@ __global__ void dense_steps_kernel(const int32_t* __restrict__ cells, int n, int
 
 void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream) {
     if (cap <= 0) return;
-    if (blob_bytes % 16 != 0) { std::fprintf(stderr, "fetch_blobs: blob size must be a multiple of 16\n"); std::exit(1); }
+    if (blob_bytes % 16 != 0) { std::fprintf(stderr, "fetch_blobs: blob size must be a multiple of 16\n"); _exit(1); }
     fetch_blobs_kernel<<<48 * 8, 256, 0, (cudaStream_t) stream>>>(src, n, (uint4*) dst, (long long) (blob_bytes / 16));
     check("fetch_blobs");
 }
@@ -325,7 +326,7 @@ void add_streams_broadcast(const float* h, const float* e, float* R, int64_t n_e
 }
 
 void ident_hits(const int32_t* ids, int n, int32_t* slot, int32_t* dst, int32_t* count, void* stream) {
-    if (n < 1 || n > 1024) { std::fprintf(stderr, "ident_hits: n out of range\n"); std::exit(1); }
+    if (n < 1 || n > 1024) { std::fprintf(stderr, "ident_hits: n out of range\n"); _exit(1); }
     ident_hits_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(ids, n, slot, dst, count);
     check("ident_hits");
 }
@@ -353,8 +354,8 @@ void map_ids(int32_t* ids, const int32_t* table, int n, void* stream) {
     check("map_ids");
 }
 
-void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* ids, float* probs, void* stream) {
-    row_top_prob_kernel<<<n_rows, 1024, 0, (cudaStream_t) stream>>>(logits, n_vocab, ids, probs);
+void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* ids, float* probs, void* stream, float inv_temp) {
+    row_top_prob_kernel<<<n_rows, 1024, 0, (cudaStream_t) stream>>>(logits, n_vocab, ids, probs, inv_temp);
     check("row_top_prob");
 }
 
@@ -498,7 +499,7 @@ void row_top_prob_split(const float* logits, int n_rows, int n_vocab, const int3
 uint64_t argmax_rows_scratch_bytes(int) { return 0; }
 void argmax_rows(const float*, int, int, void*, int32_t*, void*) {
     std::fprintf(stderr, "argmax_rows: not built for this backend\n");
-    std::exit(1);
+    _exit(1);
 }
 uint64_t row_top_prob_scratch_bytes(int) { return 0; }
 void row_top_prob_split(const float* logits, int n_rows, int n_vocab, const int32_t* ids, float* probs, void*,
@@ -562,7 +563,7 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
                        int qk_heads, float eps, int n_tok, void* stream, int t_begin) {
     if (!history || !qkv || !conv_w || !h || channels % S != 0 || n_tok < 1 || n_tok > kVerifyMaxT) {
         std::fprintf(stderr, "gdn_conv_l2_multi: invalid arguments\n");
-        std::exit(1);
+        _exit(1);
     }
     gdn_conv_l2_multi_kernel<<<dim3((unsigned) (channels / S), (unsigned) n_tok), S, 0, (cudaStream_t) stream>>>(
         history, qkv, conv_w, h, channels, qk_heads, eps, t_begin);
@@ -579,7 +580,7 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
                   float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream) {
     if (n_embd % 8 != 0 || n_tok < 1 || n_tok > kVerifyMaxT) {
         std::fprintf(stderr, "gdn_ab_multi: invalid arguments\n");
-        std::exit(1);
+        _exit(1);
     }
     gdn_ab_multi_kernel<<<(unsigned) ((2 * h_v + 7) / 8), 256, 0, (cudaStream_t) stream>>>(
         x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
@@ -592,7 +593,7 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
     if (!state || !h || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v % h_k || n_tok < 1 ||
         n_tok > kVerifyMaxT) {
         std::fprintf(stderr, "gdn_step_norm_multi: invalid arguments\n");
-        std::exit(1);
+        _exit(1);
     }
     gdn_step_norm_multi_kernel<<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(
         state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin);
@@ -601,7 +602,19 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 
 namespace {
 __global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
-    while (*flag < value) strata_spin_pause();
+    // HW-01: Adaptive backoff during graph doorbell polling to avoid saturating PCIe bus
+    int spin = 0;
+    while (*flag < value) {
+        if (++spin < 64) {
+            strata_spin_pause();
+        } else {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+            __nanosleep(1000);
+#else
+            strata_spin_pause();
+#endif
+        }
+    }
     __threadfence_system();
 }
 }  // namespace
@@ -650,7 +663,19 @@ __global__ void resident_plan_kernel(const int32_t* __restrict__ ids, int n, int
 }
 __global__ void wait_flag_ge_or_kernel(const volatile uint32_t* flag, uint32_t value, const volatile uint32_t* skip) {
     if (*skip == value) return;
-    while (*flag < value) strata_spin_pause();
+    // HW-01: Adaptive backoff during graph doorbell polling to avoid saturating PCIe bus
+    int spin = 0;
+    while (*flag < value) {
+        if (++spin < 64) {
+            strata_spin_pause();
+        } else {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+            __nanosleep(1000);
+#else
+            strata_spin_pause();
+#endif
+        }
+    }
     __threadfence_system();
 }
 __global__ void copy_i32_unless_kernel(int32_t* __restrict__ dst, const volatile int32_t* src, int n,
@@ -759,7 +784,7 @@ void copy_i32_from_mapped_unless(int32_t* dst, const int32_t* src, long long n, 
     if (n <= 0) return;
     if (n > 0x7fffffffLL) {   // D2 bounds: the kernel's n is int; fail closed, never truncate
         std::fprintf(stderr, "copy_i32_from_mapped_unless: n=%lld exceeds the kernel bound; refusing\n", n);
-        std::exit(1);
+        _exit(1);
     }
     copy_i32_unless_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(dst, (const volatile int32_t*) src, (int) n, skip, value);
     check("copy_i32_from_mapped_unless");

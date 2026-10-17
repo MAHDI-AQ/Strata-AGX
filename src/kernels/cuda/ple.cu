@@ -13,6 +13,7 @@
 //
 // The opt-in native BF16 path replaces only ple_value with the pinned CUDA single-token BF16/F32 MMVF.
 // A separate opt-in native postops path follows the pinned CUDA arithmetic after both projections.
+#include <unistd.h>
 #include "strata/kernels/ple.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -190,7 +191,7 @@ __global__ void to_bf16_kernel(const float* __restrict__ x, uint16_t* __restrict
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
         std::fprintf(stderr, "ple_block: %s: %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
 }
 
@@ -257,7 +258,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
     const size_t q8_bytes = (size_t) (n_embd / 32) * 34;
     if (scratch == nullptr) {
         std::fprintf(stderr, "ple_block: scratch is null; the caller owns it (see ple_block_scratch_bytes)\n");
-        std::exit(1);
+        _exit(1);
     }
     const struct Export { const float* pointer; size_t count; const char* name; } exports[] = {
         {out.key, (size_t) hc_dim, "key"}, {out.value, (size_t) n_embd, "value"},

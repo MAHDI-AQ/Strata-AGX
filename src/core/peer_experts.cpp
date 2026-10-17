@@ -13,6 +13,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <stdexcept>
+#include <thread>
 
 namespace strata::core {
 
@@ -259,7 +260,9 @@ bool PeerExperts::finish(float* out, std::string& err) {
 #if defined(__x86_64__) || defined(_M_X64)
             __builtin_ia32_pause();
 #endif
-            if (++spin_count > 10000000) { // ~2000ms deadline watchdog
+            ++spin_count;
+            if (spin_count > 100000) std::this_thread::yield();
+            if (spin_count > 2000000) { // ~2000ms deadline watchdog
                 std::fprintf(stderr, "strata-agx peer_experts: cudaStreamQuery timeout (>2000ms), draining peer stream\n");
                 cudaStreamSynchronize(stream_);
                 e = cudaErrorLaunchTimeout;

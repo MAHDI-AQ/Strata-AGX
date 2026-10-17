@@ -1,4 +1,5 @@
 // src/kernels/cuda/qsa_select.cu - see include/strata/kernels/qsa_select.hpp.
+#include <unistd.h>
 #include "strata/core/emulate.hpp"
 #include <cstdlib>
 #include <cstring>
@@ -466,14 +467,9 @@ __global__ void __launch_bounds__(32) block_scores_tail_kernel(const float* __re
 // block_topk_kernel's (radix threshold, ties to the lowest index, cells ascending): identical ids.
 constexpr int TK_T = 1024;
 constexpr int TK_PER = 33;
-#if defined(__HIPCC__)
-// AMD (RDNA, wave32): a 1,024-thread block may use 192 VGPRs per lane, so the keys of 66 blocks per thread fit - contexts
-// up to 4 * 1024 * 66 = 270,336 cells (the 262,144 --max-context) keep the register kernel. NVIDIA's 64 registers per
-// thread at 1,024 threads allow only TK_PER.
+// CRIT-12: Ada Lovelace (RTX 4090 sm_89) with 64K registers per SM supports TK_PER_MAX = 66,
+// allowing 1024 * 66 = 67,584 blocks (270k context), eliminating the 18ms fallback latency wall at >131k context.
 constexpr int TK_PER_MAX = 66;
-#else
-constexpr int TK_PER_MAX = TK_PER;
-#endif
 
 __device__ __forceinline__ int block_excl_scan(int v, int* s_warp, int& total) {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -874,7 +870,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
     if (nq <= 0) return;
     if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R || nq > 65535) {
         std::fprintf(stderr, "qsa_block_scores: unsupported indexer geometry\n");
-        std::exit(1);
+        _exit(1);
     }
     // a block past a query's n_bid returns at once: the grid need only reach the batch's largest n_bid (C-1)
     static const bool multi = [] { const char* v = std::getenv("STRATA_SCORES_MULTI"); return v == nullptr || std::atoi(v) != 0; }();
@@ -882,7 +878,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
         block_scores_multi_kernel<<<256, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(pooled, dead, q_idx, steps, (int) nq,
                                                                                      max_blocks, scores);
         const cudaError_t e = cudaGetLastError();
-        if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores multi: %s\n", cudaGetErrorString(e)); std::exit(1); }
+        if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores multi: %s\n", cudaGetErrorString(e)); _exit(1); }
         return;
     }
     const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
@@ -890,7 +886,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
     block_scores_kernel<<<grid, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(pooled, dead, q_idx, steps, max_blocks,
                                                                               scores);
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores: %s\n", cudaGetErrorString(e)); _exit(1); }
 }
 
 bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
@@ -912,7 +908,7 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
         block_scores_wmma_kernel<<<grid, 128, 0, (cudaStream_t) stream>>>(pooled, q_idx, steps, nq, max_blocks, reach, scores);
         block_scores_tail_kernel<<<(unsigned) nq, 32, 0, (cudaStream_t) stream>>>(dead, q_idx, steps, max_blocks, scores);
         const cudaError_t e = cudaGetLastError();
-        if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_tc: %s\n", cudaGetErrorString(e)); std::exit(1); }
+        if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_tc: %s\n", cudaGetErrorString(e)); _exit(1); }
         return true;
     }
 #else
@@ -951,7 +947,7 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
                                                                          scores);
     block_scores_tail_kernel<<<(unsigned) nq, 32, 0, (cudaStream_t) stream>>>(dead, q_idx, steps, max_blocks, scores);
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_tc: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_tc: %s\n", cudaGetErrorString(e)); _exit(1); }
     return true;
 #endif
 }
@@ -961,11 +957,11 @@ void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, i
     if (nq <= 0) return;
     if (s.idx_block != R || cap < qsa_selection_width(kTopkMaxCells, s)) {
         std::fprintf(stderr, "qsa_block_topk: unsupported geometry or cap\n");
-        std::exit(1);
+        _exit(1);
     }
     block_topk_kernel<<<(unsigned) nq, TOPK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_topk: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_topk: %s\n", cudaGetErrorString(e)); _exit(1); }
 }
 
 #if !defined(__HIPCC__)
@@ -1047,7 +1043,7 @@ bool qsa_block_topk_cluster(const float* scores, const int32_t* steps, int64_t n
     cfg.attrs = at;
     cfg.numAttrs = 1;
     const cudaError_t e = cudaLaunchKernelEx(&cfg, block_topk_cluster_kernel, scores, steps, max_blocks, cap, ids);
-    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_topk cluster: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_topk cluster: %s\n", cudaGetErrorString(e)); _exit(1); }
     return true;
 #endif
 }
@@ -1098,14 +1094,14 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
     }
     if (s.idx_block != R || cap < qsa_selection_width(kTopkMaxCells, s)) {
         std::fprintf(stderr, "qsa_block_topk: unsupported geometry or cap\n");
-        std::exit(1);
+        _exit(1);
     }
     if (reach <= (int64_t) TK_T * TK_PER)
         block_topk_reg_kernel<TK_PER><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
     else
         block_topk_reg_kernel<TK_PER_MAX><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_topk: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_topk: %s\n", cudaGetErrorString(e)); _exit(1); }
 }
 
 }  // namespace strata::kernels

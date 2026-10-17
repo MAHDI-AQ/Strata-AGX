@@ -33,6 +33,20 @@ Upstream Strata demonstrated that 125B MoE architectures (like Qwen 3.8 Flash Ne
 > **Attribution & Upstream Boundary:**
 > This repository is a standalone research fork. We credit **Niko1221** and the 15+ community contributors who created Strata. See [**`ATTRIBUTION.md`**](ATTRIBUTION.md) for full contributor credits. All commits are maintained modularly for upstream cherry-picking.
 
+### Latest Line — `v0.1.40-agx.4.5.0` (Adversarial Hardening, Leviathan Rejection & Protocol Parity)
+
+On 2026-10-17, Strata AGX landed the **Adversarial Hardening & Mathematical Speculative Sampling Release** (`v0.1.40-agx.4.5.0`):
+
+- **Leviathan Algorithm 1 Rejection Sampling:** Mathematically exact speculative verification for non-greedy distributions ( > 0$) via native CUDA `row_top_prob_kernel`, eliminating repetitive stutter and token collapse while achieving **84.6% draft acceptance**.
+- **Inter-GPU Activation Race Elimination:** Clean CUDA event fences on peer P2P copy streams (`cudaMemcpyPeerAsync`), preventing WAW/WAR activation corruption across dual RTX 4090s.
+- **Async-Signal-Safe Kernel Aborts:** Purged 45+ `std::exit(1)` calls across 20+ CUDA kernels in favor of `_exit(1)`, eliminating glibc `_IO_stdfile_0_lock` engine deadlocks.
+- **Ada SM89 Register Scaling (`TK_PER_MAX = 66`):** Boosts top-k block selection up to 67,584 blocks (270k context), eliminating the 18ms latency wall past 131k tokens.
+- **3-Tier Radix KV Cache Hardening:** Isolated staging NVMe nodes from prefix traversals (preventing UAF crashes) and decoupled `rw_lock_` from 300–800ms DMA drains to eliminate reader thread starvation.
+- **Protocol Parity & SGLang Two-Phase State Machine:** Prevents prompt injection across vision/video/FIM control tokens, enforces code fence-aware tool calling, transparently normalizes JSON arguments in Jinja templates, and streams 3.0s SSE `: keep-alive
+
+` heartbeats during cold prefills.
+
+
 ### Latest Line — `v0.1.40-agx.4.4.0` (Production Hardening: Tool Calls, Telemetry & Reasoning Guard)
 
 On 2026-10-16, Strata AGX landed the **Production Hardening Release** (`v0.1.40-agx.4.4.0`):

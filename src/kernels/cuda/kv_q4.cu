@@ -1,5 +1,6 @@
 // src/kernels/cuda/kv_q4.cu - see include/strata/kernels/kv_q4.hpp. Q4_0 KV with Walsh-Hadamard rotation
 // (from PR #21 by code-martin; KV-streaming integration and the deterministic group maximum added on merge).
+#include <unistd.h>
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/kv_stream.hpp"
@@ -16,7 +17,7 @@ void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "kv_q4: %s: %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
 }
 
@@ -196,7 +197,7 @@ __global__ void kv_gather_q4_kernel(const uint8_t* __restrict__ k_q4, const uint
 void need_256(const QsaShapes& s, const char* what) {
     if (s.head_dim != 256) {
         std::fprintf(stderr, "%s: head_dim must be 256 (the Hadamard transform's size)\n", what);
-        std::exit(1);
+        _exit(1);
     }
 }
 

@@ -1,4 +1,5 @@
 // src/kernels/cuda/elementwise.cu - P2.S5's glue kernels.  See the header for why each exists.
+#include <unistd.h>
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/dp4a.hpp"
 
@@ -141,7 +142,7 @@ void sync_if_needed(void* stream, const char* what) {
     const cudaError_t e = cudaDeviceSynchronize();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
 }
 
@@ -149,7 +150,7 @@ bool check_launch(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "%s launch: %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
     return true;
 }
@@ -300,7 +301,7 @@ void scatter_rows_f32(const float* src, float* dst, const int32_t* rows, int64_t
     if (n <= 0) return;
     if ((width & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
         std::fprintf(stderr, "scatter_rows_f32: width must be a multiple of 4 and both pointers 16-byte aligned\n");
-        std::exit(1);
+        _exit(1);
     }
     scatter_rows_kernel<<<(unsigned) n, 128, 0, (cudaStream_t) stream>>>((const float4*) src, (float4*) dst, rows, width / 4);
 }
@@ -309,7 +310,7 @@ void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t w
     if (rows <= 0) return;
     if ((width & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
         std::fprintf(stderr, "copy_rows_from_mapped: width must be a multiple of 4 and both pointers 16-byte aligned\n");
-        std::exit(1);
+        _exit(1);
     }
     copy_rows_from_mapped_kernel<<<(unsigned) rows, 128, 0, (cudaStream_t) stream>>>((float4*) dst, (const volatile float4*) src,
                                                                                   width / 4, hit_rows, count);
@@ -318,7 +319,7 @@ void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
     if (n <= 0) return;
     if ((n & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
         std::fprintf(stderr, "copy_from_mapped: n must be a multiple of 4 and both pointers 16-byte aligned\n");
-        std::exit(1);
+        _exit(1);
     }
     const int64_t n4 = n / 4;
     const int blocks = (int) ((n4 + 255) / 256 < 64 ? (n4 + 255) / 256 : 64);
@@ -341,7 +342,7 @@ __global__ void doorbell_publish_kernel(const float* __restrict__ x, const int32
 
 void doorbell_publish(const float* x, const int32_t* ids, const float* weights, int64_t n, int64_t k, float* x_out,
                       int32_t* ids_out, float* weights_out, uint32_t* d_seq, void* stream) {
-    if (k > 1024) { std::fprintf(stderr, "doorbell_publish: k too large\n"); std::exit(1); }
+    if (k > 1024) { std::fprintf(stderr, "doorbell_publish: k too large\n"); _exit(1); }
     doorbell_publish_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(x, ids, weights, (int) n, (int) k, x_out, ids_out,
                                                                     weights_out, d_seq);
     check_launch("doorbell_publish");
@@ -355,7 +356,7 @@ void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* str
     if (n <= 0) return;
     if (n > 0x7fffffffLL) {   // D2 bounds: the kernel's n is int; fail closed, never truncate
         std::fprintf(stderr, "copy_i32_from_mapped: n=%lld exceeds the kernel bound; refusing\n", (long long) n);
-        std::exit(1);
+        _exit(1);
     }
     int dev = -1;
     cudaGetDevice(&dev);

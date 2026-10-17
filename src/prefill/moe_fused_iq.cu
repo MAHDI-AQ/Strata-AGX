@@ -1,3 +1,4 @@
+#include <unistd.h>
 // src/prefill/moe_fused_iq.cu - see include/strata/prefill/moe_fused_iq.hpp (#136: the native packs' prompt experts on
 // the fused int8 kernels of moe_fused.cu).
 //
@@ -41,7 +42,7 @@ namespace {
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
         std::fprintf(stderr, "prefill fused experts (native): %s: %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
 }
 
@@ -604,7 +605,7 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
     const DevInfo& d = dev_info();
     if (!d.ok || !gu_covered(g.gu_type) || !d_covered(g.d_type)) {
         std::fprintf(stderr, "prefill fused experts (native): types %d / %d are not covered here\n", g.gu_type, g.d_type);
-        std::exit(1);
+        _exit(1);
     }
     const cudaStream_t s = (cudaStream_t) stream;
     const Tables tb = tables(const_cast<void*>(scratch), n_expert);

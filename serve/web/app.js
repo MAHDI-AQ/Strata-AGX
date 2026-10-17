@@ -392,10 +392,16 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, slots
     if ($("radix-tier-tag")) $("radix-tier-tag").textContent = radixData.cache_tier || "3-Tier (VRAM Pool → Host RAM → NVMe Disk)";
     if ($("radix-l1-val")) {
       const expStr = eng.expert_slots ? `${fmt(eng.expert_slots)} Exp` : "Resident Exp";
-      const poolDesc = radixData.l1_vram_pool || `${eng.concurrency || 2} slots · ${(eng.max_context || 262144)/1024}k (${(eng.kv || "q4_0").toUpperCase()})`;
-      const activeTok = radixData.l1_active_tokens != null ? `${fmt(radixData.l1_active_tokens)} toks` : "0 toks";
-      const l1Text = radixData.l1_vram_note || `${poolDesc} · ${activeTok} · ${expStr}`;
-      $("radix-l1-val").textContent = radixData.l1_display || (radixData.l1_vram_note || "2 slots · 0 toks");
+      if (radixData.l1_display) {
+        $("radix-l1-val").textContent = radixData.l1_display;
+      } else if (radixData.l1_active_tokens != null && radixData.l1_total_tokens != null) {
+        $("radix-l1-val").textContent = `${eng.concurrency || 2} slots · ${fmt(radixData.l1_active_tokens)} / ${fmt(radixData.l1_total_tokens)} toks`;
+      } else {
+        const poolDesc = radixData.l1_vram_pool || `${eng.concurrency || 2} slots · ${(eng.max_context || 262144)/1024}k (${(eng.kv || "q4_0").toUpperCase()})`;
+        const activeTok = radixData.l1_active_tokens != null ? `${fmt(radixData.l1_active_tokens)} toks` : "0 toks";
+        const l1Text = radixData.l1_vram_note || `${poolDesc} · ${activeTok} · ${expStr}`;
+        $("radix-l1-val").textContent = l1Text;
+      }
     }
     if ($("radix-l2-val")) {
       const nodeCount = radixData.l2_host_nodes != null ? radixData.l2_host_nodes : (radixData.l2_host_active || 0);

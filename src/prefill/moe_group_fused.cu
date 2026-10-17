@@ -268,8 +268,10 @@ __global__ void moe_cooperative_scatter_kernel(
             int e = ids[i];
             if ((unsigned)e < (unsigned)n_expert) {
                 int p = smem_offsets[e]++;
-                slot_out[i] = p;
-                src_out[p] = (int32_t)(i / k_top);
+                if ((unsigned)p < (unsigned)total_tokens) {
+                    slot_out[i] = p;
+                    src_out[p] = (int32_t)(i / k_top);
+                }
             }
         }
     }
@@ -291,6 +293,8 @@ void launch_moe_gpu_group(
         // Small tokens: Single-CTA persistent kernel
         g_single_cta_count.fetch_add(1, std::memory_order_relaxed);
         if (tables.cnt) cudaMemsetAsync(tables.cnt, 0, n_expert * sizeof(int32_t), stream);
+        if (tables.src) cudaMemsetAsync(tables.src, 0, total_tokens * sizeof(int32_t), stream);
+        if (tables.slot) cudaMemsetAsync(tables.slot, 0, total_tokens * sizeof(int32_t), stream);
 
         size_t smem_bytes = (3 * n_expert + 1) * sizeof(int32_t);
         moe_fused_cta_kernel<<<1, 256, smem_bytes, stream>>>(
@@ -301,6 +305,8 @@ void launch_moe_gpu_group(
         // Large tokens: Multi-CTA Cooperative Architecture (128 blocks for SM saturation)
         g_multi_cta_count.fetch_add(1, std::memory_order_relaxed);
         if (tables.cnt) cudaMemsetAsync(tables.cnt, 0, n_expert * sizeof(int32_t), stream);
+        if (tables.src) cudaMemsetAsync(tables.src, 0, total_tokens * sizeof(int32_t), stream);
+        if (tables.slot) cudaMemsetAsync(tables.slot, 0, total_tokens * sizeof(int32_t), stream);
 
         int num_blocks = MAX_BLOCKS;
         int64_t chunk_size = (total_tokens + num_blocks - 1) / num_blocks;

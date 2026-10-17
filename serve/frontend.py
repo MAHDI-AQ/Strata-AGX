@@ -50,10 +50,40 @@ class ChatTemplate:
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
+        # Normalize tool_calls arguments from JSON string to dict for Jinja template compatibility
+        norm_messages = []
+        for m in messages:
+            if isinstance(m, dict) and m.get("tool_calls") and isinstance(m["tool_calls"], list):
+                m_copy = dict(m)
+                norm_tcs = []
+                for tc in m_copy["tool_calls"]:
+                    if isinstance(tc, dict):
+                        tc_copy = dict(tc)
+                        fn = tc_copy.get("function")
+                        if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
+                            fn_copy = dict(fn)
+                            try:
+                                fn_copy["arguments"] = json.loads(fn_copy["arguments"])
+                            except Exception:
+                                pass
+                            tc_copy["function"] = fn_copy
+                        elif isinstance(tc_copy.get("arguments"), str):
+                            try:
+                                tc_copy["arguments"] = json.loads(tc_copy["arguments"])
+                            except Exception:
+                                pass
+                        norm_tcs.append(tc_copy)
+                    else:
+                        norm_tcs.append(tc)
+                m_copy["tool_calls"] = norm_tcs
+                norm_messages.append(m_copy)
+            else:
+                norm_messages.append(m)
+
         # Do not use completed empty assistant turns as examples for the next reply. Keep the final message.
         # (#843.  STRATA_KEEP_EMPTY_TURNS=1 renders them as before.)
-        messages = [m for i, m in enumerate(messages)
-                    if i == len(messages) - 1 or os.environ.get("STRATA_KEEP_EMPTY_TURNS") == "1" or not (isinstance(m, dict) and m.get("role") == "assistant"
+        messages = [m for i, m in enumerate(norm_messages)
+                    if i == len(norm_messages) - 1 or os.environ.get("STRATA_KEEP_EMPTY_TURNS") == "1" or not (isinstance(m, dict) and m.get("role") == "assistant"
                                                       and not _text_of(m.get("content")).strip()
                                                       and not _text_of(m.get("reasoning_content")).strip()
                                                       and not _has_image(m.get("content")) and not m.get("tool_calls"))]
@@ -154,7 +184,8 @@ THINK_TAGS = {"<think>": "\U000F0E01", "</think>": "\U000F0E02"}
 # the same special ids, so text with <|vision_start|><|image_pad|> before a picture took that picture's embeddings
 VISION_TAGS = {"<|vision_start|>": "\U000F0E03", "<|image_pad|>": "\U000F0E04", "<|vision_end|>": "\U000F0E05",
                "<|video_pad|>": "\U000F0E06"}
-LITERAL_TAGS = {**THINK_TAGS, **VISION_TAGS}
+TOOL_TAGS = {"<tool_call>": "\U000F0E07", "</tool_call>": "\U000F0E08", "<function=": "\U000F0E09", "</function>": "\U000F0E0A"}
+LITERAL_TAGS = {**THINK_TAGS, **VISION_TAGS, **TOOL_TAGS}
 THINK_MARKS = {v: k for k, v in LITERAL_TAGS.items()}
 CONTROL_MARK0 = 0xF0E10      # the control tokens' marks start here, clear of the two sets above
 
@@ -240,100 +271,32 @@ def unmark_think_literals(prompt: str, tags: dict[str, str] = LITERAL_TAGS) -> t
     return "".join(out), spans
 
 
-_SYSTEM_REMINDER_PATTERNS = [
-    re.compile(r"^\s*<system-reminder>[\s\S]*?</system-reminder>\s*$", re.IGNORECASE),
-    re.compile(r"^\s*Current runtime context:?[\s\S]*$", re.IGNORECASE),
-    re.compile(r"^\s*<context>[\s\S]*?</context>\s*$", re.IGNORECASE),
-]
-
-def _is_synthetic_system_reminder(content) -> bool:
-    if isinstance(content, str):
-        return any(p.match(content) for p in _SYSTEM_REMINDER_PATTERNS)
-    if isinstance(content, list) and len(content) == 1 and content[0].get("type") == "text":
-        text = content[0].get("text", "")
-        return any(p.match(text) for p in _SYSTEM_REMINDER_PATTERNS)
-    return False
-
 def _late_system_to_user(messages: list[dict]) -> list[dict]:
-    """
-    1. Converts late system messages (system after index 0) to user.
-    2. Identifies synthetic system reminders/context injected as user messages.
-       If an initial system/developer turn exists, hoists synthetic reminders into it
-       so the user turn contains PURE human queries, eliminating prompt hypnosis.
-    3. Merges any remaining consecutive user messages cleanly.
-    """
+    """The chat template takes a system message only at the start ("System message must be at the beginning").
+    Clients also send them mid-conversation - Claude Code's hook context as {"role": "system"} after the first user
+    turn, some OpenAI clients a late "developer" message (issue #56) - so those become user messages, in place:
+    merging them into the first one would change the prompt's start and cost the conversation cache every turn."""
     converted = [dict(m, role="user") if m.get("role") == "system" and i > 0 else m for i, m in enumerate(messages)]
-    
-    # Check if we have an initial system/developer turn
-    has_sys_at_0 = len(converted) > 0 and converted[0].get("role") in ("system", "developer")
-    
     merged = []
-    i = 0
-    while i < len(converted):
-        m = converted[i]
-        if m.get("role") != "user":
-            merged.append(m)
-            i += 1
-            continue
-
-        user_block = []
-        while i < len(converted) and converted[i].get("role") == "user":
-            user_block.append(converted[i])
-            i += 1
-
-        if len(user_block) == 1:
-            # Check if this single user message is synthetic and we can hoist it to the initial system turn
-            if has_sys_at_0 and len(merged) == 1 and _is_synthetic_system_reminder(user_block[0].get("content")):
-                sys_c = merged[0].get("content", "")
-                syn_c = user_block[0].get("content", "")
-                if isinstance(sys_c, str) and isinstance(syn_c, str):
-                    merged[0]["content"] = sys_c + chr(10) + chr(10) + syn_c
-                i_next = i
-                # proceed to next message
-                continue
-            merged.append(user_block[0])
-            continue
-
-        synthetic = []
-        regular = []
-        for u in user_block:
-            if _is_synthetic_system_reminder(u.get("content")):
-                synthetic.append(u)
+    for m in converted:
+        if merged and merged[-1].get("role") == "user" and m.get("role") == "user":
+            prev_c = merged[-1].get("content", "")
+            curr_c = m.get("content", "")
+            if isinstance(prev_c, str) and isinstance(curr_c, str):
+                merged[-1]["content"] = prev_c + chr(10) + chr(10) + curr_c
+            elif isinstance(prev_c, list) and isinstance(curr_c, list):
+                merged[-1]["content"] = prev_c + curr_c
+            elif isinstance(prev_c, list) and isinstance(curr_c, str):
+                merged[-1]["content"] = prev_c + [{"type": "text", "text": curr_c}]
+            elif isinstance(prev_c, str) and isinstance(curr_c, list):
+                merged[-1]["content"] = [{"type": "text", "text": prev_c}] + curr_c
             else:
-                regular.append(u)
-
-        # If we have an initial system message, hoist synthetic reminders directly into it!
-        if has_sys_at_0 and synthetic and len(merged) == 1:
-            for s_msg in synthetic:
-                sys_c = merged[0].get("content", "")
-                syn_c = s_msg.get("content", "")
-                if isinstance(sys_c, str) and isinstance(syn_c, str):
-                    merged[0]["content"] = sys_c + chr(10) + chr(10) + syn_c
-            # The remaining regular messages become the pure user block
-            target_block = regular if regular else synthetic
+                merged.append(m)
         else:
-            target_block = synthetic + regular if regular else synthetic
-
-        combined_content = None
-        for u in target_block:
-            c = u.get("content", "")
-            if combined_content is None:
-                combined_content = c
-            else:
-                if isinstance(combined_content, str) and isinstance(c, str):
-                    combined_content = combined_content + chr(10) + chr(10) + c
-                elif isinstance(combined_content, list) and isinstance(c, list):
-                    combined_content = combined_content + c
-                elif isinstance(combined_content, list) and isinstance(c, str):
-                    combined_content = combined_content + [{"type": "text", "text": c}]
-                elif isinstance(combined_content, str) and isinstance(c, list):
-                    combined_content = [{"type": "text", "text": combined_content}] + c
-
-        merged_user = dict(target_block[-1])
-        merged_user["content"] = combined_content
-        merged.append(merged_user)
-
+            merged.append(m)
     return merged
+
+
 def _object_list(value, name: str) -> list[dict]:
     """#460: a request's "messages" (or a message's "tool_calls") as a list of objects.  Some clients send the array
     double-encoded, as a JSON string, which used to be iterated character by character and crashed on m.get: such a
@@ -551,9 +514,44 @@ FUNC_START = "<function="
 FUNC_END = "</function>"
 
 
+def sanitize_pua(text: str) -> str:
+    """Decode byte-fallback Private Use Area characters and scrub remaining PUA junk.
+    0xF000..0xF0FF -> decoded UTF-8 bytes (0x00..0xFF).
+    Scrub: 0xE000..0xF8FF (excluding 0xF000..0xF0FF already mapped), 0xF0000..0xFFFFD, 0x100000..0x10FFFD.
+    Preserve internal LITERAL_TAGS marks (0xF0E01..0xF0E0A) and CONTROL_MARK0+ marks."""
+    out = []
+    byte_buf = bytearray()
+
+    def flush_bytes():
+        if byte_buf:
+            out.append(byte_buf.decode("utf-8", errors="replace"))
+            byte_buf.clear()
+
+    for c in text:
+        cp = ord(c)
+        if 0xF000 <= cp <= 0xF0FF:
+            byte_buf.append(cp - 0xF000)
+            continue
+        flush_bytes()
+        if 0xE000 <= cp <= 0xF8FF:
+            continue
+        elif 0xF0000 <= cp <= 0xFFFFD:
+            if 0xF0E01 <= cp <= 0xF0EFF:
+                out.append(c)
+            else:
+                continue
+        elif 0x100000 <= cp <= 0x10FFFD:
+            continue
+        else:
+            out.append(c)
+    flush_bytes()
+    return "".join(out)
+
+
+
 def param_end(text: str, final: bool = False) -> int:
     """Where a parameter value in `text` ends: the first `</parameter>` followed (after whitespace) by the next
-    `<parameter=` or `</function>` - the same text inside a value (a file that documents the call format, #210) is
+    `<parameter=`, `</function>`, or `</tool_call>` - the same text inside a value (a file that documents the call format, #210) is
     part of the value.  -1: none yet; -2: a candidate whose follower has not arrived (streaming; `final` accepts it)."""
     at = text.find(PARAM_END)
     while at >= 0:
@@ -725,15 +723,27 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     args = {}
     while "<parameter=" in rest:
         rest = rest[rest.index("<parameter=") + len("<parameter="):]
-        pname = rest[:rest.index(">")]
+        if ">" not in rest:
+            break
+        pname = rest[:rest.index(">")].strip()
         rest = rest[rest.index(">") + 1:]
         end = param_end(rest, final=True)
         value = rest[:end] if end >= 0 else rest
-        rest = rest[end + len(PARAM_END):] if end >= 0 else ""
+        if end >= 0 and rest[end:].startswith(PARAM_END):
+            rest = rest[end + len(PARAM_END):]
+        elif end >= 0:
+            rest = rest[end:]
+        else:
+            rest = ""
         if value.startswith("\n"):
             value = value[1:]
         if value.endswith("\n"):
             value = value[:-1]
+        value = sanitize_pua(value)
+        if not re.match(r"^[a-zA-Z0-9_-]+$", pname):
+            continue
+        if props and pname not in props:
+            continue
         declared = (props.get(pname) or {}).get("type")
         if declared == "string":
             args[pname] = value
@@ -746,6 +756,9 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
 
 
 RCALL_MAX = 256  # Task 4.1: Cap unclosed CoT tool call buffering to 256 chars        # the most of a `<tool_call>` inside the reasoning that is held while waiting for its end (#804)
+
+
+_TOOL_SYNTAX_RE = re.compile(r"</?tool_call>|<function=[^>]*>|</function>", re.IGNORECASE)
 
 
 class OutputParser:
@@ -770,6 +783,19 @@ class OutputParser:
         self.refused = 0             # declared calls kept as reasoning text (quoted, or the turn was cut)
         self.fence, self.line, self.ticks = "", "", 0
         self._reset_scan()
+        self.precall_buf = []
+        self.precall_len = 0
+        self.call_seen = False
+        self.holding_active = bool(self.schemas)
+
+    def _flush_precall(self, as_reasoning: bool) -> list[Event]:
+        out = []
+        for text in self.precall_buf:
+            out.append(Event("reasoning" if as_reasoning else "content", text))
+        self.precall_buf = []
+        self.precall_len = 0
+        self.holding_active = False
+        return out
 
     def _track(self, text: str) -> str:
         parts = text.split("\n")
@@ -841,12 +867,17 @@ class OutputParser:
                     b = stripped.find(">")
                     if b < 0:
                         return out
-                    pname = stripped[11:b]
+                    pname = stripped[11:b].strip()
+                    self.sp += b + 1
+                    props = ((self.schemas.get(self.scall.name if self.scall else "") or {}).get("parameters") or {}).get("properties") or {}
+                    if not re.match(r"^[a-zA-Z0-9_-]+$", pname) or (props and pname not in props):
+                        self.cur_pname = None
+                        self.ss = "skip_param"
+                        continue
                     self.cur_pname = pname
                     self.seen_params[pname] = []
                     args(("" if self.sfirst else ",") + json.dumps(pname) + ":")
                     self.sfirst = False
-                    self.sp += b + 1
                     if self.sdeclared.get(pname) == "string":
                         args('"')
                         self.ss, self.sval_started = "str", False
@@ -887,11 +918,12 @@ class OutputParser:
                     if getattr(self, "cur_pname", None) in self.seen_params:
                         self.seen_params[self.cur_pname].append(value)
                     args(json.dumps(value)[1:-1] + '"')
-                    self.sp += end + len(PARAM_END)
+                    skip_len = len(PARAM_END) if rest[end:].startswith(PARAM_END) else 0
+                    self.sp += end + skip_len
                     self.ss = "between"
                     continue
                 # an undecided </parameter> (-2) is held from its start, like a tag still arriving
-                safe = rest.find(PARAM_END) if end == -2 else len(rest) - self._hold(rest, (PARAM_END,))
+                safe = rest.find(PARAM_END) if end == -2 else len(rest) - self._hold(rest, (PARAM_END, FUNC_END, CALL_END, "<parameter="))
                 if safe > 0 and rest[safe - 1] == "\n":   # may be the trailing newline before </parameter>
                     safe -= 1
                 if safe > 0:
@@ -916,7 +948,15 @@ class OutputParser:
                 if getattr(self, "cur_pname", None) in self.seen_params:
                     self.seen_params[self.cur_pname].append(str(v))
                 args(json.dumps(v, ensure_ascii=False))
-                self.sp += end + len(PARAM_END)
+                skip_len = len(PARAM_END) if rest[end:].startswith(PARAM_END) else 0
+                self.sp += end + skip_len
+                self.ss = "between"
+            elif self.ss == "skip_param":
+                end = param_end(rest)
+                if end < 0:
+                    return out
+                skip_len = len(PARAM_END) if rest[end:].startswith(PARAM_END) else 0
+                self.sp += end + skip_len
                 self.ss = "between"
             else:
                 return out
@@ -964,21 +1004,21 @@ class OutputParser:
                     best = max(best, n)
         return best
 
-    def feed(self, delta: str) -> list[Event]:
-        self.buf += delta
+    def _feed_raw(self, delta: str) -> list[Event]:
+        self.buf += sanitize_pua(delta)
         out: list[Event] = []
         while True:
             if self.state == "rcall":
                 # #804: a `<tool_call>` inside the reasoning, with tools declared.
                 body = self.buf[len(CALL_START):]
-                if not self.fence and not self.ticks and self.line.strip() == "":
-                    name = extract_call_name(body)
-                    if name and name in self.schemas:
-                        out += self._release(False)
-                        self.buf = body
-                        self._reset_scan()
-                        self.state, self.lead = "call", False
-                        continue
+                name = extract_call_name(body)
+                if name and name in self.schemas:
+                    out += self._release(False)
+                    out.append(Event("reasoning", "\n</think>\n"))
+                    self.buf = body
+                    self._reset_scan()
+                    self.state, self.lead = "call", False
+                    continue
                 end, think = call_end(body), body.find(THINK_END)
                 if end >= 0 and (think < 0 or think >= end):
                     call = None
@@ -1106,7 +1146,7 @@ class OutputParser:
                 self._reset_scan()
                 self.state, self.lead = "content", True
 
-    def finish(self) -> list[Event]:
+    def _finish_raw(self) -> list[Event]:
         """End of generation: flush whatever is held (an unterminated tool call is returned as content; one that was
         already announced stays unfinished: its JSON is not closed and no "tool_call" follows it, #211)."""
         out = []
@@ -1145,6 +1185,7 @@ class OutputParser:
             # an unfinished call inside the reasoning (#804) is reasoning text, never a call
             kind = {"reasoning": "reasoning", "rcall": "reasoning", "content": "content"}.get(self.state, "content")
             text = self.buf if self.state != "call" else CALL_START + self.buf
+            text = _TOOL_SYNTAX_RE.sub("", text)
             # Bug 1 Guard: Never leak raw orphan tool delimiters as content deltas
             if self.state == "call":
                 cleaned_text = text.strip()
@@ -1154,3 +1195,64 @@ class OutputParser:
                 out.append(Event(kind, text))
             self.buf = ""
         return out
+
+    def feed(self, delta: str) -> list[Event]:
+        raw = self._feed_raw(delta)
+        if not self.holding_active:
+            return raw
+        out = []
+        for ev in raw:
+            if ev.kind in ("tool_start", "tool_call", "tool_args"):
+                self.call_seen = True
+                if self.precall_buf:
+                    out.extend(self._flush_precall(as_reasoning=True))
+                out.append(ev)
+            elif ev.kind == "content":
+                if self.call_seen:
+                    out.append(ev)
+                else:
+                    self.precall_buf.append(ev.text)
+                    self.precall_len += len(ev.text)
+                    if self.precall_len > 400:
+                        out.extend(self._flush_precall(as_reasoning=False))
+            else:
+                out.append(ev)
+        return out
+
+    def finish(self) -> list[Event]:
+        raw = self._finish_raw()
+        if not self.holding_active:
+            # Strip trailing orphaned delimiters from any remaining raw events
+            for ev in raw:
+                if ev.kind in ("content", "reasoning") and ev.text:
+                    ev.text = _TOOL_SYNTAX_RE.sub("", ev.text)
+            return [ev for ev in raw if ev.kind not in ("content", "reasoning") or ev.text.strip()]
+        out = []
+        for ev in raw:
+            if ev.kind in ("tool_start", "tool_call", "tool_args"):
+                self.call_seen = True
+                if self.precall_buf:
+                    out.extend(self._flush_precall(as_reasoning=True))
+                out.append(ev)
+            elif ev.kind == "content":
+                cleaned_text = _TOOL_SYNTAX_RE.sub("", ev.text)
+                if not cleaned_text.strip():
+                    continue
+                ev.text = cleaned_text
+                if self.call_seen:
+                    out.append(ev)
+                else:
+                    self.precall_buf.append(ev.text)
+            else:
+                out.append(ev)
+        if self.precall_buf:
+            out.extend(self._flush_precall(as_reasoning=self.call_seen))
+        # Strip any orphaned tool delimiters from final flushed text
+        final_out = []
+        for ev in out:
+            if ev.kind in ("content", "reasoning") and ev.text:
+                ev.text = _TOOL_SYNTAX_RE.sub("", ev.text)
+                if not ev.text.strip():
+                    continue
+            final_out.append(ev)
+        return final_out

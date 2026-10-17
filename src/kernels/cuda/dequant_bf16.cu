@@ -2,6 +2,7 @@
 //
 // Arithmetic transcribed from ggml/src/ggml-quants.c at the pinned llama.cpp (MIT License, Copyright (c) 2023-2026
 // The ggml authors): dequantize_row_q2_0/q4_0/q5_0/q8_0/q3_K/q4_K/q5_K/q6_K/iq4_nl/iq4_xs.
+#include <unistd.h>
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 
@@ -197,7 +198,7 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     if (!geometry(type, be, bb) || cols % be != 0 || rows <= 0) {
         std::fprintf(stderr, "dequant: unsupported type %d or shape %lld x %lld\n", type, (long long) rows,
                      (long long) cols);
-        std::exit(1);
+        _exit(1);
     }
     const int64_t row_bytes = cols / be * bb, gpr = cols / 32, total = rows * gpr;
     const unsigned grid = (unsigned) ((total + 255) / 256);
@@ -219,7 +220,7 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     }
 #undef STRATA_DQ
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "dequant launch: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) { std::fprintf(stderr, "dequant launch: %s\n", cudaGetErrorString(e)); _exit(1); }
 }
 
 }  // namespace

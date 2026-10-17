@@ -169,7 +169,7 @@ Verifier::~Verifier() {
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (commit_done_) cudaEventDestroy(commit_done_);
     if (arena_) cudaFree(arena_);
-    void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
+    void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_probs_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
                      h_flagA_, h_plan_, h_flagB_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
@@ -243,6 +243,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped((2 + T) * 4 + 16, (void**) &h_commit_, (void**) &m_commit_) &&
               mapped(T * N * 4, (void**) &h_ple_, (void**) &m_ple_) &&
               mapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_) &&
+              mapped(T * 4 + 16, (void**) &h_probs_, (void**) &m_probs_) &&
               mapped(T * N * 4, (void**) &h_x_, (void**) &m_x_) &&
               mapped(T * K * 4, (void**) &h_ids_, (void**) &m_ids_) &&
               mapped(T * K * 4, (void**) &h_w_, (void**) &m_w_) &&
@@ -293,7 +294,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         scores_ = b.take<float>(T * (uint64_t) max_blocks_); sel_ = b.take<int32_t>(T * (uint64_t) cap_);
         attn_ = b.take<float>(T * NH * HD); attn32_ = b.take<float>(T * NH * HD);
         attn_scratch_ = b.take<float>(T * (uint64_t) attn_scratch_floats_);
+        const int64_t PS = max_blocks_ * ID;
         tail_snap_ = b.take<float>(nQ * TS);
+        block_pos_snap_ = b.take<int32_t>(nQ);
+        pooled_snap_ = b.take<float>(nQ * PS);
         logits_ = b.take<float>(T * (uint64_t) g.n_expert); w_ = b.take<float>(T * K); ids_ = b.take<int32_t>(T * K);
         shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); hit_out_ = b.take<float>(T * K * N);
         hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
@@ -423,6 +427,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
     const int64_t TS = (s.idx_block - 1) * ID;
+    const int64_t PS = max_blocks_ * ID;
     const bool ple_on = ss.ple.ready() && ple_stage();
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
     const int G = (split_ && T >= 2) ? 2 : 1;
@@ -626,7 +631,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase
                     fwht256_inplace_cuda(vcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
                 }
                 stamp(l, 8, grp);
-                if (grp == 0) copy_from_mapped(tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, cs);
+                if (grp == 0) {
+                    copy_from_mapped(tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, cs);
+                    copy_i32_from_mapped(block_pos_snap_ + qi, st.idx_block_pos, 1, cs);
+                    copy_from_mapped(pooled_snap_ + (size_t) qi * PS, st.idx_pooled, PS, cs);
+                }
                 // K2: one launch per K/V over the group's rows; each row's position is read from its own
                 // device step row at replay. The per-token loop below stays the oracle (and the path for
                 // n == 1, kv_hybrid/kv_int8/fp16, and STRATA_DEC_BATCH=0).
@@ -1070,6 +1079,7 @@ bool Verifier::capture_commit(std::string& err) {
     const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     const int64_t TS = (s.idx_block - 1) * ID;
+    const int64_t PS = max_blocks_ * ID;
     const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "verify: begin commit capture failed";
@@ -1098,6 +1108,8 @@ bool Verifier::capture_commit(std::string& err) {
                 const WeightRef* wikn = need(v, "indexer.k_norm.weight", err);
                 if (!wikn) { ok = false; break; }
                 copy_from_mapped(st.idx_tail, tail_snap_ + (size_t) qsa_index * TS, TS, cs_);
+                copy_i32_from_mapped(st.idx_block_pos, block_pos_snap_ + qsa_index, 1, cs_);
+                copy_from_mapped(st.idx_pooled, pooled_snap_ + (size_t) qsa_index * PS, PS, cs_);
                 const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                 for (int64_t t = 0; t < MT; ++t)
                     native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + t) * ID, commit_ + 2 + t, 0,
@@ -1630,6 +1642,10 @@ bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool
             auto sp = v.sampling_;
             sp.counter = (uint64_t) b.position;
             sample_tokens(v.head_logits_, b.count, (int) v.n_vocab_, v.hist_d_, v.hist_len_, sp, v.m_out_, cs_);
+            if (b.count > 1 && v.m_probs_ != nullptr) {
+                const float inv_temp = sp.temperature > 0.0f ? (1.0f / sp.temperature) : 1.0f;
+                row_top_prob(v.head_logits_, b.count - 1, (int) v.n_vocab_, v.tok_ + 1, v.m_probs_, cs_, inv_temp);
+            }
         }
     }
     if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "batch verify: sampling failed"; return false; }
@@ -1977,6 +1993,10 @@ bool Verifier::pass_finish_outputs(int T, int32_t* out, std::string& err) {
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) last_pos0_;
         sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
+        if (T > 1 && m_probs_ != nullptr) {
+            const float inv_temp = sp.temperature > 0.0f ? (1.0f / sp.temperature) : 1.0f;
+            row_top_prob(head_logits_, T - 1, (int) n_vocab_, tok_ + 1, m_probs_, cs_, inv_temp);
+        }
         if (cudaStreamSynchronize(cs_) != cudaSuccess) {   // m_out_ is the mapped h_out_: synced, it is readable
             err = "verify: the head sampling failed";
             return false;
@@ -2062,6 +2082,10 @@ bool Verifier::end_pass_batch(const std::vector<BatchWindow>& batch, std::string
             auto sp = v.sampling_;
             sp.counter = (uint64_t) b.position;
             sample_tokens(v.head_logits_, b.count, (int) v.n_vocab_, v.hist_d_, v.hist_len_, sp, v.m_out_, cs_);
+            if (b.count > 1 && v.m_probs_ != nullptr) {
+                const float inv_temp = sp.temperature > 0.0f ? (1.0f / sp.temperature) : 1.0f;
+                row_top_prob(v.head_logits_, b.count - 1, (int) v.n_vocab_, v.tok_ + 1, v.m_probs_, cs_, inv_temp);
+            }
         }
     }
     if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "batch verify: sampling failed"; return false; }
@@ -2083,6 +2107,12 @@ bool Verifier::wait_commit(std::string& err) {
         if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
     }
     return next_ == nullptr || next_->wait_commit(err);
+}
+
+float Verifier::target_draft_prob(int t) const {
+    if (next_ != nullptr) return next_->target_draft_prob(t);
+    if (h_probs_ == nullptr || t < 0 || t >= max_t_) return 0.0f;
+    return h_probs_[t];
 }
 
 bool Verifier::copy_logits(int t, float* host) const {

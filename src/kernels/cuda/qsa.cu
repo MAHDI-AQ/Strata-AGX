@@ -40,6 +40,7 @@
 //    Every comparison still passed at any sane tolerance, the spare key landing 0.4 f32 ulp away; only a
 //    BIT-EXACT assertion plus a full-precision probe of the intermediate found it.  That is the strongest
 //    argument in this file for keeping both.
+#include <unistd.h>
 #include "strata/core/emulate.hpp"
 #include "strata/kernels/qsa.hpp"
 
@@ -63,14 +64,14 @@ constexpr int THREADS = 128;
 
 void fail(const char* what) {
     std::fprintf(stderr, "qsa: %s\n", what);
-    std::exit(1);
+    _exit(1);
 }
 
 void check_launch(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "qsa: %s launch: %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
 }
 
@@ -81,7 +82,7 @@ void check_sync(const char* what) {
     const cudaError_t e = cudaDeviceSynchronize();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "qsa: %s (synchronise): %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
 }
 
@@ -91,27 +92,27 @@ void validate(const QsaShapes& s, const char* who) {
     if (s.n_head <= 0 || s.n_head_kv <= 0 || s.head_dim <= 0 || s.idx_dim <= 0 || s.idx_n_head <= 0 ||
         s.idx_block < 2 || s.page_size < 1) {
         std::fprintf(stderr, "qsa: %s: geometry is not set up\n", who);
-        std::exit(1);
+        _exit(1);
     }
     if (s.n_head % s.n_head_kv != 0) {
         std::fprintf(stderr, "qsa: %s: n_head %lld is not a multiple of n_head_kv %lld\n", who,
                      (long long) s.n_head, (long long) s.n_head_kv);
-        std::exit(1);
+        _exit(1);
     }
     if (s.head_dim % 4 != 0) {
         std::fprintf(stderr, "qsa: %s: head_dim %lld must be a multiple of 4 (the gather copies uint2)\n", who,
                      (long long) s.head_dim);
-        std::exit(1);
+        _exit(1);
     }
     if (s.n_rot <= 0 || s.n_rot % 2 != 0 || s.n_rot > s.head_dim || s.n_rot > s.idx_dim) {
         std::fprintf(stderr, "qsa: %s: n_rot %lld must be even and <= head_dim %lld and idx_dim %lld\n", who,
                      (long long) s.n_rot, (long long) s.head_dim, (long long) s.idx_dim);
-        std::exit(1);
+        _exit(1);
     }
     if (s.idx_n_head > 32) {
         std::fprintf(stderr, "qsa: %s: idx_n_head %lld > 32 (one warp per indexer head)\n", who,
                      (long long) s.idx_n_head);
-        std::exit(1);
+        _exit(1);
     }
 }
 
@@ -689,7 +690,7 @@ int32_t* step_scratch() {
     if (d_step == nullptr) {
         if (cudaMalloc(&d_step, qsa_step_bytes()) != cudaSuccess) {
             std::fprintf(stderr, "qsa: step upload: cudaMalloc failed\n");
-            std::exit(1);
+            _exit(1);
         }
     }
     return d_step;
@@ -699,7 +700,7 @@ void step_upload_raw(const int32_t* h_step) {
     int32_t* d = step_scratch();
     if (cudaMemcpy(d, h_step, qsa_step_bytes(), cudaMemcpyHostToDevice) != cudaSuccess) {
         std::fprintf(stderr, "qsa: step upload: cudaMemcpy failed\n");
-        std::exit(1);
+        _exit(1);
     }
 }
 
@@ -714,7 +715,7 @@ const int32_t* step_upload(int64_t pos, int64_t n_kv_hint, const QsaShapes& s) {
     if (n_kv_hint >= 0 && n_kv_hint != (int64_t) h[kStepNKv]) {
         std::fprintf(stderr, "qsa: step upload: n_kv %lld disagrees with pos+1 = %d\n", (long long) n_kv_hint,
                      h[kStepNKv]);
-        std::exit(1);
+        _exit(1);
     }
     step_upload_raw(h);
     return step_scratch();
@@ -778,7 +779,7 @@ void topk_512_step(const float* cell_scores, const QsaShapes& s, int64_t cap, co
     if (cap < width_max) {
         std::fprintf(stderr, "qsa: topk_512: cap %lld < the largest possible selection width %lld\n",
                      (long long) cap, (long long) width_max);
-        std::exit(1);
+        _exit(1);
     }
     // One block, so the launch is already constant; the kernel reads `n_kv` and `width` from `step`.
     topk_kernel<<<1, TOPK_THREADS, 0, (cudaStream_t) stream>>>(cell_scores, step, ids);
@@ -852,13 +853,13 @@ void qsa_attend_step(const float* q, const uint16_t* k_scratch, const uint16_t* 
         if ((int) smem > max_shared) {
             std::fprintf(stderr, "qsa: qsa_attend: max_ids %lld needs %zu B of shared, over the %d B limit\n",
                          (long long) max_ids, smem, max_shared);
-            std::exit(1);
+            _exit(1);
         }
         const cudaError_t e =
             cudaFuncSetAttribute(qsa_attend_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
         if (e != cudaSuccess) {
             std::fprintf(stderr, "qsa: qsa_attend: shared opt-in: %s\n", cudaGetErrorString(e));
-            std::exit(1);
+            _exit(1);
         }
         s_configured = smem;
     }
@@ -921,7 +922,7 @@ void qsa_index(const float* pooled, int64_t n_bid, const float* q_idx, const flo
     if ((n_kv / s.idx_block) != n_bid) {
         std::fprintf(stderr, "qsa: qsa_index: n_bid %lld is not n_kv %lld / r %lld\n", (long long) n_bid,
                      (long long) n_kv, (long long) s.idx_block);
-        std::exit(1);
+        _exit(1);
     }
     // THIS TOKEN'S counts as the CAPACITIES: correct for a direct launch, WRONG in a graph.  The layer passes a
     // constant `max_blocks` from its state instead - see the note in `qsa.hpp`.
@@ -935,7 +936,7 @@ void topk_512(const float* cell_scores, int64_t n_kv, const QsaShapes& s, int64_
     if (n_kv > kTopkMaxCells) {
         std::fprintf(stderr, "qsa: topk_512: n_kv %lld > kTopkMaxCells %lld (one block; phase 3 replaces this)\n",
                      (long long) n_kv, (long long) kTopkMaxCells);
-        std::exit(1);
+        _exit(1);
     }
     topk_512_step(cell_scores, s, cap, step_upload(n_kv - 1, n_kv, s), ids, stream);
 }

@@ -1,3 +1,4 @@
+#include <unistd.h>
 // src/prefill/gdn_rec_parity.cu - the prompt path's DeltaNet recurrence, bit for bit and timed.
 //
 // src/prefill/kernels.cu runs gdn_rec_kh_kernel (the three value heads that share a key head in one thread, the
@@ -38,7 +39,7 @@ constexpr int CB = 32, NCB = S / CB;
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
         std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
-        std::exit(2);
+        _exit(2);
     }
 }
 

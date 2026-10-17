@@ -1,4 +1,5 @@
 // src/kernels/cuda/qsa_prompt_attn.cu - see include/strata/kernels/qsa_prompt_attn.hpp.
+#include <unistd.h>
 #include "strata/core/emulate.hpp"
 #include <cstdlib>
 #include <cstring>
@@ -700,7 +701,7 @@ bool launch_i8(const float* q, const QsaAttnPools& pools, const int32_t* ids, co
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "qsa_prompt_attn_batch: %s\n", cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
     return true;
 }
@@ -731,7 +732,7 @@ bool launch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "qsa_prompt_attn_batch: %s\n", cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
     return true;
 }
@@ -1011,7 +1012,7 @@ bool launch_wmma(const float* q, const QsaAttnPools& pools, const int32_t* ids, 
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "qsa_prompt_attn_batch (wmma): %s\n", cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
     return true;
 }

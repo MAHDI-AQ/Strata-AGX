@@ -955,6 +955,9 @@ RadixMatch RadixTree::match_prefix(const int32_t* tokens, size_t n) const {
         if (it == curr->children.end()) break;
 
         auto child = it->second;
+        // CRIT-03: If child is actively staging to NVMe with host memory pending free,
+        // stop traversal at current node so caller does not encounter use-after-free on host RAM.
+        if (child->is_staging_to_nvme) break;
         const auto& edge = child->edge_tokens;
         const auto& chunk_hashes = child->edge_chunk_hashes;
         size_t match_edge = 0;
@@ -1023,17 +1026,28 @@ RadixMatch RadixTree::match_prefix(const int64_t* tokens, size_t n) const {
         if (it == curr->children.end()) break;
 
         auto child = it->second;
+        // CRIT-03: If child is actively staging to NVMe with host memory pending free,
+        // stop traversal at current node so caller does not encounter use-after-free on host RAM.
+        if (child->is_staging_to_nvme) break;
         const auto& edge = child->edge_tokens;
         const auto& chunk_hashes = child->edge_chunk_hashes;
         size_t match_edge = 0;
         const size_t max_comp = std::min(edge.size(), n - matched_len);
         const size_t num_chunks = max_comp / kRadixChunkTokens;
 
-        // Task 2.1: 64-token chunk hash comparison
+        // Task 2.1: 64-token chunk hash comparison + raw token comparison against CRC32C collisions
         size_t c = 0;
         for (; c < num_chunks && c < chunk_hashes.size(); ++c) {
             const uint64_t q_hash = compute_token_chunk_hash(tokens + matched_len + c * kRadixChunkTokens, kRadixChunkTokens);
             if (chunk_hashes[c] != q_hash) break;
+            // CACHE-02: Enforce raw token verification across matched chunk to prevent CRC32C hash collisions
+            int32_t chunk_buf[kRadixChunkTokens];
+            for (size_t i = 0; i < kRadixChunkTokens; ++i) {
+                chunk_buf[i] = static_cast<int32_t>(tokens[matched_len + c * kRadixChunkTokens + i]);
+            }
+            if (std::memcmp(edge.data() + c * kRadixChunkTokens, chunk_buf, kRadixChunkTokens * sizeof(int32_t)) != 0) {
+                break;
+            }
             match_edge += kRadixChunkTokens;
         }
 
@@ -1104,6 +1118,9 @@ std::shared_ptr<RadixNode> RadixTree::insert(
         }
 
         auto child = it->second;
+        // CRIT-03: If child is actively staging to NVMe with host memory pending free,
+        // stop traversal at current node so caller does not encounter use-after-free on host RAM.
+        if (child->is_staging_to_nvme) break;
         const auto& edge = child->edge_tokens;
         size_t match_edge = 0;
         const size_t max_comp = std::min(edge.size(), (size_t) prefix_len - matched_len);
@@ -1334,10 +1351,13 @@ std::shared_ptr<RadixNode> RadixTree::insert(
                 }
             }
         }
+        // CRIT-04: Drop rw_lock_ across the 300-800ms DMA drain to prevent reader starvation on concurrent slots!
+        lock.unlock();
         for (size_t st = 0; st < n_stages; ++st) {
             const core::OnDevice on(stage_devices[st]);
             cudaStreamSynchronize((cudaStream_t) streams[st]);
         }
+        lock.lock();
         // S26f: verify the capture actually landed (cudaMalloc OOMs are otherwise silent here).
         // A failed capture frees its partial allocations and leaves the path snapshot-less.
         bool snap_ok = true;
@@ -1544,7 +1564,7 @@ bool RadixTree::fork_to_session(
         }
     }
     node->last_accessed = std::chrono::steady_clock::now();
-    lock.unlock(); // Drop rw_lock_ before host-blocking cudaStreamSynchronize to eliminate scheduler deadlock
+    // CACHE-01: Do NOT drop rw_lock_ before cudaStreamSynchronize; keep rw_lock_ held during active PCIe DMA read
 
     // Task 2.4: Asynchronous Multi-Stage KV Forking across concurrent CUDA streams
     // Stage 0 and Stage 1 DMA memcpy operations overlap concurrently across streams[0] and streams[1].
@@ -1991,6 +2011,9 @@ std::shared_ptr<RadixNode> RadixTree::insert_direct_device_to_host(
         }
 
         auto child = it->second;
+        // CRIT-03: If child is actively staging to NVMe with host memory pending free,
+        // stop traversal at current node so caller does not encounter use-after-free on host RAM.
+        if (child->is_staging_to_nvme) break;
         const auto& edge = child->edge_tokens;
         size_t match_edge = 0;
         const size_t max_comp = std::min(edge.size(), (size_t) prefix_len - matched_len);
@@ -2220,10 +2243,13 @@ std::shared_ptr<RadixNode> RadixTree::insert_direct_device_to_host(
                 }
             }
         }
+        // CRIT-04: Drop rw_lock_ across the 300-800ms DMA drain to prevent reader starvation on concurrent slots!
+        lock.unlock();
         for (size_t st = 0; st < n_stages; ++st) {
             const core::OnDevice on(stage_devices[st]);
             cudaStreamSynchronize((cudaStream_t) streams[st]);
         }
+        lock.lock();
 
         bool snap_ok = true;
         for (size_t st = 0; st < n_stages && snap_ok; ++st) {

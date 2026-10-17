@@ -1,3 +1,4 @@
+#include <unistd.h>
 // src/prefill/kernels.cu - see include/strata/prefill/kernels.hpp.
 #include "strata/prefill/kernels.hpp"
 #include "strata/kernels/mrope.hpp"
@@ -59,7 +60,7 @@ __device__ float block_sum(float v, float* sh) {
 }
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "prefill %s: %s\n", what, cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) { std::fprintf(stderr, "prefill %s: %s\n", what, cudaGetErrorString(e)); _exit(1); }
 }
 unsigned blocks_for(int64_t n, int t = 256) { return (unsigned) ((n + t - 1) / t); }
 
@@ -1396,7 +1397,7 @@ void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t p
     // fires for a caller that bypassed it; the prompt path has no error return here, so it stops the process.
     if (const char* why = strata::kernels::rope_scaling_invalid(scaling)) {
         std::fprintf(stderr, "prefill rope: invalid rope scaling: %s\n", why);
-        std::exit(1);
+        _exit(1);
     }
     const float theta_scale = powf((float) scaling.freq_base, -2.0f / 64.0f);
     const strata::kernels::RopeKernelArgs k = scaling.kernel_args(64);   // none: the identity constants

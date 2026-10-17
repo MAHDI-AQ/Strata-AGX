@@ -14,6 +14,7 @@
 //
 // S2 IS SPECIALISED DELIBERATELY: it is 31.64 GiB of the 38 GiB pack, so it is the kernel that matters.  The
 // generic `s_gemv_split` still serves S4 and S8.
+#include <unistd.h>
 #include "strata/kernels/s_gemv.hpp"
 
 #include <cuda_fp16.h>
@@ -78,7 +79,7 @@ void s2_gemv_quads(const uint16_t* x, const uint8_t* codes, const float* scales,
     if (n_in <= 0 || n_out <= 0) return;
     if (n_in % 4 != 0) {
         std::fprintf(stderr, "s2_gemv_quads: n_in %lld is not a multiple of 4\n", (long long) n_in);
-        std::exit(1);
+        _exit(1);
     }
     const size_t smem = (size_t) threads_per_row * sizeof(float);
     s2_gemv_quads_kernel<<<(unsigned) n_out, threads_per_row, smem>>>(x, codes, scales, y, n_in, n_out,
@@ -86,7 +87,7 @@ void s2_gemv_quads(const uint16_t* x, const uint8_t* codes, const float* scales,
     const cudaError_t e = cudaDeviceSynchronize();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "s2_gemv_quads: %s\n", cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
 }
 

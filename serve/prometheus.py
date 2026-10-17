@@ -158,3 +158,6 @@ def strata(m: dict, out: list, lab: str):
     metric("cpu", "gauge", "CPU busy, percent (hardware.cpu).", hw.get("cpu"))
     metric("ram_used_bytes", "gauge", "RAM in use (hardware.ram_used).", hw.get("ram_used"))
     metric("ram_total_bytes", "gauge", "RAM (hardware.ram_total).", hw.get("ram_total"))
+    rx = m.get("radix") or {}
+    metric("radix_l1_active_tokens", "gauge", "Active tokens in L1 VRAM pool across all slots.", rx.get("l1_active_tokens"))
+    metric("radix_l1_total_tokens", "gauge", "Total token capacity of L1 VRAM pool.", rx.get("l1_total_tokens"))

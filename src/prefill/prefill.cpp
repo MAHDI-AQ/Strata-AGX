@@ -1141,7 +1141,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         // ---- embeddings, broadcast to the four streams - or, in a later stage of a layer split, the rows the
         // previous stage handed on
         if (hand_in_ != nullptr) {
-            if (cudaMemcpyAsync(m.R, hand_in_ + (size_t) c0 * D, (size_t) T * D * 4, cudaMemcpyHostToDevice, m.cs) !=
+            // CRIT-01: If P2P peer access is active, activations were already transferred directly
+            // into m.R over NVLink/PCIe by GPU 0 via cudaMemcpyPeerAsync. Do NOT issue redundant
+            // and racily overlapping host-to-device copy into m.R!
+            if (hand_in_ == (const float*) 0x1) {
+                // Peer-to-peer fast path: m.R already populated on device
+            } else if (cudaMemcpyAsync(m.R, hand_in_ + (size_t) c0 * D, (size_t) T * D * 4, cudaMemcpyHostToDevice, m.cs) !=
                 cudaSuccess) {
                 err = "prefill: the layer split's hand-off upload failed";
                 return false;
@@ -2230,12 +2235,15 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         err = "prefill: copy stream wait on micro-chunk event failed";
                         return false;
                     }
+                    bool p2p_done = false;
                     if (next_->impl_->device >= 0 && next_->impl_->R != nullptr) {
-                        cudaMemcpyPeerAsync(next_->impl_->R + (size_t) u0 * D, next_->impl_->device,
-                                            m.R + (size_t) u0 * D, m.device,
-                                            (size_t) uT * D * sizeof(float), copy_stream);
+                        if (cudaMemcpyPeerAsync(next_->impl_->R + (size_t) u0 * D, next_->impl_->device,
+                                                m.R + (size_t) u0 * D, m.device,
+                                                (size_t) uT * D * sizeof(float), copy_stream) == cudaSuccess) {
+                            p2p_done = true;
+                        }
                     }
-                    if (cudaMemcpyAsync(h + (size_t) u0 * D, m.R + (size_t) u0 * D,
+                    if (!p2p_done && cudaMemcpyAsync(h + (size_t) u0 * D, m.R + (size_t) u0 * D,
                                         (size_t) uT * D * sizeof(float),
                                         cudaMemcpyDeviceToHost, copy_stream) != cudaSuccess) {
                         err = std::string("prefill: micro-chunk hand-off DMA push: ") + cudaGetErrorString(cudaGetLastError());
@@ -2245,7 +2253,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     if (next_run.valid() && !next_run.get()) { err = next_err; return false; }
                     ChainGate* gate = chain ? chain_gate_ : nullptr;
                     if (gate != nullptr) gate->acquire();
-                    next_->hand_in_ = h + (size_t) u0 * D;
+                    next_->hand_in_ = p2p_done ? (const float*) 0x1 : (h + (size_t) u0 * D);
                     next_run = std::async(std::launch::async, [this, tokens, c0, u0, uT, p0, &next_err, gate, ev_l24] {
                         struct GateRelease {
                             ChainGate* g;
@@ -2279,12 +2287,15 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 err = "prefill: copy stream wait on hand-off event failed";
                 return false;
             }
+            bool p2p_done = false;
             if (next_->impl_->device >= 0 && next_->impl_->R != nullptr) {
-                cudaMemcpyPeerAsync(next_->impl_->R, next_->impl_->device,
-                                    m.R, m.device,
-                                    (size_t) T * D * sizeof(float), copy_stream);
+                if (cudaMemcpyPeerAsync(next_->impl_->R, next_->impl_->device,
+                                        m.R, m.device,
+                                        (size_t) T * D * sizeof(float), copy_stream) == cudaSuccess) {
+                    p2p_done = true;
+                }
             }
-            if (cudaMemcpyAsync(h, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, copy_stream) != cudaSuccess) {
+            if (!p2p_done && cudaMemcpyAsync(h, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, copy_stream) != cudaSuccess) {
                 err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
@@ -2293,7 +2304,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             if (next_run.valid() && !next_run.get()) { err = next_err; return false; }
             ChainGate* gate = chain ? chain_gate_ : nullptr;
             if (gate != nullptr) gate->acquire();
-            next_->hand_in_ = h;
+            next_->hand_in_ = p2p_done ? (const float*) 0x1 : h;
             next_run = std::async(std::launch::async, [this, tokens, c0, T, p0, &next_err, gate, ev_l24] {
                 struct GateRelease {
                     ChainGate* g;

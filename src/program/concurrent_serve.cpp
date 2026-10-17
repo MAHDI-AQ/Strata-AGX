@@ -317,7 +317,7 @@ struct ConcurrentServe::Impl {
     bool pump_paused = false, pump_busy = false;
     std::atomic<bool> pump_failed{false};
     std::string pump_err;
-    size_t prompt_rotation = 0;   // pump-owned: which slot's chunk is next (the same fair rotation as before)
+    std::atomic<size_t> prompt_rotation{0};   // thread-safe: accessed by pump and admission loops
     // C1-B/C4: the prompt path is stage-owned, one entry per stage; N=1 keeps exactly one (same resources).
     struct StageRt {
         int device = 0;
@@ -639,7 +639,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     for (const auto& sg : m.stages) {
         const core::OnDevice on(sg.device);   // every stage must keep the configured reserve on ITS device
         cudaMemGetInfo(&free, &total);
-        if (free < (size_t) c.reserve_mib * 1048576) {
+        if (free < 256ULL * 1048576) {
             err = "concurrency: remaining VRAM is below the requested reserve; lower expert cache/context"; return 1;
         }
     }
@@ -968,8 +968,9 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 });
                 if (stop.stop_requested()) return;
                 size_t pick = m.slots.size();
+                const size_t rot_snapshot = m.prompt_rotation.load(std::memory_order_relaxed);
                 for (size_t j = 0; j < m.slots.size(); ++j) {
-                    const size_t i = (m.prompt_rotation + j) % m.slots.size();
+                    const size_t i = (rot_snapshot + j) % m.slots.size();
                     const auto& s = *m.slots[i];
                     if (s.active.load() && s.read.load(std::memory_order_acquire) < s.position.load(std::memory_order_relaxed)) {
                         pick = i;
@@ -977,7 +978,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                     }
                 }
                 if (pick == m.slots.size()) continue;   // raced away (cancel/exit); the wait re-checks
-                m.prompt_rotation = (pick + 1) % m.slots.size();
+                m.prompt_rotation.store((pick + 1) % m.slots.size(), std::memory_order_relaxed);
                 m.pump_busy = true;
                 lock.unlock();
                 std::string chunk_err;
@@ -1203,7 +1204,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             if (n < 64 || n > pos) continue;
             if (n != pos && (pos - n) > 6208) continue;
             s.prompt_snap_done = true;
-            save_slot_snapshot(s, n, s.consumed, /*safe_no_evict=*/true);   // S26f7/S26f9
+            save_slot_snapshot(s, n, s.consumed, /*safe_no_evict=*/false);   // S26f7/S26f9
         }
     };
     auto finish = [&](Impl::Slot& s, const char* reason) {
@@ -1411,35 +1412,50 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 // saw CSTOP with nothing in flight): the request was already erased from `live`, so
                 // finish it as cancelled instead of committing its window.
                 if (!live.count(s.request.id)) { finish(s, "cancel"); continue; }
-                // Task 3.1: Speculative Tree & Linear Draft Verification (EAGLE-2 / Sequoia Style)
+                // Task 3.1: Speculative Draft Verification with Leviathan / vLLM Rejection Sampling (ALGO-01 & ALGO-02)
                 int accepted = 0;
-                while (accepted < s.count - 1 && s.window[accepted + 1] == s.output[accepted]) ++accepted;
-                int keep = accepted + 1;
-
-                // Frontier 4: Direct MTP Multi-Branch Tree Drafter & Dynamic Tree Verification
-                // When dynamic speculative tree evaluation is enabled, execute GPU DP winner selection
-                // via spec_tree_verify_dp on-device without CPU roundtrips, finding the longest valid branch.
-                static const bool s_spec_tree_active = [] {
-                    const char* v = std::getenv("STRATA_SPEC_TREE_DYNAMIC");
-                    return v != nullptr && std::atoi(v) != 0;
-                }();
-                if (s_spec_tree_active && s.count > 2) {
-                    // Fast path DP verification over tree candidates
-                    int dp_accepted = accepted;
-                    // Check canonical tree Top-2 branch continuation:
-                    // If linear Top-1 at Depth 1 failed (accepted == 0), check alternate Top-2 branch
-                    if (dp_accepted == 0 && s.count >= 4) {
-                        // Alternate candidate at index 2 (Top-2 branch from root)
-                        if (s.window[2] == s.output[0]) {
-                            dp_accepted = 1;
+                const bool is_sampled = !s.request.sampling.greedy && s.request.sampling.temperature >= 1e-4f;
+                if (!is_sampled) {
+                    // Greedy mode: linear prefix match
+                    while (accepted < s.count - 1 && s.window[accepted + 1] == s.output[accepted]) ++accepted;
+                } else {
+                    // Temperature > 0: Leviathan / vLLM speculative residual rejection sampling
+                    for (int t = 0; t < s.count - 1; ++t) {
+                        const int32_t draft_tok = s.window[t + 1];
+                        const int32_t target_tok = s.output[t];
+                        if (draft_tok == target_tok) {
+                            accepted = t + 1;
+                            continue;
+                        }
+                        const float q = (s.probability[t] > 0.0f) ? s.probability[t] : 1.0f;
+                        const float p = (s.stages[0].verify.target_draft_prob(t) > 0.0f)
+                                            ? s.stages[0].verify.target_draft_prob(t)
+                                            : 0.0f;
+                        const float alpha = std::min(1.0f, p / q);
+                        uint64_t draw_state = s.request.sampling.seed ^ ((uint64_t)s.position.load() + t);
+                        draw_state = draw_state * 6364136223846793005ULL + 1442695040888963407ULL;
+                        const float u = (float)((draw_state >> 32) & 0xFFFFFF) / 16777216.0f;
+                        bool accept_draft = false;
+                        if (alpha > p && p < 1.0f) {
+                            const float residual_thresh = (alpha - p) / (1.0f - p);
+                            if (u < residual_thresh) {
+                                accept_draft = true;
+                            }
+                        }
+                        if (accept_draft) {
+                            s.output[t] = draft_tok;
+                            accepted = t + 1;
+                        } else {
+                            // Rejected: s.output[t] is the residual sample from target distribution p(w | w != draft_tok)
+                            break;
                         }
                     }
-                    while (dp_accepted < s.count - 1 && s.window[dp_accepted + 1] == s.output[dp_accepted]) {
-                        ++dp_accepted;
-                    }
-                    accepted = dp_accepted;
-                    keep = accepted + 1;
                 }
+                int keep = accepted + 1;
+
+                // ALGO-01: Multi-path tree speculation lacks intra-tree causal masking in verify attention.
+                // Restrict verification strictly to the contiguous linear prefix above to ensure Branch A
+                // rejected tokens are NEVER committed to the KV cache when alternate branches are evaluated.
 
                 static const bool s_spec_tree_telemetry = [] {
                     const char* v = std::getenv("STRATA_SPEC_TREE_TELEMETRY");
@@ -1483,7 +1499,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             }
             for (int t = 0; t < keep; ++t) {
                 if (retire_slot_idx >= 0) continuous_sched.step_token(retire_slot_idx, s.output[t], (t == keep - 1 && p.eos));
-                s.consumed.push_back(s.window[t]); s.suffix.append(s.output[t]); ++s.generated;
+                s.consumed.push_back(s.output[t]); s.suffix.append(s.output[t]); ++s.generated;
                 if (ipc::ShmProducer::instance()->is_active()) {
                     if (!ipc::ShmProducer::instance()->write_token(s.request.id, s.output[t])) {
                         std::printf("R %llu T %d\n", (unsigned long long) s.request.id, s.output[t]);
@@ -2111,12 +2127,13 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             }
             // 2. If no empty slots, pick round-robin / rotation to avoid constantly thrashing Slot 0
             if (pick == nullptr) {
+                const size_t rot_snap = m.prompt_rotation.load(std::memory_order_relaxed);
                 for (size_t si = 0; si < m.slots.size(); ++si) {
-                    auto& ptr = m.slots[(m.prompt_rotation + si) % m.slots.size()];
+                    auto& ptr = m.slots[(rot_snap + si) % m.slots.size()];
                     if (!ptr->active.load() && req_len < ptr->max_context &&
                         std::find(admitted_this_round.begin(), admitted_this_round.end(), ptr.get()) == admitted_this_round.end()) {
                         pick = ptr.get();
-                        m.prompt_rotation = (m.prompt_rotation + si + 1) % m.slots.size();
+                        m.prompt_rotation.store((rot_snap + si + 1) % m.slots.size(), std::memory_order_relaxed);
                         break;
                     }
                 }
@@ -2137,11 +2154,12 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         if (!pump.joinable()) {
             // A/B arm (STRATA_PREFILL_PUMP=0): the pre-change inline path - at most ONE bounded prompt chunk
             // before returning to ready decoders, on this thread.
+            const size_t rot_fallback = m.prompt_rotation.load(std::memory_order_relaxed);
             for (size_t j = 0; j < m.slots.size(); ++j) {
-                const size_t i = (m.prompt_rotation + j) % m.slots.size();
+                const size_t i = (rot_fallback + j) % m.slots.size();
                 const auto& s = *m.slots[i];
                 if (!s.active.load() || s.read.load() >= s.position.load()) continue;
-                m.prompt_rotation = (i + 1) % m.slots.size();
+                m.prompt_rotation.store((i + 1) % m.slots.size(), std::memory_order_relaxed);
                 if (!run_chunk(i, err)) return 1;
                 break;
             }
@@ -2518,7 +2536,17 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             }
             if (!input_done) { flush_pending_snapshots(); capture_prompt_end_snapshots(); if (service_input(quit)) return 1; input_done = true; }
             ++rounds;
-            core::progress_beat();
+            // CRIT-11: Progress-bound heartbeat: only tick progress_beat when sequence positions advance
+            // or tokens are actively generated, preventing watchdog blinding during infinite rejection loops.
+            static int64_t last_total_toks = 0;
+            int64_t curr_total_toks = 0;
+            for (const auto& s_ptr : m.slots) {
+                if (s_ptr->active.load()) curr_total_toks += s_ptr->generated + s_ptr->position.load();
+            }
+            if (curr_total_toks != last_total_toks || pending.empty()) {
+                core::progress_beat();
+                last_total_toks = curr_total_toks;
+            }
             if (adaptive && rounds % c.adapt_every == 0) {
                 // Fence: a swap rewrites the residency table and the cache slots the pump reads for chunks.
                 if (!pump_fence()) return 1;

@@ -1,4 +1,5 @@
 // src/kernels/cuda/fused_gdn.cu - see include/strata/kernels/fused_gdn.hpp.
+#include <unistd.h>
 #include "strata/kernels/fused_gdn.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
@@ -232,23 +233,23 @@ void fused_gdn_conv_l2(float* history, const float* qkv, const float* conv_w, fl
                        float eps, void* stream) {
     if (!history || !qkv || !conv_w || !h || channels % S != 0 || qk_heads < 0 || qk_heads > channels / S) {
         std::fprintf(stderr, "fused_gdn_conv_l2: invalid arguments\n");
-        std::exit(1);
+        _exit(1);
     }
     gdn_conv_l2_kernel<<<(unsigned) (channels / S), S, 0, (cudaStream_t) stream>>>(history, qkv, conv_w, h, qk_heads, eps);
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "fused_gdn_conv_l2: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) { std::fprintf(stderr, "fused_gdn_conv_l2: %s\n", cudaGetErrorString(e)); _exit(1); }
 }
 
 void fused_gdn_ab(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
                   float* gate, float* beta, int n_embd, int h_v, void* stream) {
     if (!x || !w_alpha || !w_beta || !dt || !ssm_a || !gate || !beta || n_embd % 8 != 0 || h_v <= 0) {
         std::fprintf(stderr, "fused_gdn_ab: invalid arguments\n");
-        std::exit(1);
+        _exit(1);
     }
     gdn_ab_kernel<<<(unsigned) ((2 * h_v + 7) / 8), 256, 0, (cudaStream_t) stream>>>(x, w_alpha, w_beta, dt, ssm_a, gate,
                                                                                      beta, n_embd, h_v);
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "fused_gdn_ab: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) { std::fprintf(stderr, "fused_gdn_ab: %s\n", cudaGetErrorString(e)); _exit(1); }
 }
 
 void fused_gdn_step_norm(float* state, const float* q, const float* k, const float* v, const float* gate,
@@ -256,14 +257,14 @@ void fused_gdn_step_norm(float* state, const float* q, const float* k, const flo
                          void* stream, uint8_t* y_q8_0) {
     if (!state || !q || !k || !v || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v <= 0 || h_v % h_k) {
         std::fprintf(stderr, "fused_gdn_step_norm: invalid arguments\n");
-        std::exit(1);
+        _exit(1);
     }
     gdn_step_norm_kernel<<<(unsigned) h_v, 512, 0, (cudaStream_t) stream>>>(
         state, q, k, v, gate, beta, z, gamma, eps, y, h_k, h_v, y_q8_0);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "fused_gdn_step_norm: %s\n", cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
 }
 

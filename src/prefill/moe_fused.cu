@@ -1,3 +1,4 @@
+#include <unistd.h>
 // src/prefill/moe_fused.cu - see include/strata/prefill/moe_fused.hpp (#136: the Q2_0 pack's prompt experts on
 // Strata's own int8 tensor-core kernels, with the grouping on the GPU).
 //
@@ -33,7 +34,7 @@ namespace {
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
         std::fprintf(stderr, "prefill fused experts: %s: %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
 }
 
@@ -426,7 +427,7 @@ void group(const int32_t* ids, int64_t n, int k, int n_expert, void* scratch, in
            void* stream) {
     if (n_expert < 1 || n_expert > 1024) {
         std::fprintf(stderr, "prefill fused experts: %d experts (the grouping takes 1 to 1024)\n", n_expert);
-        std::exit(1);
+        _exit(1);
     }
     const cudaStream_t s = (cudaStream_t) stream;
     const Tables tb = tables(scratch, n_expert);

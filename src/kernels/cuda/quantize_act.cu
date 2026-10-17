@@ -21,6 +21,7 @@
 //      `rintf` differs from the reference wherever the f32 quotient rounds across a .5 boundary.
 //   3. The DEQUANTIZED value is `q * d16`, the fp16 scale, not `q * d32`.  The block stores fp16 and that is
 //      what a reader multiplies by.
+#include <unistd.h>
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
@@ -225,7 +226,7 @@ void quantize_q8_0(const float* x, uint8_t* blocks, int64_t n, void* stream) {
     if (n <= 0) return;
     if (n % QK8_0 != 0) {
         std::fprintf(stderr, "quantize_q8_0: n %lld is not a multiple of %d\n", (long long) n, QK8_0);
-        std::exit(1);
+        _exit(1);
     }
     const long long nb = n / QK8_0;
     const int threads = 128;
@@ -234,7 +235,7 @@ void quantize_q8_0(const float* x, uint8_t* blocks, int64_t n, void* stream) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "quantize_q8_0 launch: %s\n", cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
     if (stream == nullptr) cudaDeviceSynchronize();
 }
@@ -246,11 +247,11 @@ void quantize_q8_0_scaled(const float* x, uint8_t* blocks, float* scales, int64_
     if (n <= 0) return;
     if (n % QK8_0 != 0) {
         std::fprintf(stderr, "quantize_q8_0_scaled: n %lld is not a multiple of %d\n", (long long) n, QK8_0);
-        std::exit(1);
+        _exit(1);
     }
     if (scales == nullptr) {
         std::fprintf(stderr, "quantize_q8_0_scaled: scales is null\n");
-        std::exit(1);
+        _exit(1);
     }
     const long long nb = n / QK8_0;
     const int threads = 128;
@@ -259,7 +260,7 @@ void quantize_q8_0_scaled(const float* x, uint8_t* blocks, float* scales, int64_
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "quantize_q8_0_scaled launch: %s\n", cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
     if (stream == nullptr) cudaDeviceSynchronize();
 }
@@ -273,7 +274,7 @@ void dequant_q8_0(const uint8_t* blocks, float* x, int64_t n, void* stream) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "dequant_q8_0 launch: %s\n", cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
     if (stream == nullptr) cudaDeviceSynchronize();
 }
@@ -282,7 +283,7 @@ void quantize_q8_K(const float* x, uint8_t* blocks, int64_t n, void* stream) {
     if (n <= 0) return;
     if (n % QK_K != 0) {
         std::fprintf(stderr, "quantize_q8_K: n %lld is not a multiple of %d\n", (long long) n, QK_K);
-        std::exit(1);
+        _exit(1);
     }
     const long long nb = n / QK_K;
     const int threads = 64;                       // one block per thread, and a block is 256 elements
@@ -291,7 +292,7 @@ void quantize_q8_K(const float* x, uint8_t* blocks, int64_t n, void* stream) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "quantize_q8_K launch: %s\n", cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
     if (stream == nullptr) cudaDeviceSynchronize();
 }
@@ -305,7 +306,7 @@ void dequant_q8_K(const uint8_t* blocks, float* x, int64_t n, void* stream) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "dequant_q8_K launch: %s\n", cudaGetErrorString(e));
-        std::exit(1);
+        _exit(1);
     }
     if (stream == nullptr) cudaDeviceSynchronize();
 }

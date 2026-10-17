@@ -1,3 +1,4 @@
+#include <unistd.h>
 // src/prefill/gemm.cu - see include/strata/prefill/gemm.hpp.
 #include "strata/prefill/gemm.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
@@ -38,7 +39,7 @@ namespace {
 void ck(cublasStatus_t s, const char* what) {
     if (s != CUBLAS_STATUS_SUCCESS) {
         std::fprintf(stderr, "prefill gemm: %s: cuBLAS status %d\n", what, (int) s);
-        std::exit(1);
+        _exit(1);
     }
 }
 
@@ -52,7 +53,7 @@ void absorb_hipblas_sticky(const char* what) {
     const hipError_t sticky = hipGetLastError();
     if (sticky == hipSuccess || sticky == hipErrorInvalidValue) return;
     std::fprintf(stderr, "prefill gemm: %s left %s\n", what, hipGetErrorString(sticky));
-    std::exit(1);
+    _exit(1);
 }
 #define STRATA_ABSORB_HIPBLAS_STICKY(what) absorb_hipblas_sticky(what)
 #else
@@ -278,7 +279,7 @@ bool try_hipblaslt(void* opaque_state, strata::prefill::hipblaslt::InputType typ
     std::fprintf(stderr, "prefill gemm: hipBLASLt launch failed with status %d\n", (int) status);
     if (beta != 0.0f) {
         std::fprintf(stderr, "prefill gemm: refusing a fallback after hipBLASLt failed with nonzero beta\n");
-        std::exit(1);
+        _exit(1);
     }
     auto* mutable_state = static_cast<HipLtState*>(opaque_state);
     uint32_t beta_bits = 0;
@@ -477,7 +478,7 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     if (N * K > scratch_elems_) {
         // Too large for the scratch at once: in row slices.
         const int64_t rows = scratch_elems_ / K;
-        if (rows <= 0) { std::fprintf(stderr, "prefill gemm: scratch too small for K=%lld\n", (long long) K); std::exit(1); }
+        if (rows <= 0) { std::fprintf(stderr, "prefill gemm: scratch too small for K=%lld\n", (long long) K); _exit(1); }
         if (ldy <= 0) ldy = N;
         for (int64_t r0 = 0; r0 < N; r0 += rows) {
             const int64_t n = (N - r0 < rows) ? N - r0 : rows;

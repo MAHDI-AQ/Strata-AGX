@@ -8,6 +8,7 @@ static std::mutex g_device_rope_mutex;
 static float* g_device_cos[8] = {nullptr};
 static float* g_device_sin[8] = {nullptr};
 static int64_t g_device_rope_cells[8] = {0};
+static int g_device_rope_ref[8] = {0};
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
@@ -625,6 +626,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         if (g_device_cos[dev] != nullptr && g_device_rope_cells[dev] >= max_cells) {
             dev_cos_ptr = g_device_cos[dev];
             dev_sin_ptr = g_device_sin[dev];
+            ++g_device_rope_ref[dev];
         }
     }
     if (share_rope != nullptr) {
@@ -698,6 +700,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
                 g_device_cos[dev] = st.cos_tab;
                 g_device_sin[dev] = st.sin_tab;
                 g_device_rope_cells[dev] = max_cells;
+                ++g_device_rope_ref[dev];
             }
             if (s.n_rot == 64)   // the native and prompt-path rope kernels read it (mrope.hpp, STRATA_ROPE_TABLE=1)
                 strata::kernels::rope_table_set(st.cos_tab, st.sin_tab, (int) max_cells, strata::kernels::rope_scaling());
@@ -1360,9 +1363,14 @@ if (!block_layer_pre(tables, g, layer, pos, pos_base, gb, qst, qb, mb, k, bb, st
 void layer_device_rope_release(int dev) {
     if (dev >= 0 && dev < 8) {
         std::lock_guard<std::mutex> lock(g_device_rope_mutex);
-        g_device_cos[dev] = nullptr;
-        g_device_sin[dev] = nullptr;
-        g_device_rope_cells[dev] = 0;
+        if (g_device_rope_ref[dev] > 0) {
+            --g_device_rope_ref[dev];
+        }
+        if (g_device_rope_ref[dev] == 0) {
+            g_device_cos[dev] = nullptr;
+            g_device_sin[dev] = nullptr;
+            g_device_rope_cells[dev] = 0;
+        }
     }
 }
 
