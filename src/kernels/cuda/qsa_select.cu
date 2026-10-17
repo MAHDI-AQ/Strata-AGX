@@ -967,18 +967,18 @@ void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, i
 #if !defined(__HIPCC__)
 // Only Turing has a retained model measurement for this CUDA dispatch. Other CUDA devices keep the capacity rule
 // (the RTX 5070 regression below). Cache the properties per calling thread; layer-split device switches are checked.
-static bool topk_active_turing_device() {
+static bool topk_active_supported_device() {
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) return false;
     static thread_local int cached_device = -1;
-    static thread_local bool turing = false;
+    static thread_local bool supported = false;
     if (dev != cached_device) {
         cudaDeviceProp prop{};
         if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return false;
-        turing = prop.major == 7 && prop.minor == 5;
+        supported = (prop.major == 7 && prop.minor == 5) || prop.major >= 8;
         cached_device = dev;
     }
-    return turing;
+    return supported;
 }
 #endif
 
@@ -1078,7 +1078,7 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
     // on whatever card runs the tests (the kernels are the same on every architecture)
     static const bool any_card = [] { const char* v = std::getenv("STRATA_TOPK_ACTIVE_ANY"); return v && v[0] == '1'; }();
     const bool counted = !capacity_guard && active_blocks > 0 && active_blocks <= max_blocks &&
-                         (any_card || topk_active_turing_device());
+                         (any_card || topk_active_supported_device());
 #endif
     const int64_t reach = counted && active_blocks < max_blocks ? active_blocks : max_blocks;
     const int64_t fit = (int64_t) TK_T * (counted ? TK_PER_MAX : TK_PER);

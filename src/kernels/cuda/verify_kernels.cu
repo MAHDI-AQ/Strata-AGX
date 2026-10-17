@@ -266,18 +266,52 @@ __global__ void map_ids_kernel(int32_t* ids, const int32_t* __restrict__ table, 
 __global__ void row_top_prob_kernel(const float* __restrict__ logits, int n_vocab, const int32_t* __restrict__ ids,
                                     float* __restrict__ probs, float inv_temp = 1.0f) {
     __shared__ float part[32];
+    __shared__ float row_max;
     const int t = blockIdx.x;
     const float* l = logits + (size_t) t * n_vocab;
-    const float m = l[ids[t]];
+
+    // Phase 1: Compute true row max M = max_i l[i] across vocabulary
+    float m = -1e30f;
+    for (int i = threadIdx.x; i < n_vocab; i += blockDim.x) {
+        m = fmaxf(m, l[i]);
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    }
+    if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = m;
+    __syncthreads();
+
+    if (threadIdx.x < 32) {
+        float wm = (threadIdx.x < (int) (blockDim.x >> 5)) ? part[threadIdx.x] : -1e30f;
+        for (int o = 16; o > 0; o >>= 1) {
+            wm = fmaxf(wm, __shfl_xor_sync(0xffffffffu, wm, o));
+        }
+        if (threadIdx.x == 0) row_max = wm;
+    }
+    __syncthreads();
+
+    const float M = row_max;
+
+    // Phase 2: Compute exponential reduction sum_i exp((l[i] - M) * inv_temp)
     float s = 0.0f;
-    for (int i = threadIdx.x; i < n_vocab; i += blockDim.x) s += __expf((l[i] - m) * inv_temp);
-    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+    for (int i = threadIdx.x; i < n_vocab; i += blockDim.x) {
+        s += __expf((l[i] - M) * inv_temp);
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        s += __shfl_xor_sync(0xffffffffu, s, o);
+    }
     if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = s;
     __syncthreads();
+
     if (threadIdx.x == 0) {
         float tot = 0.0f;
         for (int w = 0; w < (int) (blockDim.x >> 5); ++w) tot += part[w];
-        probs[t] = 1.0f / tot;
+        const int32_t target_tok = ids[t];
+        float p = 0.0f;
+        if (tot > 0.0f && target_tok >= 0 && target_tok < n_vocab) {
+            p = __expf((l[target_tok] - M) * inv_temp) / tot;
+        }
+        probs[t] = p;
     }
 }
 

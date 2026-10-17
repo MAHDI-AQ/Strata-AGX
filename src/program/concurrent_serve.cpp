@@ -208,7 +208,12 @@ bool parse_request(const std::string& line, const ConcurrentConfig& config, cons
         return true;
     } catch (const std::exception& e) { err = "bad concurrent request: " + std::string(e.what()); return false; }
 }
-void error(uint64_t id, const std::string& e) { std::printf("R %llu ERR %s\n", (unsigned long long) id, e.c_str()); std::fflush(stdout); }
+static std::mutex s_stdout_mutex;
+void error(uint64_t id, const std::string& e) {
+    std::lock_guard<std::mutex> lock(s_stdout_mutex);
+    std::printf("R %llu ERR %s\n", (unsigned long long) id, e.c_str());
+    std::fflush(stdout);
+}
 }
 
 struct ConcurrentServe::Impl {
@@ -932,9 +937,12 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             ipc::ShmProducer::instance()->write_progress(s.request.id, read0 + n, (int64_t) s.request.tokens.size());
         }
         const double chunk_rate = chunk_ms > 0 ? (n / (chunk_ms / 1000.0)) : 0.0;
-        std::printf("R %llu PP %lld %zu %.1f %.1f %s\n", (unsigned long long) s.request.id, (long long) (read0 + n),
-                    s.request.tokens.size(), chunk_ms, chunk_rate, s.cache_tier.c_str());
-        std::fflush(stdout);
+        {
+            std::lock_guard<std::mutex> lock(s_stdout_mutex);
+            std::printf("R %llu PP %lld %zu %.1f %.1f %s\n", (unsigned long long) s.request.id, (long long) (read0 + n),
+                        s.request.tokens.size(), chunk_ms, chunk_rate, s.cache_tier.c_str());
+            std::fflush(stdout);
+        }
         // R2 (STRATA_PLE_PREFETCH, default off; a no-op without the env): this slot still has prompt left, so
         // its next run() call will want the next chunk's PLE rows - gather them on a thread now, while the
         // rotation runs the other slots.  The token window stays inside the request (read0 + n + n_next <=
@@ -1221,10 +1229,13 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         // 0 = the request read its whole prompt (fresh admission - all of today's traffic).
         // Task 1: Expose byte-accurate host_snapshot_bytes() from RadixTree in DONE telemetry
         const size_t live_l2_bytes = radix_tree.host_snapshot_bytes();
-        std::printf("R %llu DONE %lld %zu %.1f %.1f %s %lld %lld %lld %s %zu\n", (unsigned long long) s.request.id,
-                    (long long) s.generated, s.request.tokens.size(), s.prompt_ms.load(), decode, reason,
-                    (long long) s.accepted, (long long) s.offered, (long long) s.reused_prefix, s.cache_tier.c_str(), live_l2_bytes);
-        std::fflush(stdout);
+        {
+            std::lock_guard<std::mutex> lock(s_stdout_mutex);
+            std::printf("R %llu DONE %lld %zu %.1f %.1f %s %lld %lld %lld %s %zu\n", (unsigned long long) s.request.id,
+                        (long long) s.generated, s.request.tokens.size(), s.prompt_ms.load(), decode, reason,
+                        (long long) s.accepted, (long long) s.offered, (long long) s.reused_prefix, s.cache_tier.c_str(), live_l2_bytes);
+            std::fflush(stdout);
+        }
         if (defer_snapshot && !is_cancelled) {
             pending_snapshots.push_back(&s);   // flushed with its snapshot at a safe point
         } else if (s.radix_node) {
@@ -1446,7 +1457,48 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                             s.output[t] = draft_tok;
                             accepted = t + 1;
                         } else {
-                            // Rejected: s.output[t] is the residual sample from target distribution p(w | w != draft_tok)
+                            // Rejected: sample replacement token from true normalized residual distribution
+                            // p_prime(y) = max(0, p(y) - q(y)) / sum_z max(0, p(z) - q(z))
+                            const int64_t nv = s.stages[0].verify.vocab();
+                            if (nv > 0) {
+                                std::vector<float> logits((size_t) nv);
+                                if (s.stages[0].verify.copy_logits(t, logits.data())) {
+                                    float max_l = -1e30f;
+                                    for (int64_t i = 0; i < nv; ++i) {
+                                        if (logits[i] > max_l) max_l = logits[i];
+                                    }
+                                    const float inv_temp = 1.0f / s.request.sampling.temperature;
+                                    float sum_exp = 0.0f;
+                                    for (int64_t i = 0; i < nv; ++i) {
+                                        logits[i] = std::exp((logits[i] - max_l) * inv_temp);
+                                        sum_exp += logits[i];
+                                    }
+                                    const float inv_sum = sum_exp > 0.0f ? (1.0f / sum_exp) : 0.0f;
+                                    float sum_res = 0.0f;
+                                    for (int64_t i = 0; i < nv; ++i) {
+                                        const float p_y = logits[i] * inv_sum;
+                                        const float q_y = (i == (int64_t) draft_tok) ? q : 0.0f;
+                                        const float diff = std::max(0.0f, p_y - q_y);
+                                        logits[i] = diff;
+                                        sum_res += diff;
+                                    }
+                                    if (sum_res > 0.0f) {
+                                        draw_state = draw_state * 6364136223846793005ULL + 1442695040888963407ULL;
+                                        const float r = (float)((draw_state >> 32) & 0xFFFFFF) / 16777216.0f;
+                                        const float thresh = r * sum_res;
+                                        float cdf = 0.0f;
+                                        int32_t rep_tok = target_tok;
+                                        for (int64_t i = 0; i < nv; ++i) {
+                                            cdf += logits[i];
+                                            if (cdf >= thresh) {
+                                                rep_tok = (int32_t) i;
+                                                break;
+                                            }
+                                        }
+                                        s.output[t] = rep_tok;
+                                    }
+                                }
+                            }
                             break;
                         }
                     }
@@ -1500,15 +1552,20 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             for (int t = 0; t < keep; ++t) {
                 if (retire_slot_idx >= 0) continuous_sched.step_token(retire_slot_idx, s.output[t], (t == keep - 1 && p.eos));
                 s.consumed.push_back(s.output[t]); s.suffix.append(s.output[t]); ++s.generated;
-                if (ipc::ShmProducer::instance()->is_active()) {
-                    if (!ipc::ShmProducer::instance()->write_token(s.request.id, s.output[t])) {
+            }
+            {
+                std::lock_guard<std::mutex> lock(s_stdout_mutex);
+                for (int t = 0; t < keep; ++t) {
+                    if (ipc::ShmProducer::instance()->is_active()) {
+                        if (!ipc::ShmProducer::instance()->write_token(s.request.id, s.output[t])) {
+                            std::printf("R %llu T %d\n", (unsigned long long) s.request.id, s.output[t]);
+                        }
+                    } else {
                         std::printf("R %llu T %d\n", (unsigned long long) s.request.id, s.output[t]);
                     }
-                } else {
-                    std::printf("R %llu T %d\n", (unsigned long long) s.request.id, s.output[t]);
                 }
+                std::fflush(stdout);
             }
-            std::fflush(stdout);
             s.first = false;
             if (p.eos || s.generated >= s.request.max_new || s.position.load() + keep >= s.max_context) {
                 finish(s, p.eos ? "stop" : "length"); continue;

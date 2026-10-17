@@ -96,19 +96,22 @@ struct PinnedBuffer {
             }
         }
     }
+
     void resize(size_t bytes) { allocate(bytes); }
+
     void free() {
         if (ptr_) {
             if (is_fallback_) {
                 std::free(ptr_);
             } else {
-                cudaFreeHost(ptr_);
+                std::free(ptr_);
             }
             ptr_ = nullptr;
             size_ = 0;
             is_fallback_ = false;
         }
     }
+
     PinnedBuffer(const PinnedBuffer&) = delete;
     PinnedBuffer& operator=(const PinnedBuffer&) = delete;
     PinnedBuffer(PinnedBuffer&& o) noexcept
@@ -123,8 +126,9 @@ struct PinnedBuffer {
         }
         return *this;
     }
-    uint8_t* data() noexcept { return static_cast<uint8_t*>(ptr_); }
-    const uint8_t* data() const noexcept { return static_cast<const uint8_t*>(ptr_); }
+
+    uint8_t* data() noexcept { return (uint8_t*)ptr_; }
+    const uint8_t* data() const noexcept { return (const uint8_t*)ptr_; }
     size_t size() const noexcept { return size_; }
     bool empty() const noexcept { return ptr_ == nullptr || size_ == 0; }
 };

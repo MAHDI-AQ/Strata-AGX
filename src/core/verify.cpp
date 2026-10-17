@@ -1652,7 +1652,6 @@ bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool
     for (const auto& b : batch)
         for (int t = 0; t < b.count; ++t) b.output[t] = b.verifier->h_out_[t];
     progress_at("decode");
-    progress_beat();
     return true;
 }
 void Verifier::set_plan_slot(int grp) {
@@ -1719,6 +1718,7 @@ bool Verifier::commit_launch(int n_keep, std::string& err) {
     std::atomic_thread_fence(std::memory_order_seq_cst);
     const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
     if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
+    if (n_keep > 0) progress_beat();
     if (ple_stage())   // stages that share one session must advance it once
         for (int t = 0; t < n_keep; ++t) {
             ss_->ple_prev[0] = ss_->ple_prev[1];
@@ -2092,7 +2092,6 @@ bool Verifier::end_pass_batch(const std::vector<BatchWindow>& batch, std::string
     for (const auto& b : batch)
         for (int t = 0; t < b.count; ++t) b.output[t] = b.verifier->h_out_[t];
     progress_at("decode");
-    progress_beat();
     return true;
 }
 

@@ -421,6 +421,16 @@ bool RadixNode::hydrate_from_nvme(NVMeStorageTier& nvme) {
         if (crc != hdr.checksum) {
             std::fprintf(stderr, "strata-agx radix: CRC32C mismatch on NVMe node #%lld (got %llx, expected %llx)\n",
                          (long long) id, (unsigned long long) crc, (unsigned long long) hdr.checksum);
+            // CRIT-RADIX-03: Quarantine / unhooking rollback on NVMe CRC32C corruption
+            is_l3_offloaded = false;
+            l3_bytes = 0;
+            free_host();
+            nvme.remove_node(id);
+            if (auto p = parent.lock()) {
+                if (!edge_tokens.empty()) {
+                    p->children.erase(edge_tokens[0]);
+                }
+            }
             return false;
         }
     }
@@ -1412,16 +1422,62 @@ bool RadixTree::fork_to_session(
     const std::vector<void*>& streams,
     std::string& err) {
 
-    std::shared_lock<std::shared_mutex> lock(rw_lock_);
-    if (!node || !node->has_snapshot()) {
-        err = "radix_fork: node has no snapshot";
-        return false;
+    // CRIT-RADIX-01: Decouple blocking NVMe hydration and multi-stage cudaStreamSynchronize
+    // outside the global rw_lock_.
+    // Traverse and ref-count bump nodes under read lock, then drop lock before NVMe I/O & sync.
+    std::shared_ptr<RadixNode> target_node = node;
+    int64_t target_prefix = prefix_len;
+
+    {
+        std::shared_lock<std::shared_mutex> lock(rw_lock_);
+        if (!target_node || !target_node->has_snapshot()) {
+            err = "radix_fork: node has no snapshot";
+            return false;
+        }
+        // Ref-count bump to protect target_node during unlocked I/O
+        ++target_node->ref_count;
     }
 
-    if (node->is_l3_offloaded && nvme_tier_) {
-        if (!node->hydrate_from_nvme(*nvme_tier_)) {
-            err = "radix_fork: failed to hydrate node from NVMe L3";
-            return false;
+    struct RefGuard {
+        std::shared_ptr<RadixNode> nd;
+        ~RefGuard() {
+            if (nd && nd->ref_count > 0) --nd->ref_count;
+        }
+    } guard{target_node};
+
+    if (target_node->is_l3_offloaded && nvme_tier_) {
+        if (!target_node->hydrate_from_nvme(*nvme_tier_)) {
+            // CRIT-RADIX-03: Fall back safely to shallower snapshot ancestors rather than failing
+            std::shared_ptr<RadixNode> fallback_node = nullptr;
+            {
+                std::shared_lock<std::shared_mutex> lock(rw_lock_);
+                auto p = target_node->parent.lock();
+                while (p) {
+                    if (p->has_snapshot()) {
+                        fallback_node = p;
+                        ++fallback_node->ref_count;
+                        break;
+                    }
+                    p = p->parent.lock();
+                }
+            }
+
+            if (!fallback_node) {
+                err = "radix_fork: failed to hydrate node from NVMe L3 and no snapshot ancestor found";
+                return false;
+            }
+
+            // Transfer ref protection to fallback_node
+            target_node = fallback_node;
+            guard.nd = target_node;
+            target_prefix = target_node->prefix_len;
+
+            if (target_node->is_l3_offloaded && nvme_tier_) {
+                if (!target_node->hydrate_from_nvme(*nvme_tier_)) {
+                    err = "radix_fork: failed to hydrate fallback ancestor from NVMe L3";
+                    return false;
+                }
+            }
         }
     }
 
@@ -1437,12 +1493,12 @@ bool RadixTree::fork_to_session(
     qs.idx_n_head = g.idx_q_heads;
     qs.idx_dim = g.idx_key_dim;
 
-    const int64_t pages = (prefix_len + qs.page_size - 1) / qs.page_size;
+    const int64_t pages = (target_prefix + qs.page_size - 1) / qs.page_size;
     const size_t qsa_rows = (size_t) pages * qs.n_head_kv * qs.page_size;
 
-    if (node->has_device_snapshot()) {
-        for (size_t st = 0; st < n_stages && st < node->stage_snapshots.size(); ++st) {
-            const auto& ss = node->stage_snapshots[st];
+    if (target_node->has_device_snapshot()) {
+        for (size_t st = 0; st < n_stages && st < target_node->stage_snapshots.size(); ++st) {
+            const auto& ss = target_node->stage_snapshots[st];
             auto* child = child_states[st];
             const core::OnDevice on(ss.device);
             cudaStream_t cs = (cudaStream_t) streams[st];
@@ -1495,15 +1551,15 @@ bool RadixTree::fork_to_session(
                 if (slice.idx_block_pos && cst.idx_block_pos) {
                     cudaMemcpyAsync(cst.idx_block_pos, slice.idx_block_pos, sizeof(int32_t), cudaMemcpyDeviceToDevice, cs);
                 }
-                const int64_t pooled_rows = prefix_len / qs.idx_block;
+                const int64_t pooled_rows = target_prefix / qs.idx_block;
                 if (pooled_rows > 0 && slice.idx_pooled && cst.idx_pooled) {
                     cudaMemcpyAsync(cst.idx_pooled, slice.idx_pooled, slice.idx_pooled_bytes, cudaMemcpyDeviceToDevice, cs);
                 }
             }
         }
-    } else if (node->has_host_snapshot()) {
-        for (size_t st = 0; st < n_stages && st < node->stage_host_snapshots.size(); ++st) {
-            const auto& hss = node->stage_host_snapshots[st];
+    } else if (target_node->has_host_snapshot()) {
+        for (size_t st = 0; st < n_stages && st < target_node->stage_host_snapshots.size(); ++st) {
+            const auto& hss = target_node->stage_host_snapshots[st];
             auto* child = child_states[st];
             const core::OnDevice on(hss.device);
             cudaStream_t cs = (cudaStream_t) streams[st];
@@ -1556,16 +1612,16 @@ bool RadixTree::fork_to_session(
                 if (slice.has_idx_block_pos && cst.idx_block_pos) {
                     cudaMemcpyAsync(cst.idx_block_pos, &slice.idx_block_pos_val, sizeof(int32_t), cudaMemcpyHostToDevice, cs);
                 }
-                const int64_t pooled_rows = prefix_len / qs.idx_block;
+                const int64_t pooled_rows = target_prefix / qs.idx_block;
                 if (pooled_rows > 0 && !slice.idx_pooled.empty() && cst.idx_pooled) {
                     cudaMemcpyAsync(cst.idx_pooled, slice.idx_pooled.data(), slice.idx_pooled.size(), cudaMemcpyHostToDevice, cs);
                 }
             }
         }
     }
-    node->last_accessed = std::chrono::steady_clock::now();
-    // CACHE-01: Do NOT drop rw_lock_ before cudaStreamSynchronize; keep rw_lock_ held during active PCIe DMA read
+    target_node->last_accessed = std::chrono::steady_clock::now();
 
+    // CRIT-RADIX-01: Multi-stage cudaStreamSynchronize performed outside rw_lock_
     // Task 2.4: Asynchronous Multi-Stage KV Forking across concurrent CUDA streams
     // Stage 0 and Stage 1 DMA memcpy operations overlap concurrently across streams[0] and streams[1].
     for (size_t st = 0; st < n_stages; ++st) {
@@ -1889,7 +1945,9 @@ CompactionStats RadixTree::compact_tree() {
         std::vector<int32_t> dead_keys;
         for (auto& kv : curr->children) {
             prune_dead_leaves(kv.second);
-            if (kv.second && kv.second->children.empty() && kv.second->ref_count == 0 && !kv.second->has_snapshot()) {
+            // CRIT-RADIX-02: Guard dead-leaf pruning against nodes actively staging to NVMe
+            if (kv.second && kv.second->children.empty() && kv.second->ref_count == 0 &&
+                !kv.second->has_snapshot() && !kv.second->is_staging_to_nvme.load()) {
                 dead_keys.push_back(kv.first);
             }
         }
@@ -1910,10 +1968,10 @@ CompactionStats RadixTree::compact_tree() {
         for (auto& kv : curr->children) {
             compress_paths(kv.second);
         }
-        // Task 2.2: Assert child->ref_count == 0 before collapsing single-child path!
-        if (curr != root_ && curr->ref_count == 0 && !curr->has_snapshot() && curr->children.size() == 1) {
+        // Task 2.2 & CRIT-RADIX-02: Assert child->ref_count == 0 and not staging to NVMe before collapsing single-child path!
+        if (curr != root_ && curr->ref_count == 0 && !curr->has_snapshot() && !curr->is_staging_to_nvme.load() && curr->children.size() == 1) {
             auto child = curr->children.begin()->second;
-            if (child && child->ref_count == 0) {
+            if (child && child->ref_count == 0 && !child->is_staging_to_nvme.load()) {
                 curr->edge_tokens.insert(curr->edge_tokens.end(), child->edge_tokens.begin(), child->edge_tokens.end());
                 curr->update_chunk_hashes();
                 curr->children = std::move(child->children);
