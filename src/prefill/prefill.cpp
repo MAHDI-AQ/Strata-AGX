@@ -336,6 +336,7 @@ struct Prefill::Impl {
     std::vector<float> ple_pageable[2];      // the fallback when no more RAM can be pinned
     float* ple_emb_host[2] = {};             // pinned, double-buffered: the next chunk's rows are read while this
     cudaEvent_t ple_copied[2] = {};          // one runs; the event marks that buffer's upload done
+    cudaEvent_t ple_done[2] = {};            // Fix 2: marks when device finishes computing on the uploaded buffer
     std::vector<uint32_t> ple_rows[2];
     float* ple_norm = nullptr;
     uint8_t* region = nullptr;               // the attention/MoE scratch region (idle while the PLE block runs)
@@ -429,6 +430,7 @@ Prefill::~Prefill() {
         if (impl_->hand[b]) cudaFreeHost(impl_->hand[b]);
         if (impl_->hand_event[b]) cudaEventDestroy(impl_->hand_event[b]);
         if (impl_->ple_copied[b]) cudaEventDestroy(impl_->ple_copied[b]);
+        if (impl_->ple_done[b]) cudaEventDestroy(impl_->ple_done[b]);
         if (impl_->ple_emb_host[b] && impl_->ple_pageable[b].empty()) cudaFreeHost(impl_->ple_emb_host[b]);
     }
     if (impl_->copy) cudaStreamDestroy(impl_->copy);
@@ -625,6 +627,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             m.ple_emb_host[b] = m.ple_pageable[b].data();
         }
         if (!m.ple_copied[b] && cudaEventCreateWithFlags(&m.ple_copied[b], cudaEventDisableTiming) != cudaSuccess)
+            ok = false;
+        if (!m.ple_done[b] && cudaEventCreateWithFlags(&m.ple_done[b], cudaEventDisableTiming) != cudaSuccess)
             ok = false;
         m.ple_rows[b].resize(T * strata::kernels::PLE_N_HEADS);
     }
@@ -1222,7 +1226,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             }
             if (!ple_have) {
                 if (!ple_next.valid()) {
-                    if (ple_pf_env) cudaEventSynchronize(m.ple_copied[ple_buf]);   // R2: its previous upload is done
+                    // Fix 2: Explicit latch ensuring device has finished using the buffer
+                    cudaEventSynchronize(m.ple_copied[ple_buf]);
+                    cudaEventSynchronize(m.ple_done[ple_buf]);
                     if (!ple_gather(c0, ple_buf, err)) return false;
                     if (ple_pf_env) ++stats_.ple_pf_inline;
                 } else if (!ple_next.get()) {
@@ -1234,7 +1240,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             cudaEventRecord(m.ple_copied[ple_buf], m.cs);
             if (ple_pf_env) m.ple_up = ple_buf;   // R2: the buffer the next spawn must not overwrite
             if (c0 + m.T < n) {
-                cudaEventSynchronize(m.ple_copied[ple_buf ^ 1]);   // the other buffer's upload (a chunk ago) is done
+                // Fix 2: Latch other buffer until previous upload & compute done
+                cudaEventSynchronize(m.ple_copied[ple_buf ^ 1]);
+                cudaEventSynchronize(m.ple_done[ple_buf ^ 1]);
                 ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + m.T, b = ple_buf ^ 1] {
                     return ple_gather(c1, b, ple_next_err);
                 });
@@ -1431,6 +1439,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 }
                 stats_.ms_ple += ms_since(tp);
             }
+            if (l == 1 && ple_on) {
+                // Fix 2: Record completion of device computation on ple_emb buffer
+                cudaEventRecord(m.ple_done[ple_buf ^ 1], m.cs);
+            }
             for (int half = 0; half < 2; ++half) {
                 // ---- the hyper-connection read of this half
                 const char* pre = half == 0 ? "hc_attn_" : "hc_ffn_";
@@ -1587,7 +1599,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
                                                               m.max_blocks, s, m.sel_scores, m.cs, active);
                         strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
-                                                        m.sel_ids + t0 * m.cap, m.cs);
+                                                        m.sel_ids + t0 * m.cap, m.cs, active);
                     }
                     // STRATA_SEL_OVERLAP (debug, D-1's question): how much do neighbouring queries' selections share?
                     // Per tile of 16 queries: the union of their selected cells against the sum of their widths.

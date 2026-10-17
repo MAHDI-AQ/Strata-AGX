@@ -649,8 +649,16 @@ class StrataEngine:
 
     def _send(self, line):
         with self._write_lock:
-            self.proc.stdin.write(line + "\n")
-            self.proc.stdin.flush()
+            # Fix 3: Chunked prompt delivery for requests > 32k tokens to eliminate stdin backpressure stalls
+            line_payload = line + "\n"
+            chunk_bytes = 65536
+            if len(line_payload) > chunk_bytes:
+                for offset in range(0, len(line_payload), chunk_bytes):
+                    self.proc.stdin.write(line_payload[offset:offset + chunk_bytes])
+                    self.proc.stdin.flush()
+            else:
+                self.proc.stdin.write(line_payload)
+                self.proc.stdin.flush()
 
     def _parse_done(self, line):
         f = line.split()
