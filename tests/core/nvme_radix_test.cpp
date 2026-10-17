@@ -221,6 +221,48 @@ int main() {
     test_nvme_throughput_and_parity(nvme);
     test_radix_node_l3_offload_and_hydration(nvme);
     test_hydration_queue_and_registry(nvme);
+    // CRIT-RADIX-03 Test: Quarantine / unhooking rollback on NVMe CRC32C failure
+    {
+        std::cout << "[Test 5] CRIT-RADIX-03: NVMe CRC32C failure quarantine and unhooking..." << std::endl;
+        auto parent_node = std::make_shared<RadixNode>();
+        parent_node->id = 888;
+        parent_node->prefix_len = 64;
+
+        auto corrupt_node = std::make_shared<RadixNode>();
+        corrupt_node->id = 889;
+        corrupt_node->prefix_len = 128;
+        corrupt_node->edge_tokens = {99};
+        corrupt_node->stage_host_snapshots.resize(1);
+        corrupt_node->stage_host_snapshots[0].slab_.allocate(4096);
+        corrupt_node->stage_host_snapshots[0].gdn_data.reset(corrupt_node->stage_host_snapshots[0].slab_.data(), 4096);
+        std::memset(corrupt_node->stage_host_snapshots[0].gdn_data.data(), 0xAA, 4096);
+        corrupt_node->is_host_parked = true;
+
+        parent_node->children[99] = corrupt_node;
+        corrupt_node->parent = parent_node;
+
+        assert(corrupt_node->offload_to_nvme(nvme));
+        assert(corrupt_node->is_l3_offloaded);
+
+        // Intentionally corrupt the node on NVMe disk
+        std::string fpath = nvme.base_path() + "/node_" + std::to_string(corrupt_node->id) + ".bin";
+        int fd = ::open(fpath.c_str(), O_RDWR);
+        assert(fd >= 0);
+        uint8_t garbage[64];
+        std::memset(garbage, 0xFF, sizeof(garbage));
+        // Overwrite payload after header
+        ::pwrite(fd, garbage, sizeof(garbage), 128);
+        ::close(fd);
+
+        // Attempt hydration - must detect CRC mismatch, quarantine node, and unhook from parent
+        bool ok = corrupt_node->hydrate_from_nvme(nvme);
+        assert(!ok);
+        assert(!corrupt_node->is_l3_offloaded);
+        assert(corrupt_node->total_l3_bytes() == 0);
+        assert(parent_node->children.count(99) == 0);
+        std::cout << "  -> PASS: CRC32C corruption quarantined and node unhooked from parent." << std::endl;
+    }
+
 
     nvme.purge();
 

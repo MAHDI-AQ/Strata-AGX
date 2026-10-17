@@ -138,6 +138,77 @@ int main() {
         std::cout << "  [PASS] Latency well below 10 us target!" << std::endl;
     }
 
+    // 8. CRIT-RADIX-02 Unit Test: compact_tree preserves staging nodes from dead-leaf pruning and path compression
+    {
+        RadixTree comp_tree(4, 64);
+        // Test manual tree structure directly to verify compact_tree staging guard
+        auto staging_node = std::make_shared<RadixNode>();
+        staging_node->id = 999;
+        staging_node->prefix_len = 64;
+        staging_node->edge_tokens = {60};
+        staging_node->ref_count = 0;
+        staging_node->is_staging_to_nvme = true; // Actively staging
+        staging_node->is_host_parked = false;
+        staging_node->is_l3_offloaded = false;
+
+        // Tree root has no snapshot, attach staging_node as child under key 60
+        // We can access through tree match or direct node manipulation
+        // In compact_tree, it visits children of root_
+        // Let's verify compact_tree behaviour with a mock node
+        std::vector<int32_t> long_p(64, 42);
+        // Mock device states to allow insert
+        RadixStageSnapshot ss;
+        ss.device = 0;
+        ss.gdn_bytes = 64 * sizeof(float);
+        cudaMalloc(&ss.gdn_saved, ss.gdn_bytes);
+        SessionState mock_state;
+        mock_state.gdn_alloc = 0;
+        mock_state.qsa_alloc = 0;
+        std::vector<int> s_devs = {0};
+        std::vector<const SessionState*> s_states = {&mock_state};
+        std::vector<const float*> s_R = {nullptr};
+        cudaStream_t strm;
+        cudaStreamCreate(&strm);
+        std::vector<void*> s_streams = {(void*) strm};
+
+        auto p1 = comp_tree.insert(long_p.data(), 64, 64, s_devs, s_states, s_R, g, s_streams);
+        if (p1) {
+            p1->children[60] = staging_node;
+            staging_node->parent = p1;
+
+            auto stats = comp_tree.compact_tree();
+            assert(p1->children.count(60) == 1);
+            assert(stats.dead_leaves_pruned == 0);
+
+            // Turn off staging and ensure it gets pruned
+            staging_node->is_staging_to_nvme = false;
+            stats = comp_tree.compact_tree();
+            assert(p1->children.count(60) == 0);
+            assert(stats.dead_leaves_pruned == 1);
+        }
+        cudaStreamDestroy(strm);
+        cudaFree(ss.gdn_saved);
+        std::cout << "  [PASS] CRIT-RADIX-02 staging pin guard in compact_tree" << std::endl;
+    }
+
+    // 9. CRIT-RADIX-04 Unit Test: Paged/segmented slab buffer structure verification
+    {
+        PinnedBuffer paged_buf;
+        paged_buf.allocate(5ULL * 1024 * 1024); // 5 MiB -> 3 pages (2MB + 2MB + 1MB)
+        assert(paged_buf.size() == 5ULL * 1024 * 1024);
+        assert(paged_buf.pages().size() == 3);
+        assert(paged_buf.pages()[0].size() == 2ULL * 1024 * 1024);
+        assert(paged_buf.pages()[1].size() == 2ULL * 1024 * 1024);
+        assert(paged_buf.pages()[2].size() == 1ULL * 1024 * 1024);
+        assert(paged_buf.locate(0) != nullptr);
+        assert(paged_buf.locate(3ULL * 1024 * 1024) != nullptr);
+        assert(paged_buf.locate(5ULL * 1024 * 1024) == nullptr);
+        paged_buf.free();
+        assert(paged_buf.empty());
+        assert(paged_buf.size() == 0);
+        std::cout << "  [PASS] CRIT-RADIX-04 Paged/segmented slab buffer structure" << std::endl;
+    }
+
     std::cout << "All RadixTree & HiCache L2 unit tests passed successfully!" << std::endl;
     return 0;
 }

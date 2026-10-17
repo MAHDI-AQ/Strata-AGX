@@ -49,7 +49,7 @@ from typing import Iterator, Protocol
 from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
-STRATA_AGX_VERSION = "0.1.40-agx.4.5.0"
+STRATA_AGX_VERSION = "0.1.40-agx.4.5.2"
 
 def get_git_commit() -> str:
     commit = os.environ.get("STRATA_COMMIT")
@@ -342,7 +342,7 @@ class ShmConsumer:
                     head, tail, cap, magic = struct.unpack_from(self.HEADER_FMT, self.m, 0)
                     if magic == 0x53545241 and cap > 0:
                         self.capacity = cap
-                        self.tail = tail
+                        self.tail = tail & 0xFFFFFFFF
                         return True
                 except OSError:
                     pass
@@ -353,13 +353,13 @@ class ShmConsumer:
         if not self.m:
             return
         head, = struct.unpack_from("<I", self.m, 0)
-        while self.tail < head:
+        while ((head - self.tail) & 0xFFFFFFFF) > 0:
             idx = self.tail & (self.capacity - 1)
             off = self.HEADER_SIZE + idx * self.ENTRY_SIZE
             msg_type, flags, reserved, token, req_id, p_read, p_total = struct.unpack_from(self.ENTRY_FMT, self.m, off)
             if msg_type != 0:
                 yield (req_id, msg_type, token, p_read, p_total)
-            self.tail += 1
+            self.tail = (self.tail + 1) & 0xFFFFFFFF
             struct.pack_into("<I", self.m, 4, self.tail)
 
     def close(self):
@@ -517,10 +517,13 @@ class StrataEngine:
             if not getattr(self, "multiplex", False):
                 lines.put(line)
                 continue
-            fields = line.split(" ", 2)
+            line_str = line.strip()
+            if not line_str:
+                continue
+            fields = line_str.split(" ", 2)
             if len(fields) != 3 or fields[0] != "R" or not fields[1].isdigit():
                 continue
-            number, payload = int(fields[1]), fields[2]
+            number, payload = int(fields[1]), fields[2] + "\n"
             if getattr(self, "_shm_active", False) and payload.startswith("PP "):
                 continue
             overflow = False
@@ -1870,7 +1873,8 @@ class Service:
             "<|im_start|>", "<|im_end|>", "<|endoftext|>",
             "<|vision_start|>", "<|vision_end|>", "<|video_start|>", "<|video_end|>",
             "<|image_pad|>", "<|video_pad|>",
-            "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>"
+            "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>",
+            "</think>", "<think>"
         )
         token_sub = {s: f"\x00_STRATA_RAW_{i}_{uuid.uuid4().hex}_\x00" for i, s in enumerate(specials)}
 
