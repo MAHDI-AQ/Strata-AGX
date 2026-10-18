@@ -378,8 +378,10 @@ bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
 // are not an exact multiple of 128 SMs. For intermediate prompt lengths T in [512, 8192], Stream-K dynamic
 // tile scheduling partitions the token dimension T into balanced, full-wave-aligned tile chunks (e.g. 512 tokens),
 // distributing MAC tiles uniformly across all 128 SMs to eliminate tail-effect pipeline stalls.
+// NOTE: Dynamic Stream-K tiling is strictly restricted to wide GEMMs (N >= 64). Narrow matrix-vector shapes
+// (such as N=1 shared expert gates) must bypass tiling to prevent cuBLAS tile stride / pointer offset MMU faults (Xid 31).
 static inline int64_t resolve_streamk_tile_step(int64_t T, int64_t N) {
-    if (T > 512 && (T % 512 == 0 || T >= 2048)) {
+    if (N >= 64 && T > 512 && (T % 512 == 0 || T >= 2048)) {
         return 512;
     }
     return T;
