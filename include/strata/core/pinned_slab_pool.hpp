@@ -49,6 +49,12 @@ public:
                 throw std::bad_alloc();
             }
         }
+        if (reinterpret_cast<uintptr_t>(base_ptr_) % alignment_ != 0) {
+            if (!is_fallback_) cudaFreeHost(base_ptr_);
+            else std::free(base_ptr_);
+            base_ptr_ = nullptr;
+            throw std::runtime_error("PinnedSlabPool: Base pointer failed alignment constraint");
+        }
 
         free_slabs_.reserve(total_slabs_);
         for (int32_t i = total_slabs_ - 1; i >= 0; --i) {

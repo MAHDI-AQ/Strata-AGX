@@ -382,7 +382,13 @@ bool NVMeStorageTier::read_node_direct(int64_t node_id, void* out_data, size_t b
                     static_cast<long>(node_id),
                     static_cast<unsigned long>(hdr->checksum),
                     static_cast<unsigned long>(actual));
-                ::unlink(path.c_str());
+                // CRIT-STORE-01: Prevent TOCTOU race with concurrent atomic rename by checking inode
+                struct stat st_fd, st_path;
+                if (::fstat(fd, &st_fd) == 0 && ::stat(path.c_str(), &st_path) == 0) {
+                    if (st_fd.st_ino == st_path.st_ino) {
+                        ::unlink(path.c_str());
+                    }
+                }
                 return false;
             }
         }

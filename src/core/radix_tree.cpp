@@ -1493,6 +1493,11 @@ bool RadixTree::fork_to_session(
     // outside the global rw_lock_.
     // Traverse and ref-count bump nodes under read lock, then drop lock before NVMe I/O & sync.
     std::shared_ptr<RadixNode> target_node = node;
+    // INQ2-OVERREAD-01: Strict bounds clamping
+    if (!target_node || prefix_len <= 0 || prefix_len > target_node->prefix_len) {
+        err = "radix_fork: invalid prefix_len or node";
+        return false;
+    }
     int64_t target_prefix = prefix_len;
 
     {

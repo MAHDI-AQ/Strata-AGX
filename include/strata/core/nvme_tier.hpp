@@ -29,6 +29,7 @@ static constexpr uint32_t kNVMeVersion = 1;
 #endif
 
 inline uint64_t compute_crc32c(const void* data, size_t bytes) {
+    if (!data || bytes == 0) return 0;
     uint64_t crc = 0xFFFFFFFF53545241ULL;
     const uint8_t* p = static_cast<const uint8_t*>(data);
     size_t i = 0;
@@ -188,7 +189,7 @@ public:
     ~NVMeStorageTier();
 
     static constexpr uint32_t kMaxConsecutiveWriteErrors = 3;
-    bool is_circuit_tripped() const { return circuit_tripped_.load(std::memory_order_relaxed); }
+    bool is_circuit_tripped() const { return circuit_tripped_.load(std::memory_order_acquire); }
     void reset_circuit_breaker() {
         circuit_tripped_.store(false, std::memory_order_release);
         consecutive_write_errors_.store(0, std::memory_order_relaxed);
