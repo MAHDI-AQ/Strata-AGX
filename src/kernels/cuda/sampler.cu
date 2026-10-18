@@ -504,8 +504,8 @@ __device__ void sampled_tail_warp(const int* sel_ids, const float* sel_logit, in
         for (int i = 0; i < n_keep; ++i) sum += ex[i];
     sum = __shfl_sync(kFullMask, sum, 0);
     __syncwarp();
-    const double inv_sum = sum > 1e-12 ? 1.0 / sum : (n_keep > 0 ? 1.0 / (double) n_keep : 1.0);
-    for (int i = lane; i < n_keep; i += 32) ex[i] = (sum > 1e-12) ? (ex[i] * inv_sum) : inv_sum;
+    const double inv_sum = sum > 1e-12 ? 1.0 / sum : 0.0;
+    for (int i = lane; i < n_keep; i += 32) ex[i] = ex[i] * inv_sum;
     __syncwarp();
     if (lane == 0) {
         const float u = philox_uniform(p.seed, p.counter + (uint64_t) t);

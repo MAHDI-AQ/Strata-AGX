@@ -1399,14 +1399,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                         uint64_t draw_state = s.request.sampling.seed ^ ((uint64_t)s.position.load() + t);
                         draw_state = draw_state * 6364136223846793005ULL + 1442695040888963407ULL;
                         const float u = (float)((draw_state >> 32) & 0xFFFFFF) / 16777216.0f;
-                        bool accept_draft = false;
-                        if (alpha > p && p < 1.0f) {
-                            const float residual_thresh = (alpha - p) / (1.0f - p);
-                            if (u < residual_thresh) {
-                                accept_draft = true;
-                            }
-                        }
-                        if (accept_draft) {
+                        if (u < alpha) {
                             s.output[t] = draft_tok;
                             accepted = t + 1;
                         } else {

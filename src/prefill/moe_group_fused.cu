@@ -148,7 +148,7 @@ __global__ void moe_block_histogram_kernel(
     for (int64_t i = start_idx + tid; i < end_idx; i += blockDim.x) {
         int e = ids[i];
         bool valid = (unsigned)e < (unsigned)n_expert;
-        unsigned active = __activemask();
+        unsigned active = __ballot_sync(__activemask(), valid);
         if (valid) {
             unsigned match_mask = __match_any_sync(active, e);
             if (match_mask != 0) {

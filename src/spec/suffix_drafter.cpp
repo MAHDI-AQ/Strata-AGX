@@ -36,7 +36,7 @@ uint64_t SuffixDrafter::key_at(size_t end) const {
 }
 
 SuffixDrafter::Slot* SuffixDrafter::find_slot(uint64_t key, bool insert) {
-    for (size_t i = key & mask_, probes = 0; probes <= mask_; i = (i + 1) & mask_, ++probes) {
+    for (size_t i = key & mask_, probes = 0; probes < 64 && probes <= mask_; i = (i + 1) & mask_, ++probes) {
         Slot& s = table_[i];
         if (s.key == key) return &s;
         if (s.key == 0) {

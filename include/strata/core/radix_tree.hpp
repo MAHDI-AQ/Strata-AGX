@@ -72,10 +72,27 @@ inline bool verify_chunk_tokens_avx2(const int32_t* a, const int32_t* b, size_t 
 }
 
 inline bool verify_chunk_tokens_avx2(const int32_t* a, const int64_t* b, size_t count = kRadixChunkTokens) {
+#if defined(__AVX2__)
+    size_t i = 0;
+    for (; i + 4 <= count; i += 4) {
+        __m128i va32 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i));
+        __m256i va64 = _mm256_cvtepi32_epi64(va32);
+        __m256i vb64 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + i));
+        __m256i cmp = _mm256_cmpeq_epi64(va64, vb64);
+        if (_mm256_movemask_epi8(cmp) != -1) {
+            return false;
+        }
+    }
+    for (; i < count; ++i) {
+        if (static_cast<int64_t>(a[i]) != b[i]) return false;
+    }
+    return true;
+#else
     for (size_t i = 0; i < count; ++i) {
         if (static_cast<int64_t>(a[i]) != b[i]) return false;
     }
     return true;
+#endif
 }
 
 inline uint64_t compute_token_chunk_hash(const int32_t* tokens, size_t count) {
@@ -281,6 +298,13 @@ struct RadixNode : public std::enable_shared_from_this<RadixNode> {
     bool is_l3_offloaded = false;
     bool has_gdn_checkpoint = false;
 
+    enum class SnapshotState : uint8_t {
+        EMPTY = 0,
+        CAPTURING = 1,
+        COMMITTED = 2
+    };
+    std::atomic<SnapshotState> snapshot_state{SnapshotState::EMPTY};
+
     // Phase 3: Decoupled Memory Paging (kv_page_ids)
     std::vector<int32_t> kv_page_ids;
     size_t num_pages() const { return kv_page_ids.size(); }
@@ -319,7 +343,8 @@ struct RadixNode : public std::enable_shared_from_this<RadixNode> {
     }
 
     bool has_device_snapshot() const {
-        return !stage_snapshots.empty() && stage_snapshots[0].gdn_saved != nullptr;
+        return snapshot_state.load(std::memory_order_acquire) == SnapshotState::COMMITTED &&
+               !stage_snapshots.empty() && stage_snapshots[0].gdn_saved != nullptr;
     }
 
     bool has_host_snapshot() const {

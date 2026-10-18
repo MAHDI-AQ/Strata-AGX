@@ -71,6 +71,7 @@ size_t RadixNode::total_host_bytes() const {
 }
 
 void RadixNode::free_device() {
+    snapshot_state.store(SnapshotState::EMPTY, std::memory_order_release);
     for (auto& ss : stage_snapshots) {
         ss.free_device();
     }
@@ -405,20 +406,11 @@ bool RadixNode::hydrate_from_nvme(NVMeStorageTier& nvme) {
     if (hdr.magic != kNVMeMagic || hdr.version != kNVMeVersion || hdr.node_id != id) {
         return false;
     }
-    // Task 2.3: Hardware SSE4.2 CRC32C Validation
+    // Task 2.3: Byte-accurate Hardware CRC32C Validation
     if (hdr.checksum != 0) {
-        uint64_t crc = 0xFFFFFFFF53545241ULL;
         const uint8_t* payload_bytes = buffer.data() + sizeof(NVMeNodeHeader);
         const size_t crc_len = l3_bytes - sizeof(NVMeNodeHeader);
-        const size_t qwords = crc_len / 8;
-        const uint64_t* qp = reinterpret_cast<const uint64_t*>(payload_bytes);
-        for (size_t qi = 0; qi < qwords; ++qi) {
-#if defined(__SSE4_2__)
-            crc = _mm_crc32_u64(crc, qp[qi]);
-#else
-            crc = (crc ^ qp[qi]) * 1099511628211ULL;
-#endif
-        }
+        uint64_t crc = compute_crc32c(payload_bytes, crc_len);
         if (crc != hdr.checksum) {
             std::fprintf(stderr, "strata-agx radix: CRC32C mismatch on NVMe node #%lld (got %llx, expected %llx)\n",
                          (long long) id, (unsigned long long) crc, (unsigned long long) hdr.checksum);
@@ -647,6 +639,7 @@ void RadixTree::nvme_worker_loop() {
                     if (task.free_host_on_write) {
                         node->free_host();
                     }
+                    this->persist_manifest();
                 } else {
                     if (cached_nvme_snapshots_.load(std::memory_order_relaxed) > 0) cached_nvme_snapshots_.fetch_sub(1, std::memory_order_relaxed);
                 }
@@ -1427,6 +1420,7 @@ std::shared_ptr<RadixNode> RadixTree::insert(
             }
         }
         // CRIT-04: Drop rw_lock_ across the 300-800ms DMA drain to prevent reader starvation on concurrent slots!
+        curr->snapshot_state.store(RadixNode::SnapshotState::CAPTURING, std::memory_order_release);
         lock.unlock();
         for (size_t st = 0; st < n_stages; ++st) {
             const core::OnDevice on(stage_devices[st]);
@@ -1450,6 +1444,7 @@ std::shared_ptr<RadixNode> RadixTree::insert(
             }
         }
         if (!snap_ok) {
+            curr->snapshot_state.store(RadixNode::SnapshotState::EMPTY, std::memory_order_release);
             if (std::getenv("STRATA_S26F_LOG"))
                 std::fprintf(stderr, "S26F capture FAILED: prefix=%lld (alloc failure; freed partial)\n",
                             (long long) prefix_len);
@@ -1457,6 +1452,7 @@ std::shared_ptr<RadixNode> RadixTree::insert(
             curr->stage_snapshots.clear();
             return curr;   // S26f: failed capture -> path only, never a broken snapshot
         }
+        curr->snapshot_state.store(RadixNode::SnapshotState::COMMITTED, std::memory_order_release);
         if (std::getenv("STRATA_S26F_LOG"))
             std::fprintf(stderr, "S26F capture OK: prefix=%lld node=%lld bytes_now=%zu\n",
                         (long long) prefix_len, (long long) curr->id, device_snapshot_bytes_locked());
@@ -1590,6 +1586,10 @@ bool RadixTree::fork_to_session(
     qs.idx_dim = g.idx_key_dim;
 
     const bool allow_recurrent = (target_prefix == target_node->prefix_len);
+    if (!allow_recurrent && g.n_gdn_layers() > 0) {
+        err = "radix_fork: cannot partially truncate recurrent GDN state; requires exact snapshot boundary";
+        return false;
+    }
     const int64_t pages = (target_prefix + qs.page_size - 1) / qs.page_size;
     const size_t qsa_rows = (size_t) pages * qs.n_head_kv * qs.page_size;
 
@@ -1959,19 +1959,10 @@ size_t RadixTree::evict_lru_locked(size_t max_snapshots, size_t min_free_vram_mi
                 }
             }
 
-            // Task 2.3: Hardware SSE4.2 CRC32C over serialized payload
-            uint64_t crc = 0xFFFFFFFF53545241ULL;
+            // Task 2.3: Byte-accurate Hardware CRC32C unification over serialized payload
             const uint8_t* payload_bytes = buffer.data() + sizeof(NVMeNodeHeader);
             const size_t crc_len = total_payload - sizeof(NVMeNodeHeader);
-            const size_t qwords = crc_len / 8;
-            const uint64_t* qp = reinterpret_cast<const uint64_t*>(payload_bytes);
-            for (size_t qi = 0; qi < qwords; ++qi) {
-#if defined(__SSE4_2__)
-                crc = _mm_crc32_u64(crc, qp[qi]);
-#else
-                crc = (crc ^ qp[qi]) * 1099511628211ULL;
-#endif
-            }
+            uint64_t crc = compute_crc32c(payload_bytes, crc_len);
             reinterpret_cast<NVMeNodeHeader*>(buffer.data())->checksum = crc;
 
             host_victim->is_staging_to_nvme = true;

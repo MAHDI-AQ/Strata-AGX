@@ -1080,8 +1080,9 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
     const bool counted = !capacity_guard && active_blocks > 0 && active_blocks <= max_blocks &&
                          (any_card || topk_active_supported_device());
 #endif
+    const bool sm89_capable = (any_card || topk_active_supported_device());
     const int64_t reach = counted && active_blocks < max_blocks ? active_blocks : max_blocks;
-    const int64_t fit = (int64_t) TK_T * (counted ? TK_PER_MAX : TK_PER);
+    const int64_t fit = (int64_t) TK_T * ((counted || sm89_capable) ? TK_PER_MAX : TK_PER);
 #if defined(__HIPCC__)
     constexpr int64_t kRegMinBlocks = 7168;   // gfx1201: below ~28K cells the 1,024-thread kernel's fixed cost loses to the ref
     const bool too_small = counted && reach < kRegMinBlocks;

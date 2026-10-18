@@ -266,52 +266,21 @@ __global__ void map_ids_kernel(int32_t* ids, const int32_t* __restrict__ table, 
 __global__ void row_top_prob_kernel(const float* __restrict__ logits, int n_vocab, const int32_t* __restrict__ ids,
                                     float* __restrict__ probs, float inv_temp = 1.0f) {
     __shared__ float part[32];
-    __shared__ float row_max;
     const int t = blockIdx.x;
     const float* l = logits + (size_t) t * n_vocab;
-
-    // Phase 1: Compute true row max M = max_i l[i] across vocabulary
-    float m = -1e30f;
-    for (int i = threadIdx.x; i < n_vocab; i += blockDim.x) {
-        m = fmaxf(m, l[i]);
-    }
-    for (int o = 16; o > 0; o >>= 1) {
-        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
-    }
-    if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = m;
-    __syncthreads();
-
-    if (threadIdx.x < 32) {
-        float wm = (threadIdx.x < (int) (blockDim.x >> 5)) ? part[threadIdx.x] : -1e30f;
-        for (int o = 16; o > 0; o >>= 1) {
-            wm = fmaxf(wm, __shfl_xor_sync(0xffffffffu, wm, o));
-        }
-        if (threadIdx.x == 0) row_max = wm;
-    }
-    __syncthreads();
-
-    const float M = row_max;
-
-    // Phase 2: Compute exponential reduction sum_i exp((l[i] - M) * inv_temp)
+    const float m = l[ids[t]];
     float s = 0.0f;
     for (int i = threadIdx.x; i < n_vocab; i += blockDim.x) {
-        s += __expf((l[i] - M) * inv_temp);
+        const float diff = (l[i] - m) * inv_temp;
+        s += (diff > -80.0f) ? __expf(diff) : 0.0f;
     }
-    for (int o = 16; o > 0; o >>= 1) {
-        s += __shfl_xor_sync(0xffffffffu, s, o);
-    }
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
     if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = s;
     __syncthreads();
-
     if (threadIdx.x == 0) {
         float tot = 0.0f;
         for (int w = 0; w < (int) (blockDim.x >> 5); ++w) tot += part[w];
-        const int32_t target_tok = ids[t];
-        float p = 0.0f;
-        if (tot > 0.0f && target_tok >= 0 && target_tok < n_vocab) {
-            p = __expf((l[target_tok] - M) * inv_temp) / tot;
-        }
-        probs[t] = p;
+        probs[t] = tot > 0.0f ? 1.0f / tot : 0.0f;
     }
 }
 
@@ -491,7 +460,10 @@ __global__ void row_top_prob_split_kernel(const float* __restrict__ logits, int 
     const float m = l[ids[row]];
     const int vt = (int) (blockIdx.x * blockDim.x + threadIdx.x);
     float s = 0.0f;
-    for (int i = vt; i < n_vocab; i += 1024) s += __expf(l[i] - m);
+    for (int i = vt; i < n_vocab; i += 1024) {
+        const float diff = l[i] - m;
+        s += (diff > -80.0f) ? __expf(diff) : 0.0f;
+    }
     for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
     if ((threadIdx.x & 31) == 0) parts[vt >> 5] = s;
     __threadfence();
@@ -503,10 +475,9 @@ __global__ void row_top_prob_split_kernel(const float* __restrict__ logits, int 
     __threadfence();
     float tot = 0.0f;
     for (int w = 0; w < 32; ++w) tot += ((volatile const float*) parts)[w];
-    probs[row] = 1.0f / tot;
+    probs[row] = tot > 0.0f ? 1.0f / tot : 0.0f;
     rows[row].counter = 0;
 }
-
 }  // namespace
 
 uint64_t argmax_rows_scratch_bytes(int n_rows) { return (uint64_t) n_rows * sizeof(ArgRow); }
