@@ -37,6 +37,47 @@
 namespace strata::core {
 
 static constexpr size_t kRadixChunkTokens = 64;
+constexpr size_t kPageTokens = 16;
+inline size_t align_down_page(size_t tokens, size_t page_size = kPageTokens) {
+    return (tokens / page_size) * page_size;
+}
+
+
+
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
+inline bool verify_chunk_tokens_avx2(const int32_t* a, const int32_t* b, size_t count = kRadixChunkTokens) {
+#if defined(__AVX2__)
+    size_t i = 0;
+    for (; i + 8 <= count; i += 8) {
+        __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i));
+        __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + i));
+        __m256i cmp = _mm256_cmpeq_epi32(va, vb);
+        int mask = _mm256_movemask_ps(_mm256_castsi256_ps(cmp));
+        if (mask != 0xFF) {
+            return false;
+        }
+    }
+    for (; i < count; ++i) {
+        if (a[i] != b[i]) return false;
+    }
+    return true;
+#else
+    for (size_t i = 0; i < count; ++i) {
+        if (a[i] != b[i]) return false;
+    }
+    return true;
+#endif
+}
+
+inline bool verify_chunk_tokens_avx2(const int32_t* a, const int64_t* b, size_t count = kRadixChunkTokens) {
+    for (size_t i = 0; i < count; ++i) {
+        if (static_cast<int64_t>(a[i]) != b[i]) return false;
+    }
+    return true;
+}
 
 inline uint64_t compute_token_chunk_hash(const int32_t* tokens, size_t count) {
     uint64_t h1 = 0xFFFFFFFF53545241ULL;
@@ -239,6 +280,31 @@ struct RadixNode : public std::enable_shared_from_this<RadixNode> {
     bool is_permanent = false;
     bool is_host_parked = false;
     bool is_l3_offloaded = false;
+    bool has_gdn_checkpoint = false;
+
+    // Phase 3: Decoupled Memory Paging (kv_page_ids)
+    std::vector<int32_t> kv_page_ids;
+    size_t num_pages() const { return kv_page_ids.size(); }
+    void set_page_ids(const std::vector<int32_t>& page_ids) { kv_page_ids = page_ids; }
+    void append_page_id(int32_t page_id) { kv_page_ids.push_back(page_id); }
+    std::vector<int32_t> slice_page_ids(size_t start_page, size_t count) const {
+        if (start_page >= kv_page_ids.size()) return {};
+        size_t actual_count = std::min(count, kv_page_ids.size() - start_page);
+        return std::vector<int32_t>(kv_page_ids.begin() + start_page,
+                                    kv_page_ids.begin() + start_page + actual_count);
+    }
+
+    bool holds_recurrent_state() const {
+        if (has_gdn_checkpoint) return true;
+        for (const auto& ss : stage_snapshots) {
+            if (ss.gdn_saved != nullptr && ss.gdn_bytes > 0) return true;
+        }
+        for (const auto& hss : stage_host_snapshots) {
+            if (!hss.gdn_data.empty()) return true;
+        }
+        return false;
+    }
+
     std::atomic<bool> is_staging_to_nvme{false};
     size_t l3_bytes = 0;
     std::mutex hydrate_mutex_;

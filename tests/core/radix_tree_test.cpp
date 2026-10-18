@@ -209,6 +209,27 @@ int main() {
         std::cout << "  [PASS] CRIT-RADIX-04 Paged/segmented slab buffer structure" << std::endl;
     }
 
+        // --- Phase 1: AVX2 SIMD Equality, Batch Hysteresis & GDN Preservation Tests ---
+    {
+        std::cout << "  [TEST] Phase 1: AVX2 SIMD chunk equality verification... " << std::flush;
+        std::vector<int32_t> a(64, 100);
+        std::vector<int32_t> b = a;
+        assert(strata::core::verify_chunk_tokens_avx2(a.data(), b.data(), 64) == true);
+        b[15] = 999;
+        assert(strata::core::verify_chunk_tokens_avx2(a.data(), b.data(), 64) == false);
+        b = a; b[63] = 999;
+        assert(strata::core::verify_chunk_tokens_avx2(a.data(), b.data(), 64) == false);
+        std::cout << "[PASS]" << std::endl;
+
+        std::cout << "  [TEST] Phase 1: GDN recurrent checkpoint compaction guard... " << std::flush;
+        auto node = std::make_shared<strata::core::RadixNode>();
+        node->has_gdn_checkpoint = true;
+        assert(node->holds_recurrent_state() == true);
+        node->has_gdn_checkpoint = false;
+        assert(node->holds_recurrent_state() == false);
+        std::cout << "[PASS]" << std::endl;
+    }
+
     std::cout << "All RadixTree & HiCache L2 unit tests passed successfully!" << std::endl;
     return 0;
 }

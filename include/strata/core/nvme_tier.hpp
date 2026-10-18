@@ -183,6 +183,26 @@ struct NVMeStageHeader {
 };
 
 /// High-performance L3 DirectStorage NVMe engine with Two-Phase Atomic Writes & Crash Recovery.
+
+class IOUringStorage {
+public:
+    explicit IOUringStorage(size_t queue_depth = 64);
+    ~IOUringStorage();
+
+    bool is_uring_available() const { return uring_initialized_.load(std::memory_order_acquire); }
+
+    int submit_read_direct(int fd, void* aligned_buf, size_t bytes, off_t offset);
+    int submit_write_direct(int fd, const void* aligned_buf, size_t bytes, off_t offset);
+    int wait_completions(size_t min_complete = 1);
+
+private:
+    std::atomic<bool> uring_initialized_{false};
+    int ring_fd_{-1};
+    size_t queue_depth_{64};
+
+    int sync_direct_io(int fd, void* buf, size_t bytes, off_t offset, bool is_write);
+};
+
 class NVMeStorageTier {
 public:
     explicit NVMeStorageTier(const std::string& base_path = "");

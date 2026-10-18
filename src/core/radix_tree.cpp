@@ -1028,10 +1028,10 @@ RadixMatch RadixTree::match_prefix(const int32_t* tokens, size_t n) const {
         for (; c < num_chunks && c < chunk_hashes.size(); ++c) {
             const uint64_t q_hash = compute_token_chunk_hash(tokens + matched_len + c * kRadixChunkTokens, kRadixChunkTokens);
             if (chunk_hashes[c] != q_hash) break;
-            // Enforce raw token verification across matched chunk
-            if (std::memcmp(edge.data() + c * kRadixChunkTokens,
-                            tokens + matched_len + c * kRadixChunkTokens,
-                            kRadixChunkTokens * sizeof(int32_t)) != 0) {
+            // Phase 1 Correctness: AVX2 SIMD equality verification against hash collision
+            if (!verify_chunk_tokens_avx2(edge.data() + c * kRadixChunkTokens,
+                                          tokens + matched_len + c * kRadixChunkTokens,
+                                          kRadixChunkTokens)) {
                 break;
             }
             match_edge += kRadixChunkTokens;
@@ -1785,29 +1785,25 @@ size_t RadixTree::evict_lru_locked(size_t max_snapshots, size_t min_free_vram_mi
         return false;
     };
 
-    // Tier 1: Park excess VRAM snapshots to HiCache L2 Host-RAM
-    while (cached_snapshots_ > 0 && should_evict()) {
+    // Tier 1: Park excess VRAM snapshots to HiCache L2 Host-RAM using batch hysteresis (W_high=0.90 -> W_low=0.75)
+    const size_t vram_target_low = static_cast<size_t>(max_snapshots * 0.75);
+    if (should_evict()) {
         std::vector<std::shared_ptr<RadixNode>> leaves;
         collect_unreferenced_leaves(root_, leaves);
-        if (leaves.empty()) break; // All leaves actively in use
-
-        std::sort(leaves.begin(), leaves.end(), [](const auto& a, const auto& b) {
-            return a->last_accessed < b->last_accessed;
-        });
-
-        std::shared_ptr<RadixNode> victim = nullptr;
-        for (const auto& leaf : leaves) {
-            if (leaf->has_device_snapshot()) {
-                victim = leaf;
-                break;
+        if (!leaves.empty()) {
+            std::sort(leaves.begin(), leaves.end(), [](const auto& a, const auto& b) {
+                return a->last_accessed < b->last_accessed;
+            });
+            for (const auto& leaf : leaves) {
+                if (cached_snapshots_ <= vram_target_low && !should_evict()) break;
+                if (leaf->has_device_snapshot()) {
+                    leaf->park_to_host();
+                    if (cached_snapshots_ > 0) --cached_snapshots_;
+                    ++cached_host_snapshots_;
+                    ++evicted;
+                }
             }
         }
-        if (!victim) break;
-
-        victim->park_to_host();
-        if (cached_snapshots_ > 0) --cached_snapshots_;
-        ++cached_host_snapshots_;
-        ++evicted;
     }
 
     // Tier 2: Prune host snapshots when exceeding max_host_snapshots_ or host_ram_budget_

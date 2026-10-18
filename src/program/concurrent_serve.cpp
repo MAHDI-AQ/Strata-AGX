@@ -2159,6 +2159,25 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         }
         for (size_t q = 0; q < pending.size(); ) {
             const auto& req = pending[q];
+            // Phase 2: In-batch simulated queue prefix matching & prefill deduplication
+            bool prefix_in_flight = false;
+            if (req.tokens.size() >= 64) {
+                uint64_t prompt_chunk_hash = core::compute_token_chunk_hash(req.tokens.data(), 64);
+                for (const auto& ptr : m.slots) {
+                    if (ptr->active.load() && ptr->read.load() < ptr->position.load() && ptr->request.tokens.size() >= 64) {
+                        if (core::compute_token_chunk_hash(ptr->request.tokens.data(), 64) == prompt_chunk_hash) {
+                            prefix_in_flight = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (prefix_in_flight && pending.size() > 1 && q + 1 < pending.size()) {
+                // Defer duplicate prefill: another slot is prefilling this exact prefix right now!
+                // Sibling request will achieve 100% warm hit once current prefill commits.
+                ++q;
+                continue;
+            }
             const int64_t req_len = (int64_t) req.tokens.size();
             Impl::Slot* pick = nullptr;
 
