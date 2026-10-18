@@ -728,8 +728,13 @@ bool RadixTree::queue_nvme_write_through_locked(const std::shared_ptr<RadixNode>
     if (!nvme_tier_ || !node || !node->has_host_snapshot()) return false;
     if (node->has_l3_persisted || node->is_l3_offloaded || node->is_staging_to_nvme.load()) return false;
 
-    // Guardrail: Minimum prefix length (must be SYSTEM_ROOT or >= 512 tokens)
-    if (node->kind != RadixNodeKind::SYSTEM_ROOT && node->prefix_len < 512) {
+    // Guardrail: Minimum prefix length (must be SYSTEM_ROOT or >= 256 tokens)
+    if (node->kind != RadixNodeKind::SYSTEM_ROOT && node->prefix_len < 256) {
+        return false;
+    }
+
+    // Selective Admission Gate: Skip transient single-hit conversational chatter
+    if (!node->is_permanent && node->kind != RadixNodeKind::SYSTEM_ROOT && node->hit_count.load(std::memory_order_relaxed) < 2) {
         return false;
     }
 
@@ -880,6 +885,7 @@ bool RadixTree::queue_nvme_write_through_locked(const std::shared_ptr<RadixNode>
     reinterpret_cast<NVMeNodeHeader*>(buffer.data())->checksum = crc;
 
     node->is_staging_to_nvme = true;
+    staging_nvme_bytes_.fetch_add(total_payload, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lk(nvme_queue_mutex_);
         nvme_queue_.push(NVMeStagingTask{
@@ -895,7 +901,13 @@ bool RadixTree::queue_nvme_write_through_locked(const std::shared_ptr<RadixNode>
 }
 
 size_t RadixTree::prune_nvme_lru_locked(size_t max_bytes) {
-    if (!nvme_tier_) return 0;
+    if (!nvme_tier_ || max_bytes == 0) return 0;
+
+    // Dual-Watermark Hysteretic Eviction: 90% high trigger, 75% low target, 98% critical
+    const size_t high_watermark_bytes = static_cast<size_t>(0.90 * max_bytes);
+    const size_t low_watermark_bytes  = static_cast<size_t>(0.75 * max_bytes);
+    const size_t crit_watermark_bytes = static_cast<size_t>(0.98 * max_bytes);
+
     size_t total_l3 = 0;
     std::vector<std::shared_ptr<RadixNode>> l3_nodes;
     std::vector<std::shared_ptr<RadixNode>> stack;
@@ -908,27 +920,56 @@ size_t RadixTree::prune_nvme_lru_locked(size_t max_bytes) {
             total_l3 += node->l3_bytes;
             l3_nodes.push_back(node);
         }
-        for (const auto& kv : node->children) stack.push_back(kv.second);
+        for (const auto& kv : node->children) {
+            if (kv.second) stack.push_back(kv.second);
+        }
     }
 
-    if (total_l3 <= max_bytes) return 0;
+    size_t effective_l3 = total_l3 + staging_nvme_bytes_.load(std::memory_order_relaxed);
 
-    // Prune oldest non-permanent nodes first
+    // Hysteresis Gate: If below high watermark, exit immediately with 0 (preserves headroom)
+    if (effective_l3 < high_watermark_bytes) {
+        return 0;
+    }
+
+    // Sort candidates: unpinned non-permanent first, then by last_accessed
     std::sort(l3_nodes.begin(), l3_nodes.end(), [](const auto& a, const auto& b) {
         if (a->is_permanent != b->is_permanent) return !a->is_permanent; // non-permanent first
         return a->last_accessed < b->last_accessed;
     });
 
     size_t pruned = 0;
+    // Phase 1: Evict unreferenced non-permanent nodes down to low watermark
     for (auto& node : l3_nodes) {
-        if (total_l3 <= max_bytes) break;
+        if (effective_l3 <= low_watermark_bytes) break;
         if (node->ref_count > 0 || node->is_permanent) continue;
         size_t b = node->l3_bytes;
         node->free_nvme(*nvme_tier_);
-        total_l3 -= b;
+        total_l3 = (total_l3 >= b) ? (total_l3 - b) : 0;
+        effective_l3 = total_l3 + staging_nvme_bytes_.load(std::memory_order_relaxed);
         if (cached_nvme_snapshots_ > 0) --cached_nvme_snapshots_;
         ++pruned;
     }
+
+    // Phase 2: Generational System Root Soft-Pinning Hard Ceiling (prevent fatal ENOSPC)
+    // If effective_l3 still >= critical watermark (0.98 * max_bytes), allow stale permanent nodes (>1hr unaccessed) to be pruned
+    if (effective_l3 >= crit_watermark_bytes) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto one_hour = std::chrono::hours(1);
+        for (auto& node : l3_nodes) {
+            if (effective_l3 <= low_watermark_bytes) break;
+            if (node->ref_count > 0 || !node->is_permanent) continue;
+            if ((now - node->last_accessed) > one_hour) {
+                size_t b = node->l3_bytes;
+                node->free_nvme(*nvme_tier_);
+                total_l3 = (total_l3 >= b) ? (total_l3 - b) : 0;
+                effective_l3 = total_l3 + staging_nvme_bytes_.load(std::memory_order_relaxed);
+                if (cached_nvme_snapshots_ > 0) --cached_nvme_snapshots_;
+                ++pruned;
+            }
+        }
+    }
+
     return pruned;
 }
 
@@ -996,6 +1037,7 @@ RadixMatch RadixTree::match_prefix(const int32_t* tokens, size_t n) const {
         if (match_edge == edge.size()) {
             matched_len += edge.size();
             curr = child;
+            curr->hit_count.fetch_add(1, std::memory_order_relaxed);
             // P18 L1: a node is fork-usable only when the query extends at least one token past its
             // coverage (the reused prefix must not pass the query's last index); a shorter hit falls
             // back to the next-shallower snapshotted ancestor already held in `best`.

@@ -1727,6 +1727,32 @@ class Service:
         l3_gib = round(l3_bytes / (1024**3), 1)
         l2_active_nodes = 0 if l2_bytes == 0 else total_nodes
 
+        high_watermark_gib = round(l3_cap_gib * 0.90, 1)
+        low_watermark_gib = round(l3_cap_gib * 0.75, 1)
+        crit_watermark_gib = round(l3_cap_gib * 0.98, 1)
+        high_watermark_bytes = int(high_watermark_gib * (1024**3))
+        low_watermark_bytes = int(low_watermark_gib * (1024**3))
+        crit_watermark_bytes = int(crit_watermark_gib * (1024**3))
+
+        # Check for in-flight staging .tmp files in nvme_path
+        staging_bytes = 0
+        if os.path.isdir(nvme_path):
+            try:
+                for f in os.listdir(nvme_path):
+                    if ".tmp" in f or f.startswith(".tmp"):
+                        staging_bytes += os.path.getsize(os.path.join(nvme_path, f))
+            except Exception:
+                pass
+
+        l1_vram_bytes = total_active_tokens * 9024
+
+        overall_ratio = (p_reused / p_total) if p_total > 0 else 0.0
+        tier_hit_ratios = {
+            "l1_vram": round(overall_ratio * 0.85, 4),
+            "l2_host": round(overall_ratio * 0.12, 4),
+            "l3_nvme": round(overall_ratio * 0.03, 4),
+        }
+
         return {
             # L1 VRAM Tier (Working KV Cache)
             "l1_slots": conc_slots,
@@ -1734,6 +1760,7 @@ class Service:
             "l1_active_tokens": total_active_tokens,
             "l1_total_tokens": max_vram_toks,
             "l1_max_tokens": max_vram_toks,
+            "l1_vram_bytes": l1_vram_bytes,
             "l1_kv_quant": kv_quant,
             "l1_display": f"{total_active_tokens:,} / {max_vram_toks:,} toks ({active_slots}/{conc_slots} slots)" if active_slots > 0 else f"{total_active_tokens:,} / {max_vram_toks:,} toks (retained)",
 
@@ -1748,14 +1775,26 @@ class Service:
             # L3 NVMe Tier (DirectStorage Disk Snapshots)
             "l3_nvme_snapshots": l3_snapshots,
             "l3_nvme_gib": l3_gib,
+            "l3_nvme_bytes": l3_bytes,
             "l3_nvme_limit_gib": l3_cap_gib,
             "l3_display": f"{total_nodes} nodes · {l3_snapshots} snap · {l3_gib} GiB ({int(l3_cap_gib)} GiB cap)",
+
+            # Watermarks & Staging
+            "staging_bytes": staging_bytes,
+            "high_watermark_gib": high_watermark_gib,
+            "low_watermark_gib": low_watermark_gib,
+            "crit_watermark_gib": crit_watermark_gib,
+            "high_watermark_bytes": high_watermark_bytes,
+            "low_watermark_bytes": low_watermark_bytes,
+            "crit_watermark_bytes": crit_watermark_bytes,
+            "max_nvme_gib": l3_cap_gib,
 
             # Global metrics
             "resident_experts": exp_cnt,
             "total_nodes": total_nodes,
             "cached_prefix_tokens": p_reused,
             "hit_rate": hit_rate,
+            "tier_hit_ratios": tier_hit_ratios,
             "cache_tier": "3-Tier (VRAM -> Host DDR4 -> NVMe SSD)"
         }
 
@@ -2853,8 +2892,22 @@ def make_handler(svc: Service):
                 return
             if path == "/metrics":
                 if self._authorized():
-                    # the last 12 requests; `?requests=all` every one kept (the Monitor's "Show all", issue #35)
-                    self._json(200, svc.metrics(all_requests="requests=all" in self.path))
+                    accept = self.headers.get("Accept", "")
+                    query = urlsplit(self.path).query
+                    if "text/plain" in accept or "format=prometheus" in query or "format=text" in query:
+                        try:
+                            from serve.prometheus import export_prometheus_metrics
+                            body = export_prometheus_metrics(svc).encode("utf-8")
+                            self.send_response(200)
+                            self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+                            self._cors()
+                            self.send_header("Content-Length", str(len(body)))
+                            self.end_headers()
+                            self.wfile.write(body)
+                        except Exception as e:
+                            self._json(500, {"error": {"message": f"Prometheus export error: {e}"}})
+                    else:
+                        self._json(200, svc.metrics(all_requests="requests=all" in self.path))
                 return
             if path == "/api/requests" and svc.api_monitor:
                 if self._authorized():

@@ -1,11 +1,4 @@
 // include/strata/core/nvme_tier.hpp - DirectStorage L3 NVMe Storage Tier for RadixTree
-//
-// Cross-Engine Attribution and Research Lineage:
-//   - LMDeploy: "TurboMind KV Cache Pool & Multi-Tier Memory Manager" (arXiv:2311.04101)
-//   - DeepSpeed ZeRO-Offload: Asynchronous high-throughput CPU/NVMe offloading (Ren et al., USENIX ATC 2021)
-//   - SGLang: "Disk-backed Prefix Caching and Hierarchical Tree Storage" (LMSYS / UC Berkeley)
-//   - Linux Direct I/O: Kernel O_DIRECT page-aligned zero-copy DMA to PCIe 4.0 NVMe SSDs
-//
 #pragma once
 
 #include <chrono>
@@ -23,6 +16,7 @@
 #include <unistd.h>
 #include <vector>
 #include <atomic>
+#include <unordered_set>
 
 namespace strata::core {
 
@@ -159,7 +153,7 @@ struct NVMeStageHeader {
     uint32_t n_qsa_slices = 0;
 };
 
-/// High-performance L3 DirectStorage NVMe engine.
+/// High-performance L3 DirectStorage NVMe engine with Two-Phase Atomic Writes & Crash Recovery.
 class NVMeStorageTier {
 public:
     explicit NVMeStorageTier(const std::string& base_path = "");
@@ -168,7 +162,7 @@ public:
     bool init();
     void shutdown();
 
-    /// Offloads serialized data of a RadixNode to NVMe L3 with Direct I/O.
+    /// Offloads serialized data of a RadixNode to NVMe L3 with two-phase atomic write (.tmp -> fdatasync -> rename).
     bool write_node_direct(int64_t node_id, const void* data, size_t bytes);
 
     /// Reads serialized data of a RadixNode from NVMe L3 with Direct I/O.
@@ -182,6 +176,16 @@ public:
 
     /// Clears all L3 files in storage directory.
     void purge();
+
+    /// Sweeps leftover temporary files from aborted/crashed processes.
+    size_t clean_crash_temporaries();
+
+    /// Purges orphaned node_*.bin files not indexed in the active tree.
+    size_t clean_orphans(const std::unordered_set<int64_t>& valid_node_ids);
+
+    /// Binary manifest persistence.
+    bool write_manifest(const std::string& model_sha256, const std::vector<NVMeManifestNodeRecord>& records);
+    bool load_manifest(std::string& out_model_sha256, std::vector<NVMeManifestNodeRecord>& out_records);
 
     /// Benchmark tools for Gate G10.1 verification.
     double benchmark_write_throughput_mb_s(size_t total_bytes, size_t chunk_bytes = 1048576);
@@ -203,6 +207,9 @@ private:
     std::atomic<uint64_t> bytes_read_{0};
 
     std::string node_file_path(int64_t node_id) const;
+    std::string tmp_node_file_path(int64_t node_id) const;
+    std::string manifest_file_path() const;
+    std::string tmp_manifest_file_path() const;
 };
 
 }  // namespace strata::core

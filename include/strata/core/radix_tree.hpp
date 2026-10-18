@@ -225,6 +225,7 @@ struct RadixNode : public std::enable_shared_from_this<RadixNode> {
     std::vector<int32_t> edge_tokens;
     std::vector<uint64_t> edge_chunk_hashes;
     std::atomic<int> ref_count{0};
+    std::atomic<uint32_t> hit_count{0};
     std::chrono::steady_clock::time_point last_accessed;
 
     std::weak_ptr<RadixNode> parent;
@@ -381,6 +382,7 @@ public:
     size_t host_snapshot_bytes() const;
     size_t l3_snapshot_bytes() const;
     bool queue_nvme_write_through_locked(const std::shared_ptr<RadixNode>& node);
+    size_t staging_nvme_bytes() const { return staging_nvme_bytes_.load(std::memory_order_relaxed); }
     size_t prune_nvme_lru_locked(size_t max_bytes);
 
 private:
@@ -398,6 +400,7 @@ private:
     size_t cached_nvme_snapshots_ = 0;
     size_t node_count_ = 0;
     int64_t next_node_id_ = 1;
+    std::atomic<size_t> staging_nvme_bytes_{0};
     size_t vram_budget_ = (size_t) 768 << 20;   // S26f: device snapshot byte budget (STRATA_RADIX_VRAM_MIB)
     size_t deep_reserve_ = (size_t) 1280 << 20;   // S26g: tier bytes reserved for deep captures (STRATA_RADIX_DEEP_RESERVE_MIB)
     static constexpr int64_t kDeepPrefixTokens = 12288;   // S26g: prefix at/above which a capture is deep (value-per-byte)

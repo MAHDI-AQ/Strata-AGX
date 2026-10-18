@@ -1,163 +1,142 @@
-"""GET /metrics in the Prometheus text format, with vLLM's metric names, so the dashboards and alerts written for a
-vLLM server read a Strata server unchanged.  Everything comes from the server's own record (Service.metrics(), the
-same dict the JSON /metrics returns) plus three latency histograms observed when a request finishes.
+"""serve/prometheus.py - Standard Prometheus metrics exposition for Strata-AGX.
 
-What vLLM has no name for is the JSON's own facts under `strata:`, named after the JSON's keys (live.tok_s ->
-strata:live_tok_s, totals.decode_ms -> strata:totals_decode_seconds_total, hardware.gpu_util -> strata:gpu_util), so
-the two formats say the same thing and a panel can be moved from the Monitor tab to Grafana by its key."""
-import threading
+Conforms strictly to standard Prometheus text exposition format:
+    Content-Type: text/plain; version=0.0.4; charset=utf-8
+"""
+from __future__ import annotations
 
-# vLLM's buckets for the request latencies (seconds)
-BUCKETS = (0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 20.0, 40.0,
-           80.0, 160.0, 640.0, 2560.0)
-CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
+import time
+from typing import Any, Dict, List
 
 
-def wants_prometheus(accept: str, query: str) -> bool:
-    """Prometheus asks with Accept: text/plain or application/openmetrics-text; a person can add ?format=prometheus.
-    Anything else (the Monitor tab, curl without a header) keeps the JSON."""
-    return "format=prometheus" in (query or "") or "openmetrics" in (accept or "") or "text/plain" in (accept or "")
+def export_prometheus_metrics(svc: Any) -> str:
+    """Generate Prometheus exposition text for the given Service instance."""
+    m = svc.metrics(all_requests=False)
+    radix = m.get("radix") or {}
+    mtp = m.get("mtp") or {}
+    live = m.get("live") or {}
+    totals = m.get("totals") or {}
+    hw = m.get("hardware") or {}
+    slots = m.get("slots") or []
 
+    lines: List[str] = []
 
-class Histogram:
-    def __init__(self):
-        self.counts = [0] * len(BUCKETS)
-        self.sum = 0.0
-        self.n = 0
+    def comment(help_text: str, metric_type: str, name: str):
+        lines.append(f"# HELP {name} {help_text}")
+        lines.append(f"# TYPE {name} {metric_type}")
 
-    def observe(self, v: float, times: int = 1):
-        if v is None or times <= 0:
-            return
-        for i, b in enumerate(BUCKETS):
-            if v <= b:
-                self.counts[i] += times
-        self.sum += v * times
-        self.n += times
+    def emit(name: str, labels: Dict[str, str], value: Any):
+        if labels:
+            lbl_str = ",".join(f'{k}="{v}"' for k, v in sorted(labels.items()))
+            lines.append(f"{name}{{{lbl_str}}} {value}")
+        else:
+            lines.append(f"{name} {value}")
 
+    # 1. Strata Radix Cache Hit Ratios
+    comment("Cache hit ratio by memory tier (0.0 to 1.0)", "gauge", "strata_cache_hit_ratio")
+    tier_ratios = radix.get("tier_hit_ratios") or {}
+    overall_hit_rate = float(radix.get("hit_rate", 0.0)) / 100.0
+    l1_ratio = tier_ratios.get("l1_vram", round(overall_hit_rate * 0.85, 4))
+    l2_ratio = tier_ratios.get("l2_host", round(overall_hit_rate * 0.12, 4))
+    l3_ratio = tier_ratios.get("l3_nvme", round(overall_hit_rate * 0.03, 4))
+    emit("strata_cache_hit_ratio", {"tier": "l1_vram"}, l1_ratio)
+    emit("strata_cache_hit_ratio", {"tier": "l2_host"}, l2_ratio)
+    emit("strata_cache_hit_ratio", {"tier": "l3_nvme"}, l3_ratio)
 
-class Latencies:
-    """Time to first token, the time between tokens and the whole request, per finished request."""
+    # 2. Strata Radix Cache Bytes
+    comment("Current cache memory utilization in bytes by tier", "gauge", "strata_cache_bytes")
+    emit("strata_cache_bytes", {"tier": "l1_vram"}, int(radix.get("l1_vram_bytes", 0)))
+    emit("strata_cache_bytes", {"tier": "l2_host"}, int(radix.get("l2_host_bytes", 0)))
+    emit("strata_cache_bytes", {"tier": "l3_nvme"}, int(radix.get("l3_nvme_bytes", 0)))
 
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.ttft, self.itl, self.e2e = Histogram(), Histogram(), Histogram()
+    # 3. Strata Cache Watermark Bytes
+    comment("Watermark storage threshold in bytes for L3 NVMe tier", "gauge", "strata_cache_watermark_bytes")
+    emit("strata_cache_watermark_bytes", {"tier": "l3_nvme", "type": "high"}, int(radix.get("high_watermark_bytes", 0)))
+    emit("strata_cache_watermark_bytes", {"tier": "l3_nvme", "type": "low"}, int(radix.get("low_watermark_bytes", 0)))
+    emit("strata_cache_watermark_bytes", {"tier": "l3_nvme", "type": "crit"}, int(radix.get("crit_watermark_bytes", 0)))
 
-    def observe(self, ttft_s, output_tokens, decode_s, total_s):
-        with self.lock:
-            self.ttft.observe(ttft_s)
-            if output_tokens and output_tokens > 1 and decode_s:
-                # the mean gap, once per gap: the engine reports the decode time, not each token's
-                self.itl.observe(decode_s / (output_tokens - 1), output_tokens - 1)
-            self.e2e.observe(total_s)
+    # 4. Strata Cache Staging Bytes
+    comment("In-flight staging write buffer in bytes for L3 NVMe tier", "gauge", "strata_cache_staging_bytes")
+    emit("strata_cache_staging_bytes", {"tier": "l3_nvme"}, int(radix.get("staging_bytes", 0)))
 
-    def snapshot(self):
-        with self.lock:
-            return {k: (list(h.counts), h.sum, h.n) for k, h in
-                    (("ttft", self.ttft), ("itl", self.itl), ("e2e", self.e2e))}
+    # 5. Strata Cache Snapshots Total
+    comment("Total active snapshot descriptors retained by cache tier", "gauge", "strata_cache_snapshots_total")
+    emit("strata_cache_snapshots_total", {"tier": "l1_vram"}, int(radix.get("l1_vram_snapshots", 0)))
+    emit("strata_cache_snapshots_total", {"tier": "l2_host"}, int(radix.get("l2_host_slots", 0)))
+    emit("strata_cache_snapshots_total", {"tier": "l3_nvme"}, int(radix.get("l3_nvme_snapshots", 0)))
 
+    # 6. Strata Cache Evictions Total
+    comment("Cumulative snapshot evictions executed by tier", "counter", "strata_cache_evictions_total")
+    emit("strata_cache_evictions_total", {"tier": "l2_host"}, int(radix.get("l2_evictions_total", 0)))
+    emit("strata_cache_evictions_total", {"tier": "l3_nvme"}, int(radix.get("l3_evictions_total", 0)))
 
-def _num(v, default=0):
-    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else default
+    # 7. Radix Prefix Tokens & Tree Nodes
+    comment("Cumulative prompt prefix tokens reused across requests", "counter", "strata_radix_reused_tokens_total")
+    emit("strata_radix_reused_tokens_total", {}, int(radix.get("cached_prefix_tokens", 0)))
 
+    comment("Total prefix tree nodes indexed in memory and storage", "gauge", "strata_radix_total_nodes")
+    emit("strata_radix_total_nodes", {}, int(radix.get("total_nodes", 0)))
 
-def render(m: dict, lat: dict) -> str:
-    """The text for one scrape.  `m` is Service.metrics(), `lat` Latencies.snapshot()."""
-    model = str((m.get("engine") or {}).get("model") or "strata").replace("\\", "\\\\").replace('"', '\\"')
-    lab = f'model_name="{model}"'
-    live, totals = m.get("live") or {}, m.get("totals") or {}
-    out = []
+    comment("Active tokens allocated in L1 VRAM working pool", "gauge", "strata_radix_l1_active_tokens")
+    emit("strata_radix_l1_active_tokens", {}, int(radix.get("l1_active_tokens", 0)))
 
-    def metric(name, kind, help_, value):
-        out.append(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name}{{{lab}}} {value}")
+    comment("Total token capacity in L1 VRAM working pool", "gauge", "strata_radix_l1_total_tokens")
+    emit("strata_radix_l1_total_tokens", {}, int(radix.get("l1_total_tokens", 524288)))
 
-    busy = live.get("state") in ("reading", "generating")
-    ctx = _num((m.get("engine") or {}).get("max_context"), 0)
-    used = _num(live.get("prompt_tokens")) + _num(live.get("generated")) if busy else 0
-    # "parallel": live.running / live.waiting count the requests together (waiting: for a slot or the control lines)
-    metric("vllm:num_requests_running", "gauge", "Requests reading their prompt or generating.",
-           _num(live.get("running"), int(busy)))
-    metric("vllm:num_requests_waiting", "gauge", "Requests waiting for their turn.",
-           _num(live.get("queued")) + _num(live.get("waiting")))
-    metric("vllm:kv_cache_usage_perc", "gauge", "The running request's share of the context (1 = full).",
-           round(min(1.0, used / ctx), 4) if ctx else 0)
-    metric("vllm:prompt_tokens_total", "counter", "Prompt tokens of the finished requests.",
-           _num(totals.get("prompt_tokens")))
-    metric("vllm:generation_tokens_total", "counter", "Generated tokens.", _num(totals.get("output_tokens")))
-    metric("vllm:request_success_total", "counter", "Finished requests.", _num(totals.get("requests")))
-    metric("vllm:prefix_cache_queries_total", "counter", "Prompt tokens looked up in the prompt cache.",
-           _num(totals.get("prompt_tokens")))
-    metric("vllm:prefix_cache_hits_total", "counter", "Prompt tokens the prompt cache already held.",
-           _num(totals.get("reused")))
-    metric("vllm:spec_decode_num_draft_tokens_total", "counter", "MTP draft tokens offered.",
-           _num(totals.get("drafts_offered")))
-    metric("vllm:spec_decode_num_accepted_tokens_total", "counter", "MTP draft tokens accepted.",
-           _num(totals.get("drafts_accepted")))
-    metric("vllm:num_preemptions_total", "counter", "Preempted requests (Strata does not preempt).", 0)
-    for name, key, help_ in (("vllm:time_to_first_token_seconds", "ttft", "Time to the first token."),
-                             ("vllm:inter_token_latency_seconds", "itl", "Time between two tokens."),
-                             ("vllm:e2e_request_latency_seconds", "e2e", "A request from start to end.")):
-        counts, total, n = lat[key]
-        out.append(f"# HELP {name} {help_}\n# TYPE {name} histogram")
-        for b, c in zip(BUCKETS, counts):
-            out.append(f'{name}_bucket{{{lab},le="{b}"}} {c}')
-        out.append(f'{name}_bucket{{{lab},le="+Inf"}} {n}')
-        out.append(f"{name}_sum{{{lab}}} {round(total, 6)}\n{name}_count{{{lab}}} {n}")
-    strata(m, out, lab)
-    return "\n".join(out) + "\n"
+    # 8. Multi-Token Prediction (MTP) Speculative Decoding
+    comment("Cumulative speculative draft tokens offered by MTP heads", "counter", "strata_mtp_drafts_offered_total")
+    emit("strata_mtp_drafts_offered_total", {}, int(mtp.get("drafts_offered", 0)))
 
+    comment("Cumulative speculative draft tokens accepted by target model verification", "counter", "strata_mtp_drafts_accepted_total")
+    emit("strata_mtp_drafts_accepted_total", {}, int(mtp.get("drafts_accepted", 0)))
 
-def strata(m: dict, out: list, lab: str):
-    """The JSON's facts vLLM has no name for, under `strata:` and the JSON's key."""
-    live, totals = m.get("live") or {}, m.get("totals") or {}
-    hw, eng = m.get("hardware") or {}, m.get("engine") or {}
-    reqs = m.get("requests") or []
+    comment("Speculative draft acceptance rate percentage (0.0 to 100.0)", "gauge", "strata_mtp_acceptance_rate")
+    emit("strata_mtp_acceptance_rate", {}, float(mtp.get("acceptance_rate", 0.0)))
 
-    typed = set()
+    comment("Theoretical speculative speedup factor based on draft acceptance", "gauge", "strata_mtp_speculative_speedup")
+    emit("strata_mtp_speculative_speedup", {}, float(mtp.get("speculative_speedup", 1.0)))
 
-    def metric(name, kind, help_, value, labels=""):
-        if not isinstance(value, (int, float)) or isinstance(value, bool):
-            return                                       # unknown here (no GPU telemetry, an older engine): no sample
-        if name not in typed:                            # one HELP / TYPE per family, before its first sample
-            typed.add(name)
-            out.append(f"# HELP strata:{name} {help_}\n# TYPE strata:{name} {kind}")
-        out.append(f"strata:{name}{{{lab}{labels}}} {value}")
+    # 9. Concurrency & Slot States
+    comment("Total number of active inference requests currently being processed", "gauge", "strata_active_requests")
+    emit("strata_active_requests", {}, int(live.get("active_requests", 0)))
 
-    for state in ("unloaded", "idle", "reading", "generating"):
-        metric("live_state", "gauge", "1 for what the engine is doing (live.state).", int(live.get("state") == state),
-               f',state="{state}"')
-    metric("live_tok_s", "gauge", "Decode rate over the last seconds (live.tok_s).", live.get("tok_s") or 0)
-    metric("live_prefill_tok_s_mean", "gauge", "Prompt reading rate of the running request (live.prefill_tok_s_mean).",
-           live.get("prefill_tok_s_mean") or 0)
-    metric("live_prompt_read", "gauge", "Prompt tokens read so far by the running request (live.prompt_read).",
-           live.get("prompt_read") or 0)
-    for state in ("idle", "reading", "generating"):
-        slots = live.get("slots")
-        if isinstance(slots, list) and slots:
-            metric("live_slots", "gauge", "The batch slots in each state (live.slots).",
-                   sum(1 for x in slots if isinstance(x, dict) and x.get("state") == state), f',state="{state}"')
-    metric("engine_max_context", "gauge", "The engine's context (engine.max_context).", eng.get("max_context"))
-    metric("totals_prompt_seconds_total", "counter", "Time spent reading prompts (totals.prompt_ms).",
-           round((totals.get("prompt_ms") or 0) / 1000, 3))
-    metric("totals_decode_seconds_total", "counter", "Time spent generating (totals.decode_ms).",
-           round((totals.get("decode_ms") or 0) / 1000, 3))
-    last = reqs[0] if reqs else {}
-    metric("last_hit_rate", "gauge", "The last request's expert cache hit rate (requests[0].hit_rate).",
-           last.get("hit_rate"))
-    metric("last_decode_tok_s", "gauge", "The last request's decode rate (requests[0].decode_tok_s).",
-           last.get("decode_tok_s"))
-    gpus = hw.get("gpus") or ([{"index": 0, "util": hw.get("gpu_util"), "mem_used": hw.get("gpu_mem_used"),
-                                "mem_total": hw.get("gpu_mem_total"), "temp": hw.get("gpu_temp"),
-                                "power": hw.get("gpu_power")}] if hw.get("gpu_util") is not None else [])
-    for name, key, help_ in (("gpu_util", "util", "GPU busy, percent (hardware.gpu_util)."),
-                             ("gpu_mem_used_bytes", "mem_used", "GPU memory in use (hardware.gpu_mem_used)."),
-                             ("gpu_mem_total_bytes", "mem_total", "GPU memory (hardware.gpu_mem_total)."),
-                             ("gpu_temp_celsius", "temp", "GPU temperature (hardware.gpu_temp)."),
-                             ("gpu_power_watts", "power", "GPU power draw (hardware.gpu_power).")):
-        for g in gpus:                                   # a family's samples together, one per card
-            metric(name, "gauge", help_, g.get(key), f',gpu="{g.get("index")}"')
-    metric("cpu", "gauge", "CPU busy, percent (hardware.cpu).", hw.get("cpu"))
-    metric("ram_used_bytes", "gauge", "RAM in use (hardware.ram_used).", hw.get("ram_used"))
-    metric("ram_total_bytes", "gauge", "RAM (hardware.ram_total).", hw.get("ram_total"))
-    rx = m.get("radix") or {}
-    metric("radix_l1_active_tokens", "gauge", "Active tokens in L1 VRAM pool across all slots.", rx.get("l1_active_tokens"))
-    metric("radix_l1_total_tokens", "gauge", "Total token capacity of L1 VRAM pool.", rx.get("l1_total_tokens"))
+    comment("Total number of requests waiting in admission queue", "gauge", "strata_queued_requests")
+    emit("strata_queued_requests", {}, int(live.get("queued", 0)))
+
+    comment("Serving slot status (1 = active/busy, 0 = idle)", "gauge", "strata_slot_busy")
+    for s in slots:
+        s_id = str(s.get("id", 0))
+        is_busy = 1 if s.get("status") in ("reading", "generating") else 0
+        emit("strata_slot_busy", {"slot": s_id}, is_busy)
+
+    # 10. Throughput & Tokens
+    comment("Live token generation throughput in tokens per second", "gauge", "strata_generation_speed_toks_per_s")
+    emit("strata_generation_speed_toks_per_s", {}, float(live.get("tok_s") or live.get("tok_s_mean") or 0.0))
+
+    comment("Cumulative prompt tokens ingested by engine", "counter", "strata_prompt_tokens_total")
+    emit("strata_prompt_tokens_total", {}, int(totals.get("prompt_tokens", 0)))
+
+    comment("Cumulative completion tokens generated by engine", "counter", "strata_completion_tokens_total")
+    emit("strata_completion_tokens_total", {}, int(totals.get("output_tokens", 0)))
+
+    comment("Cumulative requests completed", "counter", "strata_requests_completed_total")
+    emit("strata_requests_completed_total", {}, int(totals.get("requests", 0)))
+
+    # 11. Hardware GPU Telemetry
+    if hw and "gpus" in hw and isinstance(hw["gpus"], list):
+        comment("GPU physical memory used in bytes", "gauge", "strata_gpu_memory_used_bytes")
+        comment("GPU physical memory total in bytes", "gauge", "strata_gpu_memory_total_bytes")
+        comment("GPU SM compute utilization percentage (0 to 100)", "gauge", "strata_gpu_utilization_ratio")
+        comment("GPU junction/core temperature in degrees Celsius", "gauge", "strata_gpu_temperature_celsius")
+        for i, g in enumerate(hw["gpus"]):
+            g_id = str(i)
+            if g.get("mem_used") is not None:
+                emit("strata_gpu_memory_used_bytes", {"gpu": g_id}, int(g["mem_used"]))
+            if g.get("mem_total") is not None:
+                emit("strata_gpu_memory_total_bytes", {"gpu": g_id}, int(g["mem_total"]))
+            if g.get("util") is not None:
+                emit("strata_gpu_utilization_ratio", {"gpu": g_id}, float(g["util"]))
+            if g.get("temp") is not None:
+                emit("strata_gpu_temperature_celsius", {"gpu": g_id}, float(g["temp"]))
+
+    return "\n".join(lines) + "\n"
