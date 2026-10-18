@@ -207,7 +207,18 @@ size_t NVMeStorageTier::clean_orphans(const std::unordered_set<int64_t>& valid_n
 }
 
 bool NVMeStorageTier::write_node_direct(int64_t node_id, const void* data, size_t bytes) {
+    if (circuit_tripped_.load(std::memory_order_relaxed)) {
+        return false;
+    }
     if (!data || bytes == 0) return false;
+
+    auto record_failure = [&](int err) {
+        if (err == ENOSPC || consecutive_write_errors_.fetch_add(1, std::memory_order_relaxed) + 1 >= kMaxConsecutiveWriteErrors) {
+            circuit_tripped_.store(true, std::memory_order_release);
+            std::fprintf(stderr,
+                "[NVMeStorageTier] CRITICAL: Circuit breaker TRIPPED (ENOSPC or write errors). Disabling L3 NVMe writes to protect engine stability.\n");
+        }
+    };
 
     std::shared_lock<std::shared_mutex> lk(mutex_);
 
@@ -222,9 +233,12 @@ bool NVMeStorageTier::write_node_direct(int64_t node_id, const void* data, size_
     int fd = ::open(tmp_path.c_str(), flags, 0644);
     if (fd < 0) {
         if (direct_io_supported_) {
-            fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            fd = ::open(tmp_path.c_str(), O_WRONLY| O_CREAT | O_TRUNC, 0644);
         }
-        if (fd < 0) return false;
+        if (fd < 0) {
+            record_failure(errno);
+            return false;
+        }
     }
 
     struct FileGuard {
@@ -268,6 +282,7 @@ bool NVMeStorageTier::write_node_direct(int64_t node_id, const void* data, size_
         ssize_t rc = ::write(fd, p + total_written, write_bytes - total_written);
         if (rc <= 0) {
             if (rc < 0 && errno == EINTR) continue;
+            record_failure(errno);
             return false;
         }
         total_written += rc;
@@ -275,6 +290,7 @@ bool NVMeStorageTier::write_node_direct(int64_t node_id, const void* data, size_
 
     // Force commit to disk to eliminate volatile NAND cache drops
     if (::fdatasync(fd) != 0) {
+        record_failure(errno);
         return false;
     }
 
@@ -283,10 +299,12 @@ bool NVMeStorageTier::write_node_direct(int64_t node_id, const void* data, size_
 
     // Two-Phase Atomic Rename: replaces or creates target file with 0 partial window
     if (::rename(tmp_path.c_str(), final_path.c_str()) != 0) {
+        record_failure(errno);
         return false;
     }
 
     guard.committed = true;
+    consecutive_write_errors_.store(0, std::memory_order_relaxed);
     offloaded_nodes_.fetch_add(1, std::memory_order_relaxed);
     bytes_written_.fetch_add(write_bytes, std::memory_order_relaxed);
     return true;
@@ -349,6 +367,25 @@ bool NVMeStorageTier::read_node_direct(int64_t node_id, void* out_data, size_t b
 
     if (read_ptr != out_data) {
         std::memcpy(out_data, staging.data(), bytes);
+    }
+
+    // Hardware SSE4.2 CRC32C Validation & Auto-Unlink
+    if (bytes >= sizeof(NVMeNodeHeader)) {
+        const auto* hdr = reinterpret_cast<const NVMeNodeHeader*>(out_data);
+        if (hdr->magic == kNVMeMagic && hdr->version == kNVMeVersion && hdr->checksum != 0) {
+            uint64_t actual = compute_crc32c(
+                static_cast<const uint8_t*>(out_data) + sizeof(NVMeNodeHeader),
+                bytes - sizeof(NVMeNodeHeader));
+            if (actual != hdr->checksum) {
+                std::fprintf(stderr,
+                    "[NVMeStorageTier] CORRUPTION DETECTED for node %ld: expected checksum %lu, computed %lu. Unlinking corrupted snapshot.\n",
+                    static_cast<long>(node_id),
+                    static_cast<unsigned long>(hdr->checksum),
+                    static_cast<unsigned long>(actual));
+                ::unlink(path.c_str());
+                return false;
+            }
+        }
     }
 
     bytes_read_.fetch_add(total_read, std::memory_order_relaxed);

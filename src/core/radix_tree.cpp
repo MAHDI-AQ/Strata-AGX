@@ -1513,7 +1513,30 @@ bool RadixTree::fork_to_session(
     } guard{target_node};
 
     if (target_node->is_l3_offloaded && nvme_tier_) {
-        if (!target_node->hydrate_from_nvme(*nvme_tier_)) {
+        bool hydrate_ok = true;
+        {
+            std::unique_lock<std::mutex> h_lock(target_node->hydrate_mutex_);
+            if (target_node->is_l3_offloaded) {
+                hydrate_ok = target_node->hydrate_from_nvme(*nvme_tier_);
+            }
+        }
+        if (!hydrate_ok) {
+            std::fprintf(stderr, "[RadixTree] Quarantining corrupted node %ld from tree after hydration/CRC failure.\n", (long) target_node->id);
+
+            // Quarantine corrupted node: unhook from parent
+            {
+                std::unique_lock<std::shared_mutex> w_lock(rw_lock_);
+                if (auto p = target_node->parent.lock()) {
+                    if (!target_node->edge_tokens.empty()) {
+                        p->children.erase(target_node->edge_tokens[0]);
+                        if (node_count_ > 0) --node_count_;
+                    }
+                }
+                target_node->stage_host_snapshots.clear();
+                target_node->is_l3_offloaded = false;
+                target_node->has_l3_persisted = false;
+            }
+
             // CRIT-RADIX-03: Fall back safely to shallower snapshot ancestors rather than failing
             std::shared_ptr<RadixNode> fallback_node = nullptr;
             {
@@ -1540,9 +1563,12 @@ bool RadixTree::fork_to_session(
             target_prefix = target_node->prefix_len;
 
             if (target_node->is_l3_offloaded && nvme_tier_) {
-                if (!target_node->hydrate_from_nvme(*nvme_tier_)) {
-                    err = "radix_fork: failed to hydrate fallback ancestor from NVMe L3";
-                    return false;
+                std::unique_lock<std::mutex> h_lock(target_node->hydrate_mutex_);
+                if (target_node->is_l3_offloaded) {
+                    if (!target_node->hydrate_from_nvme(*nvme_tier_)) {
+                        err = "radix_fork: failed to hydrate fallback ancestor from NVMe L3";
+                        return false;
+                    }
                 }
             }
         }
@@ -1560,6 +1586,7 @@ bool RadixTree::fork_to_session(
     qs.idx_n_head = g.idx_q_heads;
     qs.idx_dim = g.idx_key_dim;
 
+    const bool allow_recurrent = (target_prefix == target_node->prefix_len);
     const int64_t pages = (target_prefix + qs.page_size - 1) / qs.page_size;
     const size_t qsa_rows = (size_t) pages * qs.n_head_kv * qs.page_size;
 
@@ -1570,15 +1597,15 @@ bool RadixTree::fork_to_session(
             const core::OnDevice on(ss.device);
             cudaStream_t cs = (cudaStream_t) streams[st];
 
-            if (ss.R_saved && child->block.R) {
+            if (allow_recurrent && ss.R_saved && child->block.R) {
                 cudaMemcpyAsync(child->block.R, ss.R_saved, ss.R_bytes, cudaMemcpyDeviceToDevice, cs);
             }
 
-            if (ss.gdn_saved && child->gdn_state) {
+            if (allow_recurrent && ss.gdn_saved && child->gdn_state) {
                 cudaMemcpyAsync(child->gdn_state, ss.gdn_saved, ss.gdn_bytes, cudaMemcpyDeviceToDevice, cs);
             }
 
-            if (ss.ple_saved && child->ple_hist) {
+            if (allow_recurrent && ss.ple_saved && child->ple_hist) {
                 cudaMemcpyAsync(child->ple_hist, ss.ple_saved, ss.ple_bytes, cudaMemcpyDeviceToDevice, cs);
                 child->ple_prev[0] = ss.ple_prev_saved[0];
                 child->ple_prev[1] = ss.ple_prev_saved[1];
@@ -1631,15 +1658,15 @@ bool RadixTree::fork_to_session(
             const core::OnDevice on(hss.device);
             cudaStream_t cs = (cudaStream_t) streams[st];
 
-            if (!hss.R_data.empty() && child->block.R) {
+            if (allow_recurrent && !hss.R_data.empty() && child->block.R) {
                 cudaMemcpyAsync(child->block.R, hss.R_data.data(), hss.R_data.size(), cudaMemcpyHostToDevice, cs);
             }
 
-            if (!hss.gdn_data.empty() && child->gdn_state) {
+            if (allow_recurrent && !hss.gdn_data.empty() && child->gdn_state) {
                 cudaMemcpyAsync(child->gdn_state, hss.gdn_data.data(), hss.gdn_data.size(), cudaMemcpyHostToDevice, cs);
             }
 
-            if (!hss.ple_data.empty() && child->ple_hist) {
+            if (allow_recurrent && !hss.ple_data.empty() && child->ple_hist) {
                 cudaMemcpyAsync(child->ple_hist, hss.ple_data.data(), hss.ple_data.size(), cudaMemcpyHostToDevice, cs);
                 child->ple_prev[0] = hss.ple_prev_saved[0];
                 child->ple_prev[1] = hss.ple_prev_saved[1];

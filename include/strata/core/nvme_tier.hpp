@@ -24,6 +24,34 @@ static constexpr size_t kDirectBlockAlignment = 4096;
 static constexpr uint64_t kNVMeMagic = 0x5354524154414E56ULL; // "STRATANV"
 static constexpr uint32_t kNVMeVersion = 1;
 
+#if defined(__SSE4_2__)
+#include <nmmintrin.h>
+#endif
+
+inline uint64_t compute_crc32c(const void* data, size_t bytes) {
+    uint64_t crc = 0xFFFFFFFF53545241ULL;
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    size_t i = 0;
+#if defined(__SSE4_2__)
+    while (i + 8 <= bytes) {
+        uint64_t val;
+        std::memcpy(&val, p + i, sizeof(val));
+        crc = _mm_crc32_u64(crc, val);
+        i += 8;
+    }
+    while (i < bytes) {
+        crc = _mm_crc32_u8(static_cast<uint32_t>(crc), p[i]);
+        i += 1;
+    }
+#else
+    for (; i < bytes; ++i) {
+        crc = (crc ^ p[i]) * 1099511628211ULL;
+    }
+#endif
+    return crc;
+}
+
+
 /// RAII page-aligned buffer for direct Linux kernel I/O (O_DIRECT requires 4096-byte alignment).
 struct AlignedBuffer {
     void* ptr_ = nullptr;
@@ -159,6 +187,14 @@ public:
     explicit NVMeStorageTier(const std::string& base_path = "");
     ~NVMeStorageTier();
 
+    static constexpr uint32_t kMaxConsecutiveWriteErrors = 3;
+    bool is_circuit_tripped() const { return circuit_tripped_.load(std::memory_order_relaxed); }
+    void reset_circuit_breaker() {
+        circuit_tripped_.store(false, std::memory_order_release);
+        consecutive_write_errors_.store(0, std::memory_order_relaxed);
+    }
+    uint32_t consecutive_write_errors() const { return consecutive_write_errors_.load(std::memory_order_relaxed); }
+
     bool init();
     void shutdown();
 
@@ -205,6 +241,8 @@ private:
     std::atomic<size_t> offloaded_nodes_{0};
     std::atomic<uint64_t> bytes_written_{0};
     std::atomic<uint64_t> bytes_read_{0};
+    std::atomic<bool> circuit_tripped_{false};
+    std::atomic<uint32_t> consecutive_write_errors_{0};
 
     std::string node_file_path(int64_t node_id) const;
     std::string tmp_node_file_path(int64_t node_id) const;

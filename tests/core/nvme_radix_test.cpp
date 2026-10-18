@@ -208,6 +208,43 @@ void test_hydration_queue_and_registry(NVMeStorageTier& nvme) {
               << hq.last_hydration_latency_ms() << " ms." << std::endl;
 }
 
+
+void test_circuit_breaker() {
+    std::cout << "[Test 6] Circuit breaker consecutive errors & ENOSPC protection..." << std::endl;
+    NVMeStorageTier bad_nvme("/proc/non_existent_strata_dir");
+    assert(!bad_nvme.is_circuit_tripped());
+
+    AlignedBuffer buf(4096);
+    std::memset(buf.data(), 0x11, 4096);
+
+    // Error 1
+    bool r1 = bad_nvme.write_node_direct(1001, buf.data(), 4096);
+    assert(!r1);
+    assert(!bad_nvme.is_circuit_tripped());
+    assert(bad_nvme.consecutive_write_errors() == 1);
+
+    // Error 2
+    bool r2 = bad_nvme.write_node_direct(1002, buf.data(), 4096);
+    assert(!r2);
+    assert(!bad_nvme.is_circuit_tripped());
+    assert(bad_nvme.consecutive_write_errors() == 2);
+
+    // Error 3 -> Trips breaker
+    bool r3 = bad_nvme.write_node_direct(1003, buf.data(), 4096);
+    assert(!r3);
+    assert(bad_nvme.is_circuit_tripped());
+
+    // Subsequent writes short-circuit immediately
+    bool r4 = bad_nvme.write_node_direct(1004, buf.data(), 4096);
+    assert(!r4);
+
+    // Reset breaker
+    bad_nvme.reset_circuit_breaker();
+    assert(!bad_nvme.is_circuit_tripped());
+    assert(bad_nvme.consecutive_write_errors() == 0);
+    std::cout << "  -> PASS: Circuit breaker tripped on 3 consecutive errors and reset correctly." << std::endl;
+}
+
 int main() {
     cudaFree(0);
     std::cout << "=================================================================" << std::endl;
@@ -264,6 +301,7 @@ int main() {
     }
 
 
+    test_circuit_breaker();
     nvme.purge();
 
     std::cout << "=================================================================" << std::endl;
