@@ -104,7 +104,7 @@ struct PinnedBuffer {
             if (is_fallback_) {
                 std::free(ptr_);
             } else {
-                std::free(ptr_);
+                cudaFreeHost(ptr_);
             }
             ptr_ = nullptr;
             size_ = 0;
