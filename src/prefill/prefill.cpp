@@ -1271,6 +1271,17 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             }();
             (void) bl;
         }
+        auto is_resident = [&](int64_t lyr, int32_t ex) -> bool {
+            if (!m.host_res || !m.cache) return false;
+            const int32_t s_idx = m.host_res[(size_t) lyr * m.g->n_expert + ex];
+            return s_idx >= 0 && s_idx < m.cache->slots();
+        };
+        auto get_resident_dev = [&](int64_t lyr, int32_t ex) -> const uint8_t* {
+            if (!m.host_res || !m.cache) return nullptr;
+            const int32_t s_idx = m.host_res[(size_t) lyr * m.g->n_expert + ex];
+            if (s_idx < 0 || s_idx >= m.cache->slots()) return nullptr;
+            return m.cache->device_slot(s_idx);
+        };
         const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
         struct StreamEntry { int32_t l, e; const uint8_t* blob; int job; };
         std::vector<StreamEntry> seq;
@@ -1282,7 +1293,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             for (int64_t l = LB; l < LE; ++l) {
                 seq_start[(size_t) l] = seq.size();
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
-                    if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                    if (is_resident(l, e)) continue;
                     const uint8_t* b = m.src->blob(l, e);
                     if (!b) { err = "prefill: expert source has no blob"; return false; }
                     int job = -1;
@@ -1923,8 +1934,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 std::this_thread::yield();
                             }
                             const int32_t e = order[j];
-                            const bool resident = m.host_res && m.cache &&
-                                                  m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
+                            const bool resident = is_resident(l, e);
                             if (resident) { a_staged.store(j + 1, std::memory_order_release); continue; }
                             const int sl = sn;
                             sn = (sn + 1) % STAGE;
@@ -1961,7 +1971,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         std::vector<Stager::Job> js;
                         for (size_t j = 0; j < order.size(); ++j) {
                             const int32_t e = order[j];
-                            if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                            if (is_resident(l, e)) continue;
                             if (m.src->pinned(l, e)) continue;
                             const uint8_t* b = m.src->blob(l, e);
                             if (!b) { err = "prefill: expert source has no blob"; return false; }
@@ -1973,7 +1983,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     if (stage_thread_on && !stream_all && !order.empty()) stage_worker = std::thread(stage_worker_fn);
                     auto stage_one = [&](size_t j) -> bool {
                         const int32_t e = order[j];
-                        const bool resident = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
+                        const bool resident = is_resident(l, e);
                         if (resident) return true;
                         const int sl = stage_next;
                         stage_next = (stage_next + 1) % STAGE;
@@ -2014,6 +2024,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 // pointer table's entries are absolute bases, so the product is bit-exact.
                                 const auto& f = lay.fmt[(size_t) l];
                                 const bool resident = slot < 0;
+                                if (resident && blob_dev == nullptr) {
+                                    err = "prefill: resident expert " + std::to_string(e) + " on layer " + std::to_string(l) + " has null device pointer";
+                                    return false;
+                                }
                                 // Index by half: the per-group slice layout is [MMQ_GROUP gate/up bases]
                                 // [MMQ_GROUP down bases] and each launch reads entry q of its own half.  An
                                 // interleaved [gu,dn] pair layout makes a partial last group read entries
@@ -2115,7 +2129,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             const int32_t e = order[j];
                             if (stage_of[j] < 0) {
                                 ++stats_.experts_resident;
-                                if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1)) return false;
+                                {
+                                    const uint8_t* bdev = get_resident_dev(l, e);
+                                    if (!bdev) {
+                                        err = "prefill: resident expert " + std::to_string(e) + " on layer " + std::to_string(l) + " has invalid cache slot";
+                                        return false;
+                                    }
+                                    if (!compute(j, bdev, -1)) return false;
+                                }
                             } else {
                                 pt.mark(kPfWaitCopy, cs);
                                 cudaStreamWaitEvent(m.cs, m.copied[stage_of[j]], 0);
@@ -2138,7 +2159,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             const int32_t e = order[j];
                             if (stage_of[j] < 0) {
                                 ++stats_.experts_resident;
-                                if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1)) return false;
+                                {
+                                    const uint8_t* bdev = get_resident_dev(l, e);
+                                    if (!bdev) {
+                                        err = "prefill: resident expert " + std::to_string(e) + " on layer " + std::to_string(l) + " has invalid cache slot";
+                                        return false;
+                                    }
+                                    if (!compute(j, bdev, -1)) return false;
+                                }
                             } else {
                                 pt.mark(kPfWaitCopy, cs);
                                 cudaStreamWaitEvent(m.cs, m.copied[stage_of[j]], 0);
@@ -2170,7 +2198,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 give_back(consumed);
                             } else {
                                 ++stats_.experts_resident;
-                                if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1)) return false;
+                                {
+                                    const uint8_t* bdev = get_resident_dev(l, e);
+                                    if (!bdev) {
+                                        err = "prefill: resident expert " + std::to_string(e) + " on layer " + std::to_string(l) + " has invalid cache slot";
+                                        return false;
+                                    }
+                                    if (!compute(j, bdev, -1)) return false;
+                                }
                             }
                         }
                         release_to(m.g->n_expert);
