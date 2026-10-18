@@ -649,8 +649,16 @@ class StrataEngine:
 
     def _send(self, line):
         with self._write_lock:
-            self.proc.stdin.write(line + "\n")
-            self.proc.stdin.flush()
+            # Fix 3: Chunked prompt delivery for requests > 32k tokens to eliminate stdin backpressure stalls
+            line_payload = line + "\n"
+            chunk_bytes = 65536
+            if len(line_payload) > chunk_bytes:
+                for offset in range(0, len(line_payload), chunk_bytes):
+                    self.proc.stdin.write(line_payload[offset:offset + chunk_bytes])
+                    self.proc.stdin.flush()
+            else:
+                self.proc.stdin.write(line_payload)
+                self.proc.stdin.flush()
 
     def _parse_done(self, line):
         f = line.split()
@@ -728,6 +736,7 @@ class StrataEngine:
             raise ValueError("concurrent serving currently supports text only")
         self.last = {}
         self.progress = None
+        self._prefill_start = None
         channel = queue.Queue(maxsize=256)
         with self._channels_lock:
             self._request_number += 1
@@ -777,6 +786,12 @@ class StrataEngine:
                         raise ValueError(f"engine sent non-numeric progress: {line!r}")
                     self.progress = pr                       # this reader's value (unchanged)
                     self._shared_progress[number] = pr       # /metrics snapshot; lock-free (see progress)
+                    # Compute live prefill rate from SHM progress (tok/s)
+                    now = time.monotonic()
+                    if self._prefill_start is None:
+                        self._prefill_start = now
+                    if pr[0] > 0 and now > self._prefill_start:
+                        self.prefill_tok_s_mean = pr[0] / (now - self._prefill_start)
                     yield None
                 elif line.startswith("DONE "):
                     self._parse_done(line)
@@ -1817,6 +1832,8 @@ class Service:
             else:
                 s_dict.setdefault("cache_tier", "Fresh")
                 s_dict.setdefault("context_len", (s_dict.get("prompt_tokens", 0) or 0) + (s_dict.get("generated", 0) or 0))
+                if s_dict.get("status") == "reading":
+                    s_dict.setdefault("prefill_tok_s", getattr(self.engine, "prefill_tok_s_mean", None))
             s_dict.setdefault("state", s_dict.get("status"))
             formatted_slots.append(s_dict)
 

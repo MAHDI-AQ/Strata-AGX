@@ -66,14 +66,14 @@ inline uint64_t compute_token_chunk_hash(const int64_t* tokens, size_t count) {
     return h1 ^ ((h2 << 32) | (h2 >> 32));
 }
 
-struct PinnedSlabPage {
+struct PinnedBuffer {
     void* ptr_ = nullptr;
     size_t size_ = 0;
     bool is_fallback_ = false;
 
-    PinnedSlabPage() = default;
-    explicit PinnedSlabPage(size_t bytes) { allocate(bytes); }
-    ~PinnedSlabPage() { free(); }
+    PinnedBuffer() = default;
+    explicit PinnedBuffer(size_t bytes) { allocate(bytes); }
+    ~PinnedBuffer() { free(); }
 
     void allocate(size_t bytes) {
         if (bytes == size_ && ptr_) return;
@@ -96,25 +96,29 @@ struct PinnedSlabPage {
             }
         }
     }
+
+    void resize(size_t bytes) { allocate(bytes); }
+
     void free() {
         if (ptr_) {
             if (is_fallback_) {
                 std::free(ptr_);
             } else {
-                cudaFreeHost(ptr_);
+                std::free(ptr_);
             }
             ptr_ = nullptr;
             size_ = 0;
             is_fallback_ = false;
         }
     }
-    PinnedSlabPage(const PinnedSlabPage&) = delete;
-    PinnedSlabPage& operator=(const PinnedSlabPage&) = delete;
-    PinnedSlabPage(PinnedSlabPage&& o) noexcept
+
+    PinnedBuffer(const PinnedBuffer&) = delete;
+    PinnedBuffer& operator=(const PinnedBuffer&) = delete;
+    PinnedBuffer(PinnedBuffer&& o) noexcept
         : ptr_(o.ptr_), size_(o.size_), is_fallback_(o.is_fallback_) {
         o.ptr_ = nullptr; o.size_ = 0; o.is_fallback_ = false;
     }
-    PinnedSlabPage& operator=(PinnedSlabPage&& o) noexcept {
+    PinnedBuffer& operator=(PinnedBuffer&& o) noexcept {
         if (this != &o) {
             free();
             ptr_ = o.ptr_; size_ = o.size_; is_fallback_ = o.is_fallback_;
@@ -122,91 +126,11 @@ struct PinnedSlabPage {
         }
         return *this;
     }
-    uint8_t* data() noexcept { return static_cast<uint8_t*>(ptr_); }
-    const uint8_t* data() const noexcept { return static_cast<const uint8_t*>(ptr_); }
+
+    uint8_t* data() noexcept { return (uint8_t*)ptr_; }
+    const uint8_t* data() const noexcept { return (const uint8_t*)ptr_; }
     size_t size() const noexcept { return size_; }
     bool empty() const noexcept { return ptr_ == nullptr || size_ == 0; }
-};
-
-// CRIT-RADIX-04: Paged/segmented slab buffer structure eliminating host memory fragmentation
-// and avoiding single giant contiguous allocations that cause unpinned fallback.
-struct PinnedBuffer {
-    static constexpr size_t kPageSize = 2ULL * 1024 * 1024; // 2 MiB segmented page chunks
-    std::vector<PinnedSlabPage> pages_;
-    size_t total_size_ = 0;
-
-    PinnedBuffer() = default;
-    explicit PinnedBuffer(size_t bytes) { allocate(bytes); }
-    ~PinnedBuffer() = default;
-
-    void allocate(size_t bytes) {
-        if (bytes == total_size_ && !pages_.empty()) return;
-        free();
-        if (bytes == 0) return;
-        total_size_ = bytes;
-        size_t allocated = 0;
-        while (allocated < bytes) {
-            size_t chunk = std::min(kPageSize, bytes - allocated);
-            pages_.emplace_back(chunk);
-            allocated += chunk;
-        }
-    }
-
-    void resize(size_t bytes) { allocate(bytes); }
-
-    void free() {
-        pages_.clear();
-        total_size_ = 0;
-    }
-
-    PinnedBuffer(const PinnedBuffer&) = delete;
-    PinnedBuffer& operator=(const PinnedBuffer&) = delete;
-    PinnedBuffer(PinnedBuffer&& o) noexcept
-        : pages_(std::move(o.pages_)), total_size_(o.total_size_) {
-        o.total_size_ = 0;
-    }
-    PinnedBuffer& operator=(PinnedBuffer&& o) noexcept {
-        if (this != &o) {
-            free();
-            pages_ = std::move(o.pages_);
-            total_size_ = o.total_size_;
-            o.total_size_ = 0;
-        }
-        return *this;
-    }
-
-    uint8_t* data() noexcept {
-        return pages_.empty() ? nullptr : pages_[0].data();
-    }
-    const uint8_t* data() const noexcept {
-        return pages_.empty() ? nullptr : pages_[0].data();
-    }
-
-    uint8_t* locate(size_t offset) noexcept {
-        size_t acc = 0;
-        for (auto& pg : pages_) {
-            if (offset < acc + pg.size()) {
-                return pg.data() + (offset - acc);
-            }
-            acc += pg.size();
-        }
-        return nullptr;
-    }
-
-    const uint8_t* locate(size_t offset) const noexcept {
-        size_t acc = 0;
-        for (const auto& pg : pages_) {
-            if (offset < acc + pg.size()) {
-                return pg.data() + (offset - acc);
-            }
-            acc += pg.size();
-        }
-        return nullptr;
-    }
-
-    size_t size() const noexcept { return total_size_; }
-    bool empty() const noexcept { return total_size_ == 0 || pages_.empty(); }
-    const std::vector<PinnedSlabPage>& pages() const noexcept { return pages_; }
 };
 
 struct PinnedSpan {

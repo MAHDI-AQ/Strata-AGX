@@ -62,7 +62,16 @@ def prefill_progress():
     tokens": X moves).  At concurrency > 1 the same line carries the CONSTANT prompt size - the
     old constant-form match made every concurrent prefill look frozen (the 2026-10-01 false
     fire); that shape is covered by /metrics live.prompt_read instead."""
-    tail = sh(f"tail -n 80 {WS}/serve-8096.log 2>/dev/null")
+    cfg, _ = current_config()
+    log_candidates = [
+        f"{os.path.dirname(cfg)}/logs/server.log" if cfg else None,
+        "/srv/lab/recipes/q3-xxs-3x262k/logs/server.log",
+        f"{WS}/serve-8096.log"
+    ]
+    log_path = next((p for p in log_candidates if p and os.path.exists(p)), None)
+    if not log_path:
+        return None
+    tail = sh(f"tail -n 80 {log_path} 2>/dev/null")
     vals = [int(m.group(1).replace(",", "")) for m in re.finditer(r"reading the prompt:\s*([\d,]+) of [\d,]+ tokens", tail)]
     return max(vals) if vals else None
 
