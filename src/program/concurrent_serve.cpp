@@ -888,29 +888,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         }
         int64_t n = std::min<int64_t>(dynamic_chunk, rem);
 
-        // Phase 1 & 3: Boundary-aligned prefill clamping at T_sys and intermediate turn boundaries
-        while (s.next_turn_snap_idx < s.turn_boundaries.size() && s.turn_boundaries[s.next_turn_snap_idx] <= read0) {
-            s.next_turn_snap_idx++;
-        }
-        if (s.root_at > 0 && !s.root_snap_done && read0 < s.root_at) {
-            const int64_t dist_to_root = s.root_at - read0;
-            if (dist_to_root > 0 && n > dist_to_root) {
-                n = dist_to_root;
-            }
-        } else if (s.next_turn_snap_idx < s.turn_boundaries.size()) {
-            const int64_t b = s.turn_boundaries[s.next_turn_snap_idx];
-            if (b > read0) {
-                const int64_t dist_to_b = b - read0;
-                if (dist_to_b > 0 && n > dist_to_b) {
-                    n = dist_to_b;
-                }
-            }
-        } else if (s.turn_at > 0 && !s.turn_snap_done && s.turn_at > s.root_at && read0 < s.turn_at) {
-            const int64_t dist_to_turn = s.turn_at - read0;
-            if (dist_to_turn > 0 && n > dist_to_turn) {
-                n = dist_to_turn;
-            }
-        }
+        // Prefill runs uninterrupted micro-chunks to ensure continuous streaming throughput
         // Frontier 2: Enforce GPU stream dependency prior to prefill chunk launch
         for (size_t st = 0; st < s.stages.size(); ++st) {
             if (s.stages[st].fork_in_flight) {
@@ -1174,37 +1152,11 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     auto capture_prompt_end_snapshots = [&]() {
         for (auto& ptr : m.slots) {
             auto& s = *ptr;
-            if (!s.active.load() || !s.first) continue;
+            if (!s.active.load(std::memory_order_relaxed) || !s.first || s.prompt_snap_done) continue;
+            const int64_t pos = s.position.load(std::memory_order_relaxed);
             const int64_t cur_read = s.read.load(std::memory_order_acquire);
+            if (cur_read < pos) continue;
 
-            // Phase 1: Boundary snapshot capture at T_sys
-            if (s.root_at > 0 && !s.root_snap_done && cur_read >= s.root_at && (int64_t) s.consumed.size() >= s.root_at) {
-                s.root_snap_done = true;
-                save_slot_snapshot(s, s.root_at, s.consumed, /*safe_no_evict=*/true);
-                std::fprintf(stderr, "strata-agx concurrent: captured SYSTEM_ROOT boundary snapshot at T_sys=%lld (req=%llu)\n",
-                             (long long) s.root_at, (unsigned long long) s.request.id);
-            }
-            // Phase 3: Intermediate turn boundary snapshot capture
-            while (s.next_turn_snap_idx < s.turn_boundaries.size()) {
-                const int64_t b = s.turn_boundaries[s.next_turn_snap_idx];
-                if (cur_read >= b && (int64_t) s.consumed.size() >= b) {
-                    save_slot_snapshot(s, b, s.consumed, /*safe_no_evict=*/false);
-                    std::fprintf(stderr, "strata-agx concurrent: captured INTERMEDIATE TURN_BOUNDARY snapshot at T=%lld (req=%llu)\n",
-                                 (long long) b, (unsigned long long) s.request.id);
-                    s.next_turn_snap_idx++;
-                } else {
-                    break;
-                }
-            }
-            if (s.turn_at > 0 && !s.turn_snap_done && s.turn_at > s.root_at && cur_read >= s.turn_at && (int64_t) s.consumed.size() >= s.turn_at) {
-                s.turn_snap_done = true;
-                save_slot_snapshot(s, s.turn_at, s.consumed, /*safe_no_evict=*/false);
-                std::fprintf(stderr, "strata-agx concurrent: captured TURN_BOUNDARY snapshot at T_turn=%lld (req=%llu)\n",
-                             (long long) s.turn_at, (unsigned long long) s.request.id);
-            }
-
-            if (s.prompt_snap_done) continue;
-            const int64_t pos = s.position.load();
             const int64_t n = (int64_t) s.consumed.size();
             // S26f9: end-append prompts re-tokenize at the junction, so a snapshot at the very end
             // is unusable for the next (appended) turn.  Capture the deepest real state below the
@@ -1767,33 +1719,6 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         s.current = (int32_t) s.request.tokens.back();
         s.reused_prefix = reused;
         s.prompt_snap_done = false;
-        s.root_snap_done = false;
-        s.turn_snap_done = false;
-        s.root_at = -1;
-        s.turn_at = -1;
-        s.turn_boundaries.clear();
-        s.next_turn_snap_idx = 0;
-
-        // Phase 1: Semantic boundary detection for Qwen chat format (<|im_start|> = 248045)
-        // System prompt root ends at the second <|im_start|> (the start of the first user turn)
-        constexpr int64_t kImStartToken = 248045;
-        const auto& req_toks = s.request.tokens;
-        int im_start_count = 0;
-        for (int64_t idx = 0; idx < (int64_t) req_toks.size(); ++idx) {
-            if (req_toks[(size_t) idx] == kImStartToken) {
-                ++im_start_count;
-                if (im_start_count == 2) {
-                    if (idx >= 64) s.root_at = idx;
-                }
-                if (idx >= 64 && idx > reused) {
-                    s.turn_boundaries.push_back(idx);
-                }
-                s.turn_at = idx;
-            }
-        }
-        if (s.root_at > 0 && reused >= s.root_at) {
-            s.root_snap_done = true; // Prefix already past system root
-        }
         if (retain) s.session = s.request.session;   // D1: keep the slot's conversation key current
         if (reused == 0) s.consumed.clear();
         std::fill(std::begin(s.probability), std::end(s.probability), 0.0f);
