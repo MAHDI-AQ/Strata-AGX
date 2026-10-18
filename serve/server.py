@@ -49,7 +49,7 @@ from typing import Iterator, Protocol
 from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
-STRATA_AGX_VERSION = "0.1.40-agx.4.6.0"
+STRATA_AGX_VERSION = "0.1.40-agx.5.0.0"
 
 def get_git_commit() -> str:
     commit = os.environ.get("STRATA_COMMIT")
