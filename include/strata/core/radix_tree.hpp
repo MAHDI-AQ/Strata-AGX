@@ -55,8 +55,7 @@ inline bool verify_chunk_tokens_avx2(const int32_t* a, const int32_t* b, size_t 
         __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i));
         __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + i));
         __m256i cmp = _mm256_cmpeq_epi32(va, vb);
-        int mask = _mm256_movemask_ps(_mm256_castsi256_ps(cmp));
-        if (mask != 0xFF) {
+        if (_mm256_movemask_epi8(cmp) != -1) {
             return false;
         }
     }

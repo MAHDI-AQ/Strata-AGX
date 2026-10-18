@@ -1108,12 +1108,10 @@ RadixMatch RadixTree::match_prefix(const int64_t* tokens, size_t n) const {
         for (; c < num_chunks && c < chunk_hashes.size(); ++c) {
             const uint64_t q_hash = compute_token_chunk_hash(tokens + matched_len + c * kRadixChunkTokens, kRadixChunkTokens);
             if (chunk_hashes[c] != q_hash) break;
-            // CACHE-02: Enforce raw token verification across matched chunk to prevent CRC32C hash collisions
-            int32_t chunk_buf[kRadixChunkTokens];
-            for (size_t i = 0; i < kRadixChunkTokens; ++i) {
-                chunk_buf[i] = static_cast<int32_t>(tokens[matched_len + c * kRadixChunkTokens + i]);
-            }
-            if (std::memcmp(edge.data() + c * kRadixChunkTokens, chunk_buf, kRadixChunkTokens * sizeof(int32_t)) != 0) {
+            // Phase 1 Correctness: AVX2 SIMD equality verification against hash collision
+            if (!verify_chunk_tokens_avx2(edge.data() + c * kRadixChunkTokens,
+                                          tokens + matched_len + c * kRadixChunkTokens,
+                                          kRadixChunkTokens)) {
                 break;
             }
             match_edge += kRadixChunkTokens;
@@ -1786,24 +1784,27 @@ size_t RadixTree::evict_lru_locked(size_t max_snapshots, size_t min_free_vram_mi
     };
 
     // Tier 1: Park excess VRAM snapshots to HiCache L2 Host-RAM using batch hysteresis (W_high=0.90 -> W_low=0.75)
-    const size_t vram_target_low = static_cast<size_t>(max_snapshots * 0.75);
-    if (should_evict()) {
+    const size_t vram_target_low = (max_snapshots > 1) ? static_cast<size_t>(max_snapshots * 0.75) : max_snapshots;
+    while (cached_snapshots_ > vram_target_low && should_evict()) {
         std::vector<std::shared_ptr<RadixNode>> leaves;
         collect_unreferenced_leaves(root_, leaves);
-        if (!leaves.empty()) {
-            std::sort(leaves.begin(), leaves.end(), [](const auto& a, const auto& b) {
-                return a->last_accessed < b->last_accessed;
-            });
-            for (const auto& leaf : leaves) {
-                if (cached_snapshots_ <= vram_target_low && !should_evict()) break;
-                if (leaf->has_device_snapshot()) {
-                    leaf->park_to_host();
-                    if (cached_snapshots_ > 0) --cached_snapshots_;
-                    ++cached_host_snapshots_;
-                    ++evicted;
-                }
+        if (leaves.empty()) break;
+        std::sort(leaves.begin(), leaves.end(), [](const auto& a, const auto& b) {
+            return a->last_accessed < b->last_accessed;
+        });
+        bool made_progress = false;
+        for (const auto& leaf : leaves) {
+            if (cached_snapshots_ <= vram_target_low && !should_evict()) break;
+            if (leaf->has_device_snapshot()) {
+                leaf->park_to_host();
+                if (cached_snapshots_ > 0) --cached_snapshots_;
+                ++cached_host_snapshots_;
+                ++evicted;
+                made_progress = true;
+                break; // Refresh leaves to discover newly unreferenced ancestors
             }
         }
+        if (!made_progress) break;
     }
 
     // Tier 2: Prune host snapshots when exceeding max_host_snapshots_ or host_ram_budget_
@@ -2042,7 +2043,7 @@ CompactionStats RadixTree::compact_tree() {
             prune_dead_leaves(kv.second);
             // CRIT-RADIX-02: Guard dead-leaf pruning against nodes actively staging to NVMe
             if (kv.second && kv.second->children.empty() && kv.second->ref_count == 0 &&
-                !kv.second->has_snapshot() && !kv.second->is_staging_to_nvme.load()) {
+                !kv.second->has_snapshot() && !kv.second->holds_recurrent_state() && !kv.second->is_staging_to_nvme.load()) {
                 dead_keys.push_back(kv.first);
             }
         }
@@ -2064,9 +2065,9 @@ CompactionStats RadixTree::compact_tree() {
             compress_paths(kv.second);
         }
         // Task 2.2 & CRIT-RADIX-02: Assert child->ref_count == 0 and not staging to NVMe before collapsing single-child path!
-        if (curr != root_ && curr->ref_count == 0 && !curr->has_snapshot() && !curr->is_staging_to_nvme.load() && curr->children.size() == 1) {
+        if (curr != root_ && curr->ref_count == 0 && !curr->has_snapshot() && !curr->holds_recurrent_state() && !curr->is_staging_to_nvme.load() && curr->children.size() == 1) {
             auto child = curr->children.begin()->second;
-            if (child && child->ref_count == 0 && !child->is_staging_to_nvme.load()) {
+            if (child && child->ref_count == 0 && !child->holds_recurrent_state() && !child->is_staging_to_nvme.load()) {
                 curr->edge_tokens.insert(curr->edge_tokens.end(), child->edge_tokens.begin(), child->edge_tokens.end());
                 curr->update_chunk_hashes();
                 curr->children = std::move(child->children);

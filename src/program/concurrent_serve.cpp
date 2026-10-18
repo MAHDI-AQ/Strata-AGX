@@ -259,6 +259,7 @@ struct ConcurrentServe::Impl {
         // during prompt processing, and the loop only decodes (and re-sets `read = position`) once the slot
         // is ready.  `read` is the release/acquire hand-off between the two (see the pump).
         std::atomic<bool> active{false};
+        std::atomic<uint64_t> in_flight_prefix_hash{0};
         bool first = true, lookup = false;
         bool brought_up = false;   // STRATA_SLOT_LAZY: false until its first admission initializes it
         // P4 live retention: `consumed` is ALSO the conversation this slot's sessions hold. At idle the
@@ -1248,7 +1249,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         }
         s.stages[0].prompt.embd_rows = nullptr;
         live.erase(s.request.id);
-        s.active.store(false);
+        s.in_flight_prefix_hash.store(0, std::memory_order_release); s.active.store(false);
         int finish_slot_idx = -1;
         for (size_t si = 0; si < m.slots.size(); ++si) {
             if (m.slots[si].get() == &s) { finish_slot_idx = (int) si; break; }
@@ -1761,7 +1762,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         if ((int64_t) s.request.tokens.size() > s.max_context) { err = "concurrency: request prompt (" + std::to_string(s.request.tokens.size()) + ") exceeds slot context (" + std::to_string(s.max_context) + ")"; return false; }
         if (m.lazy_slots && !s.brought_up && !bringup_slot(s, err)) return false;
         s.read.store(reused); s.generated = s.offered = s.accepted = 0;
-        s.prompt_ms.store(0); s.first = true; s.active.store(true);
+        s.prompt_ms.store(0); s.first = true; s.in_flight_prefix_hash.store(s.request.tokens.size() >= 64 ? core::compute_token_chunk_hash(s.request.tokens.data(), 64) : 0, std::memory_order_release); s.active.store(true);
         s.position.store((int64_t) s.request.tokens.size() - 1);
         s.current = (int32_t) s.request.tokens.back();
         s.reused_prefix = reused;
@@ -2159,20 +2160,29 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         }
         for (size_t q = 0; q < pending.size(); ) {
             const auto& req = pending[q];
-            // Phase 2: In-batch simulated queue prefix matching & prefill deduplication
+            // Phase 2: In-batch simulated queue prefix matching & prefill deduplication (INQ2-01 Thread-Safe Atomic)
             bool prefix_in_flight = false;
             if (req.tokens.size() >= 64) {
-                uint64_t prompt_chunk_hash = core::compute_token_chunk_hash(req.tokens.data(), 64);
+                const uint64_t prompt_chunk_hash = core::compute_token_chunk_hash(req.tokens.data(), 64);
                 for (const auto& ptr : m.slots) {
-                    if (ptr->active.load() && ptr->read.load() < ptr->position.load() && ptr->request.tokens.size() >= 64) {
-                        if (core::compute_token_chunk_hash(ptr->request.tokens.data(), 64) == prompt_chunk_hash) {
+                    if (ptr->active.load() && ptr->read.load() < ptr->position.load()) {
+                        const uint64_t slot_hash = ptr->in_flight_prefix_hash.load(std::memory_order_acquire);
+                        if (slot_hash != 0 && slot_hash == prompt_chunk_hash) {
                             prefix_in_flight = true;
                             break;
                         }
                     }
                 }
             }
-            if (prefix_in_flight && pending.size() > 1 && q + 1 < pending.size()) {
+            // INQ2-03: Only defer if no other slot is currently idle and ready
+            bool has_other_idle_slot = false;
+            for (const auto& ptr : m.slots) {
+                if (!ptr->active.load() && std::find(admitted_this_round.begin(), admitted_this_round.end(), ptr.get()) == admitted_this_round.end()) {
+                    has_other_idle_slot = true;
+                    break;
+                }
+            }
+            if (prefix_in_flight && !has_other_idle_slot && pending.size() > 1 && q + 1 < pending.size()) {
                 // Defer duplicate prefill: another slot is prefilling this exact prefix right now!
                 // Sibling request will achieve 100% warm hit once current prefill commits.
                 ++q;

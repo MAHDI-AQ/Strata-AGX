@@ -614,6 +614,10 @@ IOUringStorage::~IOUringStorage() {
 }
 
 int IOUringStorage::sync_direct_io(int fd, void* buf, size_t bytes, off_t offset, bool is_write) {
+    if (!buf || bytes == 0) return 0;
+    if ((reinterpret_cast<uintptr_t>(buf) % 4096 != 0) || (bytes % 4096 != 0) || (offset % 4096 != 0)) {
+        return -EINVAL;
+    }
     size_t total = 0;
     uint8_t* ptr = static_cast<uint8_t*>(buf);
     while (total < bytes) {
