@@ -20,6 +20,7 @@ async function api(path, body) {
   const response = await fetch(path, {
     cache: "no-store",
     headers: {
+      Accept: "application/json",
       ...(apiKey ? {Authorization: `Bearer ${apiKey}`} : {}),
       ...(body !== undefined ? {"Content-Type": "application/json"} : {})
     },

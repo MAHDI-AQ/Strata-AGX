@@ -2894,7 +2894,8 @@ def make_handler(svc: Service):
                 if self._authorized():
                     accept = self.headers.get("Accept", "")
                     query = urlsplit(self.path).query
-                    if "text/plain" in accept or "format=prometheus" in query or "format=text" in query:
+                    wants_json = ("application/json" in accept) or ("format=json" in query)
+                    if not wants_json:
                         try:
                             from serve.prometheus import export_prometheus_metrics
                             body = export_prometheus_metrics(svc).encode("utf-8")

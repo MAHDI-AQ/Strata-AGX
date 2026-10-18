@@ -377,13 +377,14 @@ public:
 
     size_t cached_snapshot_count() const { return cached_snapshots_; }
     size_t cached_host_snapshot_count() const { return cached_host_snapshots_; }
-    size_t cached_nvme_snapshot_count() const { return cached_nvme_snapshots_; }
+    size_t cached_nvme_snapshot_count() const { return cached_nvme_snapshots_.load(std::memory_order_relaxed); }
     size_t total_nodes() const { return node_count_; }
     size_t host_snapshot_bytes() const;
     size_t l3_snapshot_bytes() const;
     bool queue_nvme_write_through_locked(const std::shared_ptr<RadixNode>& node);
     size_t staging_nvme_bytes() const { return staging_nvme_bytes_.load(std::memory_order_relaxed); }
     size_t prune_nvme_lru_locked(size_t max_bytes);
+    size_t clean_nvme_orphans();
 
 private:
     mutable std::shared_mutex rw_lock_;
@@ -397,7 +398,7 @@ private:
     size_t host_snapshot_bytes_locked() const;
     size_t cached_snapshots_ = 0;
     size_t cached_host_snapshots_ = 0;
-    size_t cached_nvme_snapshots_ = 0;
+    std::atomic<size_t> cached_nvme_snapshots_{0};
     size_t node_count_ = 0;
     int64_t next_node_id_ = 1;
     std::atomic<size_t> staging_nvme_bytes_{0};

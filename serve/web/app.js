@@ -86,7 +86,7 @@ window.addEventListener("hashchange", () => showTab(location.hash.slice(1)));
 
 // ------------------------------------------------------------------ server access
 function headers(json = false) {
-  const h = {};
+  const h = { Accept: "application/json" };
   const key = store.get("apikey", "");
   if (key) h.Authorization = "Bearer " + key;
   if (json) h["Content-Type"] = "application/json";

@@ -255,6 +255,7 @@ bool RadixNode::offload_to_nvme(NVMeStorageTier& nvme) {
 
     AlignedBuffer buffer(total_payload);
     uint8_t* p = buffer.data();
+    if (!p) return false;
     size_t offset = 0;
 
     NVMeNodeHeader hdr;
@@ -389,7 +390,7 @@ bool RadixNode::hydrate_from_nvme(NVMeStorageTier& nvme) {
     } read_guard;
 
     AlignedBuffer buffer(l3_bytes);
-    if (!nvme.read_node_direct(id, buffer.data(), l3_bytes)) {
+    if (!buffer.data() || !nvme.read_node_direct(id, buffer.data(), l3_bytes)) {
         return false;
     }
 
@@ -647,19 +648,25 @@ void RadixTree::nvme_worker_loop() {
                         node->free_host();
                     }
                 } else {
-                    if (cached_nvme_snapshots_ > 0) --cached_nvme_snapshots_;
+                    if (cached_nvme_snapshots_.load(std::memory_order_relaxed) > 0) cached_nvme_snapshots_.fetch_sub(1, std::memory_order_relaxed);
                 }
                 node->is_staging_to_nvme = false;
             } else {
                 std::unique_lock<std::shared_mutex> lk(rw_lock_);
-                if (!ok && cached_nvme_snapshots_ > 0) --cached_nvme_snapshots_;
+                if (!ok && cached_nvme_snapshots_.load(std::memory_order_relaxed) > 0) cached_nvme_snapshots_.fetch_sub(1, std::memory_order_relaxed);
             }
         } else {
             if (auto node = task.node_weak.lock()) {
                 std::unique_lock<std::shared_mutex> lk(rw_lock_);
-                if (cached_nvme_snapshots_ > 0) --cached_nvme_snapshots_;
+                if (cached_nvme_snapshots_.load(std::memory_order_relaxed) > 0) cached_nvme_snapshots_.fetch_sub(1, std::memory_order_relaxed);
                 node->is_staging_to_nvme = false;
             }
+        }
+        if (task.total_payload > 0) {
+            size_t cur = staging_nvme_bytes_.load(std::memory_order_relaxed);
+            while (cur > 0 && !staging_nvme_bytes_.compare_exchange_weak(
+                       cur, (cur >= task.total_payload) ? (cur - task.total_payload) : 0,
+                       std::memory_order_relaxed)) {}
         }
     }
 }
@@ -728,8 +735,8 @@ bool RadixTree::queue_nvme_write_through_locked(const std::shared_ptr<RadixNode>
     if (!nvme_tier_ || !node || !node->has_host_snapshot()) return false;
     if (node->has_l3_persisted || node->is_l3_offloaded || node->is_staging_to_nvme.load()) return false;
 
-    // Guardrail: Minimum prefix length (must be SYSTEM_ROOT or >= 256 tokens)
-    if (node->kind != RadixNodeKind::SYSTEM_ROOT && node->prefix_len < 256) {
+    // Guardrail: Minimum prefix length (must be permanent, SYSTEM_ROOT or >= 256 tokens)
+    if (!node->is_permanent && node->kind != RadixNodeKind::SYSTEM_ROOT && node->prefix_len < 256) {
         return false;
     }
 
@@ -774,6 +781,7 @@ bool RadixTree::queue_nvme_write_through_locked(const std::shared_ptr<RadixNode>
 
     AlignedBuffer buffer(total_payload);
     uint8_t* p = buffer.data();
+    if (!p) return false;
     size_t offset = 0;
 
     NVMeNodeHeader hdr;
@@ -896,7 +904,7 @@ bool RadixTree::queue_nvme_write_through_locked(const std::shared_ptr<RadixNode>
         });
     }
     nvme_cv_.notify_one();
-    ++cached_nvme_snapshots_;
+    cached_nvme_snapshots_.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
@@ -947,7 +955,7 @@ size_t RadixTree::prune_nvme_lru_locked(size_t max_bytes) {
         node->free_nvme(*nvme_tier_);
         total_l3 = (total_l3 >= b) ? (total_l3 - b) : 0;
         effective_l3 = total_l3 + staging_nvme_bytes_.load(std::memory_order_relaxed);
-        if (cached_nvme_snapshots_ > 0) --cached_nvme_snapshots_;
+        if (cached_nvme_snapshots_.load(std::memory_order_relaxed) > 0) cached_nvme_snapshots_.fetch_sub(1, std::memory_order_relaxed);
         ++pruned;
     }
 
@@ -964,7 +972,7 @@ size_t RadixTree::prune_nvme_lru_locked(size_t max_bytes) {
                 node->free_nvme(*nvme_tier_);
                 total_l3 = (total_l3 >= b) ? (total_l3 - b) : 0;
                 effective_l3 = total_l3 + staging_nvme_bytes_.load(std::memory_order_relaxed);
-                if (cached_nvme_snapshots_ > 0) --cached_nvme_snapshots_;
+                if (cached_nvme_snapshots_.load(std::memory_order_relaxed) > 0) cached_nvme_snapshots_.fetch_sub(1, std::memory_order_relaxed);
                 ++pruned;
             }
         }
@@ -1037,7 +1045,15 @@ RadixMatch RadixTree::match_prefix(const int32_t* tokens, size_t n) const {
         if (match_edge == edge.size()) {
             matched_len += edge.size();
             curr = child;
-            curr->hit_count.fetch_add(1, std::memory_order_relaxed);
+            uint32_t hits = curr->hit_count.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (hits >= 2 && !curr->is_permanent && curr->kind != RadixNodeKind::SYSTEM_ROOT) {
+                if (!curr->is_staging_to_nvme.load(std::memory_order_relaxed) &&
+                    !curr->is_l3_offloaded &&
+                    !curr->has_l3_persisted &&
+                    curr->has_host_snapshot()) {
+                    const_cast<RadixTree*>(this)->queue_nvme_write_through_locked(curr);
+                }
+            }
             // P18 L1: a node is fork-usable only when the query extends at least one token past its
             // coverage (the reused prefix must not pass the query's last index); a shorter hit falls
             // back to the next-shallower snapshotted ancestor already held in `best`.
@@ -1111,6 +1127,15 @@ RadixMatch RadixTree::match_prefix(const int64_t* tokens, size_t n) const {
         if (match_edge == edge.size()) {
             matched_len += edge.size();
             curr = child;
+            uint32_t hits = curr->hit_count.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (hits >= 2 && !curr->is_permanent && curr->kind != RadixNodeKind::SYSTEM_ROOT) {
+                if (!curr->is_staging_to_nvme.load(std::memory_order_relaxed) &&
+                    !curr->is_l3_offloaded &&
+                    !curr->has_l3_persisted &&
+                    curr->has_host_snapshot()) {
+                    const_cast<RadixTree*>(this)->queue_nvme_write_through_locked(curr);
+                }
+            }
             // P18 L1: a node is fork-usable only when the query extends at least one token past its
             // coverage (the reused prefix must not pass the query's last index); a shorter hit falls
             // back to the next-shallower snapshotted ancestor already held in `best`.
@@ -1942,7 +1967,7 @@ size_t RadixTree::evict_lru_locked(size_t max_snapshots, size_t min_free_vram_mi
         if (host_victim->children.empty() && host_victim->ref_count == 0) {
             if (host_victim->is_l3_offloaded && nvme_tier_) {
                 host_victim->free_nvme(*nvme_tier_);
-                if (cached_nvme_snapshots_ > 0) --cached_nvme_snapshots_;
+                if (cached_nvme_snapshots_.load(std::memory_order_relaxed) > 0) cached_nvme_snapshots_.fetch_sub(1, std::memory_order_relaxed);
             }
             if (!host_victim->has_snapshot() && !host_victim->is_staging_to_nvme.load()) {
                 if (auto p = host_victim->parent.lock()) {
@@ -2510,6 +2535,24 @@ bool RadixTree::restore_manifest(const std::string& model_id_hash) {
     cached_nvme_snapshots_ = restored_l3_count;
     node_count_ = id_to_node.size();
     return true;
+}
+
+size_t RadixTree::clean_nvme_orphans() {
+    if (!nvme_tier_) return 0;
+    std::shared_lock<std::shared_mutex> lock(rw_lock_);
+    std::unordered_set<int64_t> valid_node_ids;
+    std::vector<std::shared_ptr<RadixNode>> stack;
+    if (root_) stack.push_back(root_);
+    while (!stack.empty()) {
+        auto node = stack.back();
+        stack.pop_back();
+        if (!node) continue;
+        valid_node_ids.insert(node->id);
+        for (const auto& kv : node->children) {
+            if (kv.second) stack.push_back(kv.second);
+        }
+    }
+    return nvme_tier_->clean_orphans(valid_node_ids);
 }
 
 }  // namespace strata::core

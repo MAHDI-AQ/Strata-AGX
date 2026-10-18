@@ -9,6 +9,8 @@
 #include <iomanip>
 #include <cstring>
 #include <cerrno>
+#include <csignal>
+#include <atomic>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -63,10 +65,14 @@ bool NVMeStorageTier::init() {
     int fd = ::open(test_file.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_DIRECT, 0644);
     if (fd >= 0) {
         AlignedBuffer buf(kDirectBlockAlignment);
-        std::memset(buf.data(), 0xAB, kDirectBlockAlignment);
-        ssize_t w = ::write(fd, buf.data(), kDirectBlockAlignment);
-        if (w == static_cast<ssize_t>(kDirectBlockAlignment)) {
-            direct_io_supported_ = true;
+        if (buf.data()) {
+            std::memset(buf.data(), 0xAB, kDirectBlockAlignment);
+            ssize_t w = ::write(fd, buf.data(), kDirectBlockAlignment);
+            if (w == static_cast<ssize_t>(kDirectBlockAlignment)) {
+                direct_io_supported_ = true;
+            } else {
+                direct_io_supported_ = false;
+            }
         } else {
             direct_io_supported_ = false;
         }
@@ -88,7 +94,10 @@ std::string NVMeStorageTier::node_file_path(int64_t node_id) const {
 }
 
 std::string NVMeStorageTier::tmp_node_file_path(int64_t node_id) const {
-    return base_path_ + "/.tmp_node_" + std::to_string(node_id) + "_" + std::to_string(::getpid()) + ".bin";
+    static std::atomic<uint64_t> s_tmp_seq{0};
+    return base_path_ + "/.tmp_node_" + std::to_string(node_id) + "_" +
+           std::to_string(::getpid()) + "_" +
+           std::to_string(s_tmp_seq.fetch_add(1, std::memory_order_relaxed)) + ".bin";
 }
 
 std::string NVMeStorageTier::manifest_file_path() const {
@@ -96,21 +105,64 @@ std::string NVMeStorageTier::manifest_file_path() const {
 }
 
 std::string NVMeStorageTier::tmp_manifest_file_path() const {
-    return base_path_ + "/.tmp_radix_manifest_" + std::to_string(::getpid()) + ".bin";
+    static std::atomic<uint64_t> s_manifest_seq{0};
+    return base_path_ + "/.tmp_radix_manifest_" + std::to_string(::getpid()) + "_" +
+           std::to_string(s_manifest_seq.fetch_add(1, std::memory_order_relaxed)) + ".bin";
 }
 
 size_t NVMeStorageTier::clean_crash_temporaries() {
+    std::unique_lock<std::shared_mutex> lk(mutex_);
     size_t swept = 0;
     std::error_code ec;
     if (!fs::exists(base_path_, ec)) return 0;
+
+    const auto now = std::filesystem::file_time_type::clock::now();
 
     for (const auto& entry : fs::directory_iterator(base_path_, ec)) {
         if (!entry.is_regular_file()) continue;
         std::string fname = entry.path().filename().string();
         if (fname.rfind(".tmp_node_", 0) == 0 || fname.rfind(".tmp.", 0) == 0 || fname.rfind(".tmp_", 0) == 0) {
-            std::error_code rm_ec;
-            if (fs::remove(entry.path(), rm_ec)) {
-                swept++;
+            bool safe_to_delete = false;
+            // Attempt to parse PID from .tmp_node_<id>_<pid>...
+            if (fname.rfind(".tmp_node_", 0) == 0) {
+                size_t p1 = fname.find('_', 10); // after .tmp_node_
+                if (p1 != std::string::npos) {
+                    size_t p2 = fname.find('_', p1 + 1);
+                    if (p2 == std::string::npos) {
+                        p2 = fname.find(".bin", p1 + 1);
+                    }
+                    if (p2 != std::string::npos && p2 > p1 + 1) {
+                        std::string pid_str = fname.substr(p1 + 1, p2 - (p1 + 1));
+                        try {
+                            pid_t pid = static_cast<pid_t>(std::stol(pid_str));
+                            if (pid > 0) {
+                                int res = ::kill(pid, 0);
+                                if (res == -1 && errno == ESRCH) {
+                                    safe_to_delete = true;
+                                } else {
+                                    // Process is active, skip
+                                    continue;
+                                }
+                            }
+                        } catch (...) {}
+                    }
+                }
+            }
+            if (!safe_to_delete) {
+                // If PID couldn't be parsed, only delete if older than 300 seconds
+                auto lwt = entry.last_write_time(ec);
+                if (!ec) {
+                    auto age_sec = std::chrono::duration_cast<std::chrono::seconds>(now - lwt).count();
+                    if (age_sec > 300) {
+                        safe_to_delete = true;
+                    }
+                }
+            }
+            if (safe_to_delete) {
+                std::error_code rm_ec;
+                if (fs::remove(entry.path(), rm_ec)) {
+                    swept++;
+                }
             }
         }
     }
@@ -118,9 +170,12 @@ size_t NVMeStorageTier::clean_crash_temporaries() {
 }
 
 size_t NVMeStorageTier::clean_orphans(const std::unordered_set<int64_t>& valid_node_ids) {
+    std::unique_lock<std::shared_mutex> lk(mutex_);
     size_t unlinked = 0;
     std::error_code ec;
     if (!fs::exists(base_path_, ec)) return 0;
+
+    const auto now = std::filesystem::file_time_type::clock::now();
 
     for (const auto& entry : fs::directory_iterator(base_path_, ec)) {
         if (!entry.is_regular_file()) continue;
@@ -130,6 +185,14 @@ size_t NVMeStorageTier::clean_orphans(const std::unordered_set<int64_t>& valid_n
             try {
                 int64_t nid = std::stoll(id_str);
                 if (valid_node_ids.find(nid) == valid_node_ids.end()) {
+                    // Grace Period: Skip any files modified within the last 60 seconds
+                    auto lwt = entry.last_write_time(ec);
+                    if (!ec) {
+                        auto age_sec = std::chrono::duration_cast<std::chrono::seconds>(now - lwt).count();
+                        if (age_sec < 60) {
+                            continue;
+                        }
+                    }
                     std::error_code rm_ec;
                     if (fs::remove(entry.path(), rm_ec)) {
                         unlinked++;
@@ -146,6 +209,8 @@ size_t NVMeStorageTier::clean_orphans(const std::unordered_set<int64_t>& valid_n
 bool NVMeStorageTier::write_node_direct(int64_t node_id, const void* data, size_t bytes) {
     if (!data || bytes == 0) return false;
 
+    std::shared_lock<std::shared_mutex> lk(mutex_);
+
     std::string tmp_path = tmp_node_file_path(node_id);
     std::string final_path = node_file_path(node_id);
 
@@ -156,16 +221,24 @@ bool NVMeStorageTier::write_node_direct(int64_t node_id, const void* data, size_
 
     int fd = ::open(tmp_path.c_str(), flags, 0644);
     if (fd < 0) {
-        // Fallback without O_DIRECT if flag caused error
         if (direct_io_supported_) {
             fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
         }
         if (fd < 0) return false;
     }
-#if defined(__linux__)
-    // Pre-allocate blocks via fallocate to prevent fragmentation during Direct I/O
-    ::fallocate(fd, 0, 0, static_cast<off_t>(bytes));
-#endif
+
+    struct FileGuard {
+        int fd;
+        const std::string& path;
+        bool committed = false;
+        ~FileGuard() {
+            if (fd >= 0) ::close(fd);
+            if (!committed) {
+                std::error_code ec;
+                fs::remove(path, ec);
+            }
+        }
+    } guard{fd, tmp_path};
 
     size_t write_bytes = bytes;
     const void* write_ptr = data;
@@ -175,47 +248,45 @@ bool NVMeStorageTier::write_node_direct(int64_t node_id, const void* data, size_
         size_t aligned_len = AlignedBuffer::align_up(bytes, kDirectBlockAlignment);
         if ((reinterpret_cast<uintptr_t>(data) % kDirectBlockAlignment != 0) || (bytes != aligned_len)) {
             staging.allocate(aligned_len);
-            if (staging.data() && bytes > 0) {
-                std::memcpy(staging.data(), data, bytes);
+            if (staging.empty() || !staging.data()) {
+                return false;
             }
+            std::memcpy(staging.data(), data, bytes);
             write_ptr = staging.data();
             write_bytes = aligned_len;
         }
     }
 
+#if defined(__linux__)
+    // Pre-allocate blocks via fallocate using actual sector-aligned Direct I/O size
+    ::fallocate(fd, 0, 0, static_cast<off_t>(write_bytes));
+#endif
+
     size_t total_written = 0;
     const uint8_t* p = static_cast<const uint8_t*>(write_ptr);
-    bool write_ok = true;
     while (total_written < write_bytes) {
         ssize_t rc = ::write(fd, p + total_written, write_bytes - total_written);
         if (rc <= 0) {
             if (rc < 0 && errno == EINTR) continue;
-            write_ok = false;
-            break;
+            return false;
         }
         total_written += rc;
     }
 
     // Force commit to disk to eliminate volatile NAND cache drops
-    if (write_ok) {
-        if (::fdatasync(fd) != 0) {
-            write_ok = false;
-        }
-    }
-
-    ::close(fd);
-
-    if (!write_ok) {
-        ::unlink(tmp_path.c_str());
+    if (::fdatasync(fd) != 0) {
         return false;
     }
 
-    // Two-Phase Atomic Rename: instantly replaces or creates target file with 0 partial window
+    ::close(guard.fd);
+    guard.fd = -1;
+
+    // Two-Phase Atomic Rename: replaces or creates target file with 0 partial window
     if (::rename(tmp_path.c_str(), final_path.c_str()) != 0) {
-        ::unlink(tmp_path.c_str());
         return false;
     }
 
+    guard.committed = true;
     offloaded_nodes_.fetch_add(1, std::memory_order_relaxed);
     bytes_written_.fetch_add(write_bytes, std::memory_order_relaxed);
     return true;
@@ -223,6 +294,8 @@ bool NVMeStorageTier::write_node_direct(int64_t node_id, const void* data, size_
 
 bool NVMeStorageTier::read_node_direct(int64_t node_id, void* out_data, size_t bytes) {
     if (!out_data || bytes == 0) return false;
+
+    std::shared_lock<std::shared_mutex> lk(mutex_);
 
     std::string path = node_file_path(node_id);
     int flags = O_RDONLY;
@@ -246,6 +319,10 @@ bool NVMeStorageTier::read_node_direct(int64_t node_id, void* out_data, size_t b
         size_t aligned_len = AlignedBuffer::align_up(bytes, kDirectBlockAlignment);
         if ((reinterpret_cast<uintptr_t>(out_data) % kDirectBlockAlignment != 0) || (bytes != aligned_len)) {
             staging.allocate(aligned_len);
+            if (staging.empty() || !staging.data()) {
+                ::close(fd);
+                return false;
+            }
             read_ptr = staging.data();
             read_bytes = aligned_len;
         }
@@ -266,20 +343,26 @@ bool NVMeStorageTier::read_node_direct(int64_t node_id, void* out_data, size_t b
 
     ::close(fd);
 
+    if (total_read < bytes) {
+        return false;
+    }
+
     if (read_ptr != out_data) {
         std::memcpy(out_data, staging.data(), bytes);
     }
 
     bytes_read_.fetch_add(total_read, std::memory_order_relaxed);
-    return total_read >= bytes;
+    return true;
 }
 
 bool NVMeStorageTier::has_node(int64_t node_id) const {
+    std::shared_lock<std::shared_mutex> lk(mutex_);
     std::string path = node_file_path(node_id);
     return ::access(path.c_str(), F_OK) == 0;
 }
 
 bool NVMeStorageTier::remove_node(int64_t node_id) {
+    std::shared_lock<std::shared_mutex> lk(mutex_);
     std::string path = node_file_path(node_id);
     if (::unlink(path.c_str()) == 0) {
         size_t prev = offloaded_nodes_.load(std::memory_order_relaxed);
@@ -290,6 +373,7 @@ bool NVMeStorageTier::remove_node(int64_t node_id) {
 }
 
 void NVMeStorageTier::purge() {
+    std::unique_lock<std::shared_mutex> lk(mutex_);
     std::error_code ec;
     for (const auto& entry : fs::directory_iterator(base_path_, ec)) {
         if (entry.is_regular_file()) {
@@ -303,6 +387,7 @@ void NVMeStorageTier::purge() {
 }
 
 bool NVMeStorageTier::write_manifest(const std::string& model_sha256, const std::vector<NVMeManifestNodeRecord>& records) {
+    std::unique_lock<std::shared_mutex> lk(mutex_);
     std::string tmp_manifest = tmp_manifest_file_path();
     std::string final_manifest = manifest_file_path();
 
@@ -348,6 +433,7 @@ bool NVMeStorageTier::write_manifest(const std::string& model_sha256, const std:
 }
 
 bool NVMeStorageTier::load_manifest(std::string& out_model_sha256, std::vector<NVMeManifestNodeRecord>& out_records) {
+    std::shared_lock<std::shared_mutex> lk(mutex_);
     std::string path = manifest_file_path();
     int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) return false;
@@ -384,6 +470,7 @@ double NVMeStorageTier::benchmark_write_throughput_mb_s(size_t total_bytes, size
     total_bytes = AlignedBuffer::align_up(total_bytes, chunk_bytes);
 
     AlignedBuffer buf(chunk_bytes);
+    if (!buf.data()) return 0.0;
     std::memset(buf.data(), 0x5A, chunk_bytes);
 
     std::string bench_file = base_path_ + "/.bench_write.bin";
@@ -414,6 +501,7 @@ double NVMeStorageTier::benchmark_read_throughput_mb_s(size_t total_bytes, size_
     total_bytes = AlignedBuffer::align_up(total_bytes, chunk_bytes);
 
     AlignedBuffer wbuf(chunk_bytes);
+    if (!wbuf.data()) return 0.0;
     std::memset(wbuf.data(), 0x3C, chunk_bytes);
 
     std::string bench_file = base_path_ + "/.bench_read.bin";
@@ -428,6 +516,10 @@ double NVMeStorageTier::benchmark_read_throughput_mb_s(size_t total_bytes, size_
     ::close(wfd);
 
     AlignedBuffer rbuf(chunk_bytes);
+    if (!rbuf.data()) {
+        ::unlink(bench_file.c_str());
+        return 0.0;
+    }
     int rfd = ::open(bench_file.c_str(), O_RDONLY | (direct_io_supported_ ? O_DIRECT : 0));
     if (rfd < 0) {
         ::unlink(bench_file.c_str());
