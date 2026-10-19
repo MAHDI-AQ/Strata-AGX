@@ -41,8 +41,8 @@ inline std::vector<int> schedule_rows(const std::vector<int>& wanted, int budget
 // Strata AGX v5.4.0: 4 Uniform Dynamic Slots Continuous Scheduler
 // ============================================================================
 constexpr size_t MAX_UNIFORM_SLOTS = 4;
-constexpr size_t MAX_PAGES_PER_SLOT = 16384; // 16384 * 16 tokens/page = 262,144 max context
-constexpr size_t SLOT_PAGE_SHIFT = 14;       // 1 << 14 = 16384
+constexpr size_t MAX_PAGES_PER_SLOT = 65536; // 65536 * 4 tokens/page = 262,144 max context
+constexpr size_t SLOT_PAGE_SHIFT = 16;       // 1 << 16 = 65536
 
 enum class SlotState : uint8_t {
     IDLE = 0,

@@ -1518,36 +1518,20 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 // saw CSTOP with nothing in flight): the request was already erased from `live`, so
                 // finish it as cancelled instead of committing its window.
                 if (!live.count(s.request.id)) { finish(s, "cancel"); continue; }
-                // Task 3.1: Speculative Draft Verification with Leviathan / vLLM Rejection Sampling (ALGO-01 & ALGO-02)
+                // Target-Sample Authoritative Acceptance (vLLM / SGLang Parity)
+                // The target model verifier has already sampled  with all
+                // temperature, top-p, min-p, and penalties applied.
+                // If draft_tok == target_tok, the draft matches the target model's verified sample: accepted.
+                // If draft_tok != target_tok, the draft is rejected; the target model's sample stands!
+                // Never overwrite s.output[t] with an unpenalized draft token or unpenalized residual.
                 int accepted = 0;
-                const bool is_sampled = !s.request.sampling.greedy && s.request.sampling.temperature >= 1e-4f;
-                if (!is_sampled) {
-                    // Greedy mode: linear prefix match
-                    while (accepted < s.count - 1 && s.window[accepted + 1] == s.output[accepted]) ++accepted;
-                } else {
-                    // Temperature > 0: Leviathan / vLLM speculative residual rejection sampling (Algorithm 1)
-                    for (int t = 0; t < s.count - 1; ++t) {
-                        const int32_t draft_tok = s.window[t + 1];
-                        const int32_t target_tok = s.output[t];
-                        const float q = (s.probability[t] > 0.0f) ? s.probability[t] : 1.0f;
-                        const float p = (s.stages[0].verify.target_draft_prob(t) > 0.0f)
-                                            ? s.stages[0].verify.target_draft_prob(t)
-                                            : 0.0f;
-                        const float alpha = std::min(1.0f, p / q);
-                        uint64_t draw_state = s.request.sampling.seed ^ ((uint64_t)s.position.load() + t);
-                        draw_state = draw_state * 6364136223846793005ULL + 1442695040888963407ULL;
-                        const float u = (float)((draw_state >> 32) & 0xFFFFFF) / 16777216.0f;
-                        if (u < alpha) {
-                            s.output[t] = draft_tok;
-                            accepted = t + 1;
-                        } else {
-                            // Task 3.1 / CRIT-SPEC-01: Fused GPU Leviathan Residual Sampling (zero-PCIe D2H elimination)
-                            draw_state = draw_state * 6364136223846793005ULL + 1442695040888963407ULL;
-                            const float r = (float)((draw_state >> 32) & 0xFFFFFF) / 16777216.0f;
-                            const float inv_temp = 1.0f / s.request.sampling.temperature;
-                            s.output[t] = s.stages[0].verify.sample_residual(t, inv_temp, draft_tok, q, r, target_tok);
-                            break;
-                        }
+                for (int t = 0; t < s.count - 1; ++t) {
+                    const int32_t draft_tok = s.window[t + 1];
+                    const int32_t target_tok = s.output[t];
+                    if (draft_tok == target_tok) {
+                        accepted = t + 1;
+                    } else {
+                        break;
                     }
                 }
                 int keep = accepted + 1;

@@ -121,7 +121,7 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __rest
                     long long page = -1;
                     if (p.page_tables && p.query_slot_map) {
                         const int slot_id = __ldg(p.query_slot_map + blockIdx.z);
-                        page = (long long) __ldg(p.page_tables + (slot_id << 14) + page_idx);
+                        page = (long long) __ldg(p.page_tables + (slot_id << 16) + page_idx);
                     } else if (p.page_table) {
                         page = (long long) p.page_table[page_idx];
                     }

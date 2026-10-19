@@ -545,12 +545,22 @@ __global__ void window_ids_kernel(int32_t* steps, int window, int32_t* ids, long
     const int q = blockIdx.y;
     int32_t* st = steps + q * 4;
     const int n_kv = st[1];
-    const int start = n_kv > window ? n_kv - window : 0;
-    const int width = n_kv - start;
-    for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < width; j += gridDim.x * blockDim.x)
-        ids[q * stride + j] = start + j;
-    __syncthreads();
-    if (blockIdx.x == 0 && threadIdx.x == 0) st[3] = width;
+    if (n_kv <= window) {
+        for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < n_kv; j += gridDim.x * blockDim.x)
+            ids[q * stride + j] = j;
+        __syncthreads();
+        if (blockIdx.x == 0 && threadIdx.x == 0) st[3] = n_kv;
+    } else {
+        // Anchor the system prompt and tools on tokens [0 .. anchor-1]
+        const int anchor = (window >= 8192) ? 4096 : (window / 2);
+        const int tail_width = window - anchor;
+        const int tail_start = n_kv - tail_width;
+        for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < window; j += gridDim.x * blockDim.x) {
+            ids[q * stride + j] = (j < anchor) ? j : (tail_start + (j - anchor));
+        }
+        __syncthreads();
+        if (blockIdx.x == 0 && threadIdx.x == 0) st[3] = window;
+    }
 }
 }  // namespace
 

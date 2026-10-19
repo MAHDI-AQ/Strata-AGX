@@ -30,7 +30,7 @@ struct QsaAttnPools {
     const uint8_t* k_q4 = nullptr;      ///< q4_0 block_q4_0 [page][kv_head][page_size][head_dim / 32 * 18]
     const uint8_t* v_q4 = nullptr;
     const int32_t* page_table = nullptr;
-    const int32_t* page_tables = nullptr;     ///< 2D virtual page table [num_slots * 16384]
+    const int32_t* page_tables = nullptr;     ///< 2D virtual page table [num_slots * 65536] (262k tokens max)
     const int32_t* query_slot_map = nullptr;  ///< [n_q] mapping query -> slot_id
 };
 

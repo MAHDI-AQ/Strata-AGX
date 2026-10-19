@@ -1165,7 +1165,7 @@ std::shared_ptr<RadixNode> RadixTree::insert(
             new_node->update_chunk_hashes();
             new_node->parent = curr;
             new_node->last_accessed = std::chrono::steady_clock::now();
-            size_t delta_pages = (new_node->edge_tokens.size() + 15) / 16;
+            size_t delta_pages = (new_node->edge_tokens.size() + (kPageTokens - 1)) / kPageTokens;
             if (kv_pool_) {
                 new_node->kv_page_ids = kv_pool_->allocate_pages(delta_pages);
             }
@@ -1200,7 +1200,7 @@ std::shared_ptr<RadixNode> RadixTree::insert(
             split_node->parent = curr;
             split_node->last_accessed = std::chrono::steady_clock::now();
 
-            size_t split_pages = (match_edge + 15) / 16;
+            size_t split_pages = (match_edge + (kPageTokens - 1)) / kPageTokens;
             split_node->kv_page_ids = child->slice_page_ids(0, split_pages);
 
             if (match_edge % 16 == 0) {
@@ -1226,7 +1226,7 @@ std::shared_ptr<RadixNode> RadixTree::insert(
             child->update_chunk_hashes();
             child->parent = split_node;
 
-            size_t child_rem_pages = (child->edge_tokens.size() + 15) / 16;
+            size_t child_rem_pages = (child->edge_tokens.size() + (kPageTokens - 1)) / kPageTokens;
             if (child->kv_page_ids.size() < child_rem_pages && kv_pool_) {
                 auto extra = kv_pool_->allocate_pages(child_rem_pages - child->kv_page_ids.size());
                 child->kv_page_ids.insert(child->kv_page_ids.end(), extra.begin(), extra.end());
@@ -1238,7 +1238,7 @@ std::shared_ptr<RadixNode> RadixTree::insert(
                 child->kv_page_ids.resize(child_rem_pages);
             }
             if (kv_pool_) {
-                assert(child->kv_page_ids.size() == (child->edge_tokens.size() + 15) / 16);
+                assert(child->kv_page_ids.size() == (child->edge_tokens.size() + (kPageTokens - 1)) / kPageTokens);
             }
 
             split_node->children[child->edge_tokens[0]] = child;
@@ -1258,7 +1258,7 @@ std::shared_ptr<RadixNode> RadixTree::insert(
                 new_node->update_chunk_hashes();
                 new_node->parent = split_node;
                 new_node->last_accessed = std::chrono::steady_clock::now();
-                size_t delta_pages = (new_node->edge_tokens.size() + 15) / 16;
+                size_t delta_pages = (new_node->edge_tokens.size() + (kPageTokens - 1)) / kPageTokens;
                 if (kv_pool_) {
                     new_node->kv_page_ids = kv_pool_->allocate_pages(delta_pages);
                 }
@@ -1273,7 +1273,7 @@ std::shared_ptr<RadixNode> RadixTree::insert(
 
     curr->last_accessed = std::chrono::steady_clock::now();
     if (curr != root_ && curr->kv_page_ids.empty()) {
-        size_t delta_pages = (curr->edge_tokens.size() + 15) / 16;
+        size_t delta_pages = (curr->edge_tokens.size() + (kPageTokens - 1)) / kPageTokens;
         if (kv_pool_) {
             curr->kv_page_ids = kv_pool_->allocate_pages(delta_pages);
         }
@@ -2233,7 +2233,7 @@ std::shared_ptr<RadixNode> RadixTree::insert_direct_device_to_host(
             new_node->update_chunk_hashes();
             new_node->parent = curr;
             new_node->last_accessed = std::chrono::steady_clock::now();
-            size_t delta_pages = (new_node->edge_tokens.size() + 15) / 16;
+            size_t delta_pages = (new_node->edge_tokens.size() + (kPageTokens - 1)) / kPageTokens;
             if (kv_pool_) {
                 new_node->kv_page_ids = kv_pool_->allocate_pages(delta_pages);
             }
@@ -2268,7 +2268,7 @@ std::shared_ptr<RadixNode> RadixTree::insert_direct_device_to_host(
             split_node->parent = curr;
             split_node->last_accessed = std::chrono::steady_clock::now();
 
-            size_t split_pages = (match_edge + 15) / 16;
+            size_t split_pages = (match_edge + (kPageTokens - 1)) / kPageTokens;
             split_node->kv_page_ids = child->slice_page_ids(0, split_pages);
 
             if (match_edge % 16 == 0) {
@@ -2294,7 +2294,7 @@ std::shared_ptr<RadixNode> RadixTree::insert_direct_device_to_host(
             child->update_chunk_hashes();
             child->parent = split_node;
 
-            size_t child_rem_pages = (child->edge_tokens.size() + 15) / 16;
+            size_t child_rem_pages = (child->edge_tokens.size() + (kPageTokens - 1)) / kPageTokens;
             if (child->kv_page_ids.size() < child_rem_pages && kv_pool_) {
                 auto extra = kv_pool_->allocate_pages(child_rem_pages - child->kv_page_ids.size());
                 child->kv_page_ids.insert(child->kv_page_ids.end(), extra.begin(), extra.end());
@@ -2306,7 +2306,7 @@ std::shared_ptr<RadixNode> RadixTree::insert_direct_device_to_host(
                 child->kv_page_ids.resize(child_rem_pages);
             }
             if (kv_pool_) {
-                assert(child->kv_page_ids.size() == (child->edge_tokens.size() + 15) / 16);
+                assert(child->kv_page_ids.size() == (child->edge_tokens.size() + (kPageTokens - 1)) / kPageTokens);
             }
 
             split_node->children[child->edge_tokens[0]] = child;
@@ -2326,7 +2326,7 @@ std::shared_ptr<RadixNode> RadixTree::insert_direct_device_to_host(
                 new_node->update_chunk_hashes();
                 new_node->parent = split_node;
                 new_node->last_accessed = std::chrono::steady_clock::now();
-                size_t delta_pages = (new_node->edge_tokens.size() + 15) / 16;
+                size_t delta_pages = (new_node->edge_tokens.size() + (kPageTokens - 1)) / kPageTokens;
                 if (kv_pool_) {
                     new_node->kv_page_ids = kv_pool_->allocate_pages(delta_pages);
                 }
@@ -2341,7 +2341,7 @@ std::shared_ptr<RadixNode> RadixTree::insert_direct_device_to_host(
 
     curr->last_accessed = std::chrono::steady_clock::now();
     if (curr != root_ && curr->kv_page_ids.empty()) {
-        size_t delta_pages = (curr->edge_tokens.size() + 15) / 16;
+        size_t delta_pages = (curr->edge_tokens.size() + (kPageTokens - 1)) / kPageTokens;
         if (kv_pool_) {
             curr->kv_page_ids = kv_pool_->allocate_pages(delta_pages);
         }

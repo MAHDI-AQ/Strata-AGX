@@ -16,6 +16,7 @@ static int g_device_rope_ref[8] = {0};
 #include "strata/kernels/gdn.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/rope.hpp"
@@ -749,6 +750,9 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     cudaMemsetAsync(st.idx_dead, 0, (size_t) s.idx_dim * 4, cs);
     cudaMemsetAsync(st.idx_pooled, 0, (size_t) st.idx_pooled_rows * s.idx_dim * 4, cs);
     if (st.idx_block_pos) cudaMemsetAsync(st.idx_block_pos, 0, sizeof(int32_t), cs);
+    if (st.page_table && st.n_pages > 0 && st.kv_mode == 0) {
+        strata::kernels::kv_ring_table(st.page_table, st.n_pages, st.n_pages, cs);
+    }
     if (st.step) cudaMemsetAsync(st.step, 0, (size_t) strata::kernels::kStepCount * sizeof(int32_t), cs);
     if (st.pos_dev) cudaMemsetAsync(st.pos_dev, 0, (size_t) s.n_head * sizeof(int32_t), cs);
     if (st.host_step) std::memset(st.host_step, 0, strata::kernels::qsa_step_bytes() + sizeof(int32_t));

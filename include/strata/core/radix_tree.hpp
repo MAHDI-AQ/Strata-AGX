@@ -38,7 +38,7 @@
 namespace strata::core {
 
 static constexpr size_t kRadixChunkTokens = 64;
-constexpr size_t kPageTokens = 16;
+constexpr size_t kPageTokens = 4; // Unified 4 tokens/page with QSA decode attention kernels
 inline size_t align_down_page(size_t tokens, size_t page_size = kPageTokens) {
     return (tokens / page_size) * page_size;
 }
@@ -46,7 +46,7 @@ inline size_t align_down_page(size_t tokens, size_t page_size = kPageTokens) {
 /// Thread-safe Physical KV Page Allocator with Atomic Page Reference Counting (SGLang / vLLM Parity)
 class PagedKVPool {
 public:
-    explicit PagedKVPool(size_t total_pages = 65536)
+    explicit PagedKVPool(size_t total_pages = 262144)
         : total_pages_(total_pages), next_free_id_(0), allocated_pages_(0) {
         page_ref_counts_ = std::make_unique<std::atomic<uint16_t>[]>(total_pages_);
         for (size_t i = 0; i < total_pages_; ++i) {
