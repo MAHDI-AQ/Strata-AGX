@@ -338,7 +338,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: copy stream create failed";
         return false;
     }
-    if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) {
+    int high_pri = -1;
+    cudaDeviceGetStreamPriorityRange(nullptr, &high_pri);
+    if (cudaStreamCreateWithPriority(&cs_, cudaStreamNonBlocking, high_pri) != cudaSuccess) {
         err = "verify: stream create failed";
         return false;
     }
@@ -1546,8 +1548,8 @@ bool Verifier::prepare_batch(const std::vector<BatchWindow>& batch, int& total,
             cudaGraphExecDestroy(graph_exec);
             err = "batch verify: cannot query free VRAM"; return false;
         }
-        const auto reserve_bytes = (size_t) std::min<int>(batch_reserve_mib_, 16) * 1048576;
-        while (!batch_graphs_.empty() && (batch_graphs_.size() >= (size_t) batch_cache_limit_ || free_bytes < reserve_bytes)) {
+        const auto evict_reserve_bytes = (size_t) std::max<int>(batch_reserve_mib_, 256) * 1048576;
+        while (!batch_graphs_.empty() && (batch_graphs_.size() >= (size_t) batch_cache_limit_ || free_bytes < evict_reserve_bytes)) {
             cudaGraphExecDestroy(batch_graphs_.front().graph);
             batch_graphs_.erase(batch_graphs_.begin());
             if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
@@ -1569,7 +1571,8 @@ bool Verifier::prepare_batch(const std::vector<BatchWindow>& batch, int& total,
             const std::string list = std::string(",") + test_refuse_list + ",";
             test_refuse = list.find("," + std::to_string(test_capture_ordinal) + ",") != std::string::npos;
         }
-        if (free_bytes < reserve_bytes) {
+        const auto hard_reserve_bytes = (size_t) std::min<int>(batch_reserve_mib_, 16) * 1048576;
+        if (free_bytes < hard_reserve_bytes) {
             // graph-OOM fix v2: the guard needs only ~16 MiB; the MMQ pools hold surplus scratch
             // (their unused buffers), so flush them and re-read before refusing a request the box
             // can actually hold (measured: the 3rd slot failed at 11 MiB of 16).
@@ -1579,7 +1582,7 @@ bool Verifier::prepare_batch(const std::vector<BatchWindow>& batch, int& total,
                 err = "batch verify: cannot query free VRAM"; return false;
             }
         }
-        if (free_bytes < reserve_bytes || test_refuse) {
+        if (free_bytes < hard_reserve_bytes || test_refuse) {
             if (test_refuse)
                 std::fprintf(stderr, "strata verify: TEST hook refused batch capture #%d (STRATA_TEST_REFUSE_CAPTURE=%s)\n",
                              test_capture_ordinal, test_refuse_list);

@@ -584,6 +584,8 @@ public:
     /// Dynamic KV Fragmentation Compaction (Task 9.3)
         bool persist_manifest(const std::string& model_id_hash = "");
     bool persist_manifest_locked(const std::string& model_id_hash = "");
+    std::string serialize_manifest_locked(const std::string& model_id_hash = "");
+    bool write_manifest_to_disk(const std::string& buffer);
     bool restore_manifest(const std::string& model_id_hash = "");
     void drain_nvme_staging();
     CompactionStats compact_tree();

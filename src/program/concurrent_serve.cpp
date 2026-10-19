@@ -549,6 +549,29 @@ bool ConcurrentServe::prepare(const core::ModelGeometry& g, core::SessionState& 
                 if (!gpu_alloc(&gs.arena, core::session_bytes(g, slot_context, primary.k, stages[st].lb, stages[st].le), c.reserve_mib, err)) return false;
                 gs.state = &gs.owned;
                 if (!core::session_init(g, slot_context, primary.k, gs.arena, gs.owned, stages[st].lb, stages[st].le)) { err = "concurrency: session initialization failed"; return false; }
+                // SGLang-Parity Zero-Copy Paged KV Sharing
+                const auto* prim_sess = (st == 0 ? &primary : stages[st].session);
+                for (int64_t j = 0; j < gs.owned.qsa_alloc; ++j) {
+                    const int64_t ord = gs.owned.qsa_ord0 + j;
+                    const auto& prim_qsa = prim_sess->qsa_states[ord];
+                    auto& sec_qsa = gs.owned.qsa_states[ord];
+                    if (prim_qsa.kv_q4) {
+                        sec_qsa.k_q4 = prim_qsa.k_q4;
+                        sec_qsa.v_q4 = prim_qsa.v_q4;
+                    } else if (prim_qsa.kv_hybrid) {
+                        sec_qsa.k_q = prim_qsa.k_q;
+                        sec_qsa.k_scale = prim_qsa.k_scale;
+                        sec_qsa.v_q4 = prim_qsa.v_q4;
+                    } else if (prim_qsa.kv_int8) {
+                        sec_qsa.k_q = prim_qsa.k_q;
+                        sec_qsa.v_q = prim_qsa.v_q;
+                        sec_qsa.k_scale = prim_qsa.k_scale;
+                        sec_qsa.v_scale = prim_qsa.v_scale;
+                    } else {
+                        sec_qsa.k_pool = prim_qsa.k_pool;
+                        sec_qsa.v_pool = prim_qsa.v_pool;
+                    }
+                }
                 if (st == 0) {
                     // The PLE is a layer-1 module: only the stage that holds layer 1 (stage 0 for any legal
                     // split) wires it.  Stages >= 1 leave it unwired there (ready() == false).
@@ -980,7 +1003,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         if (continuous_sched.is_prefill_throttled()) {
             dynamic_chunk = std::min<int64_t>(dynamic_chunk, 1024);
         } else if (active_decodes >= 2) {
-            dynamic_chunk = std::min<int64_t>(dynamic_chunk, 512);
+            dynamic_chunk = std::min<int64_t>(dynamic_chunk, 1024);
         } else if (active_decodes == 1) {
             dynamic_chunk = std::min<int64_t>(dynamic_chunk, 1024);
         } else if (active_prefills >= 2) {
@@ -1712,6 +1735,29 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 err = "concurrency: STRATA_SLOT_LAZY: session initialization failed";
                 return false;
             }
+            // SGLang-Parity Zero-Copy Paged KV Sharing
+            const auto* prim_sess = (st == 0 ? m.primary_state : sg.session);
+            for (int64_t j = 0; j < gs.owned.qsa_alloc; ++j) {
+                const int64_t ord = gs.owned.qsa_ord0 + j;
+                const auto& prim_qsa = prim_sess->qsa_states[ord];
+                auto& sec_qsa = gs.owned.qsa_states[ord];
+                if (prim_qsa.kv_q4) {
+                    sec_qsa.k_q4 = prim_qsa.k_q4;
+                    sec_qsa.v_q4 = prim_qsa.v_q4;
+                } else if (prim_qsa.kv_hybrid) {
+                    sec_qsa.k_q = prim_qsa.k_q;
+                    sec_qsa.k_scale = prim_qsa.k_scale;
+                    sec_qsa.v_q4 = prim_qsa.v_q4;
+                } else if (prim_qsa.kv_int8) {
+                    sec_qsa.k_q = prim_qsa.k_q;
+                    sec_qsa.v_q = prim_qsa.v_q;
+                    sec_qsa.k_scale = prim_qsa.k_scale;
+                    sec_qsa.v_scale = prim_qsa.v_scale;
+                } else {
+                    sec_qsa.k_pool = prim_qsa.k_pool;
+                    sec_qsa.v_pool = prim_qsa.v_pool;
+                }
+            }
             gs.arena = base;
             gs.carved = true;
             if (st == 0) {
@@ -2378,6 +2424,17 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             const size_t free_pgs = pool->free_pages_count();
             const size_t total_pgs = pool->total_pages();
             auto wm_action = continuous_sched.check_watermarks(free_pgs, total_pgs);
+
+            size_t d0_free = 0, d0_tot = 0, d1_free = 0, d1_tot = 0;
+            cudaSetDevice(0);
+            cudaMemGetInfo(&d0_free, &d0_tot);
+            cudaSetDevice(1);
+            cudaMemGetInfo(&d1_free, &d1_tot);
+            const size_t min_phys_free_mib = std::min(d0_free, d1_free) >> 20;
+            if (min_phys_free_mib < 512) {
+                wm_action = core::ContinuousScheduler::WatermarkAction::TRIGGER_PREEMPTION;
+            }
+
             if (wm_action == core::ContinuousScheduler::WatermarkAction::TRIGGER_PREEMPTION) {
                 int victim_id = continuous_sched.select_preemption_victim();
                 if (victim_id >= 0 && victim_id < (int) m.slots.size()) {

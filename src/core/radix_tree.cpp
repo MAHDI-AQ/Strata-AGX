@@ -354,18 +354,9 @@ bool RadixNode::offload_to_nvme(NVMeStorageTier& nvme) {
     }
 
     // Task 2.3: Compute hardware SSE4.2 CRC32C over serialized payload
-    uint64_t crc = 0xFFFFFFFF53545241ULL;
     const uint8_t* payload_bytes = buffer.data() + sizeof(NVMeNodeHeader);
     const size_t crc_len = total_payload - sizeof(NVMeNodeHeader);
-    const size_t qwords = crc_len / 8;
-    const uint64_t* qp = reinterpret_cast<const uint64_t*>(payload_bytes);
-    for (size_t qi = 0; qi < qwords; ++qi) {
-#if defined(__SSE4_2__)
-        crc = _mm_crc32_u64(crc, qp[qi]);
-#else
-        crc = (crc ^ qp[qi]) * 1099511628211ULL;
-#endif
-    }
+    uint64_t crc = compute_crc32c(payload_bytes, crc_len);
     // Update header checksum in buffer
     reinterpret_cast<NVMeNodeHeader*>(buffer.data())->checksum = crc;
 
@@ -639,20 +630,26 @@ void RadixTree::nvme_worker_loop() {
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
             bool ok = nvme_tier_->write_node_direct(task.node_id, task.payload.data(), task.total_payload);
+            std::string manifest_buf;
             if (auto node = task.node_weak.lock()) {
-                std::unique_lock<std::shared_mutex> lk(rw_lock_);
-                if (ok) {
-                    node->l3_bytes = task.total_payload;
-                    node->is_l3_offloaded = true;
-                    node->has_l3_persisted = true;
-                    if (task.free_host_on_write) {
-                        node->free_host();
+                {
+                    std::unique_lock<std::shared_mutex> lk(rw_lock_);
+                    if (ok) {
+                        node->l3_bytes = task.total_payload;
+                        node->is_l3_offloaded = true;
+                        node->has_l3_persisted = true;
+                        if (task.free_host_on_write) {
+                            node->free_host();
+                        }
+                        manifest_buf = this->serialize_manifest_locked();
+                    } else {
+                        if (cached_nvme_snapshots_.load(std::memory_order_relaxed) > 0) cached_nvme_snapshots_.fetch_sub(1, std::memory_order_relaxed);
                     }
-                    this->persist_manifest_locked();
-                } else {
-                    if (cached_nvme_snapshots_.load(std::memory_order_relaxed) > 0) cached_nvme_snapshots_.fetch_sub(1, std::memory_order_relaxed);
+                    node->is_staging_to_nvme = false;
                 }
-                node->is_staging_to_nvme = false;
+                if (!manifest_buf.empty()) {
+                    this->write_manifest_to_disk(manifest_buf);
+                }
             } else {
                 std::unique_lock<std::shared_mutex> lk(rw_lock_);
                 if (!ok && cached_nvme_snapshots_.load(std::memory_order_relaxed) > 0) cached_nvme_snapshots_.fetch_sub(1, std::memory_order_relaxed);
@@ -885,18 +882,9 @@ bool RadixTree::queue_nvme_write_through_locked(const std::shared_ptr<RadixNode>
         }
     }
 
-    uint64_t crc = 0xFFFFFFFF53545241ULL;
     const uint8_t* payload_bytes = buffer.data() + sizeof(NVMeNodeHeader);
     const size_t crc_len = total_payload - sizeof(NVMeNodeHeader);
-    const size_t qwords = crc_len / 8;
-    const uint64_t* qp = reinterpret_cast<const uint64_t*>(payload_bytes);
-    for (size_t qi = 0; qi < qwords; ++qi) {
-#if defined(__SSE4_2__)
-        crc = _mm_crc32_u64(crc, qp[qi]);
-#else
-        crc = (crc ^ qp[qi]) * 1099511628211ULL;
-#endif
-    }
+    uint64_t crc = compute_crc32c(payload_bytes, crc_len);
     reinterpret_cast<NVMeNodeHeader*>(buffer.data())->checksum = crc;
 
     node->is_staging_to_nvme = true;
@@ -1402,13 +1390,15 @@ std::shared_ptr<RadixNode> RadixTree::insert(
                 if (qst.kv_q4) {
                     slice.k_bytes = qsa_rows * strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
                     slice.v_bytes = slice.k_bytes;
-                    if (qst.k_q4) {
-                        cudaMalloc(&slice.k_q, slice.k_bytes);
-                        cudaMemcpyAsync(slice.k_q, qst.k_q4, slice.k_bytes, cudaMemcpyDeviceToDevice, cs);
-                    }
-                    if (qst.v_q4) {
-                        cudaMalloc(&slice.v_q4, slice.v_bytes);
-                        cudaMemcpyAsync(slice.v_q4, qst.v_q4, slice.v_bytes, cudaMemcpyDeviceToDevice, cs);
+                    if (kv_pool_ == nullptr) {
+                        if (qst.k_q4) {
+                            cudaMalloc(&slice.k_q, slice.k_bytes);
+                            cudaMemcpyAsync(slice.k_q, qst.k_q4, slice.k_bytes, cudaMemcpyDeviceToDevice, cs);
+                        }
+                        if (qst.v_q4) {
+                            cudaMalloc(&slice.v_q4, slice.v_bytes);
+                            cudaMemcpyAsync(slice.v_q4, qst.v_q4, slice.v_bytes, cudaMemcpyDeviceToDevice, cs);
+                        }
                     }
                 } else if (qst.kv_hybrid) {
                     slice.k_bytes = qsa_rows * qs.head_dim;
@@ -1694,8 +1684,12 @@ bool RadixTree::fork_to_session(
 
                 if (cst.kv_q4) {
                     const size_t bytes = qsa_rows * strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
-                    if (slice.k_q && cst.k_q4) cudaMemcpyAsync(cst.k_q4, slice.k_q, bytes, cudaMemcpyDeviceToDevice, cs);
-                    if (slice.v_q4 && cst.v_q4) cudaMemcpyAsync(cst.v_q4, slice.v_q4, bytes, cudaMemcpyDeviceToDevice, cs);
+                    if (block_table.empty() && slice.k_q && cst.k_q4 && cst.k_q4 != slice.k_q) {
+                        cudaMemcpyAsync(cst.k_q4, slice.k_q, bytes, cudaMemcpyDeviceToDevice, cs);
+                    }
+                    if (block_table.empty() && slice.v_q4 && cst.v_q4 && cst.v_q4 != slice.v_q4) {
+                        cudaMemcpyAsync(cst.v_q4, slice.v_q4, bytes, cudaMemcpyDeviceToDevice, cs);
+                    }
                 } else if (cst.kv_hybrid) {
                     const size_t k_bytes = qsa_rows * qs.head_dim;
                     const size_t sc_bytes = qsa_rows * (qs.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
@@ -2581,18 +2575,20 @@ std::shared_ptr<RadixNode> RadixTree::insert_direct_device_to_host(
 
 namespace strata::core {
 
-bool RadixTree::persist_manifest(const std::string& model_id_hash) {
-    std::shared_lock<std::shared_mutex> lock(rw_lock_);
-    return persist_manifest_locked(model_id_hash);
-}
-
-bool RadixTree::persist_manifest_locked(const std::string& model_id_hash) {
-    if (!nvme_tier_) return false;
-
+bool RadixTree::write_manifest_to_disk(const std::string& buffer) {
+    if (!nvme_tier_ || buffer.empty()) return false;
     std::string manifest_path = nvme_tier_->base_path() + "/radix_manifest.bin";
     std::string manifest_tmp = manifest_path + ".tmp";
     std::ofstream ofs(manifest_tmp, std::ios::binary);
     if (!ofs.is_open()) return false;
+    ofs.write(buffer.data(), buffer.size());
+    ofs.flush();
+    ofs.close();
+    return (::rename(manifest_tmp.c_str(), manifest_path.c_str()) == 0);
+}
+
+std::string RadixTree::serialize_manifest_locked(const std::string& model_id_hash) {
+    if (!nvme_tier_) return "";
 
     std::vector<std::shared_ptr<RadixNode>> all_nodes;
     std::vector<std::shared_ptr<RadixNode>> stack;
@@ -2607,6 +2603,7 @@ bool RadixTree::persist_manifest_locked(const std::string& model_id_hash) {
         }
     }
 
+    std::string buffer;
     NVMeManifestHeader hdr;
     hdr.magic = kNVMeMagic;
     hdr.version = kNVMeVersion;
@@ -2615,7 +2612,7 @@ bool RadixTree::persist_manifest_locked(const std::string& model_id_hash) {
     if (!model_id_hash.empty()) {
         std::strncpy(hdr.model_id_hash, model_id_hash.c_str(), sizeof(hdr.model_id_hash) - 1);
     }
-    ofs.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
+    buffer.append(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
 
     for (const auto& node : all_nodes) {
         NVMeManifestNodeRecord rec;
@@ -2630,18 +2627,27 @@ bool RadixTree::persist_manifest_locked(const std::string& model_id_hash) {
         rec.n_edge_tokens = static_cast<uint32_t>(node->edge_tokens.size());
         rec.is_l3_offloaded = node->is_l3_offloaded;
 
-        ofs.write(reinterpret_cast<const char*>(&rec), sizeof(rec));
+        buffer.append(reinterpret_cast<const char*>(&rec), sizeof(rec));
         if (rec.n_edge_tokens > 0) {
-            ofs.write(reinterpret_cast<const char*>(node->edge_tokens.data()),
-                      rec.n_edge_tokens * sizeof(int32_t));
+            buffer.append(reinterpret_cast<const char*>(node->edge_tokens.data()),
+                          rec.n_edge_tokens * sizeof(int32_t));
         }
     }
-    ofs.flush();
-    ofs.close();
-    if (::rename(manifest_tmp.c_str(), manifest_path.c_str()) != 0) {
-        return false;
+    return buffer;
+}
+
+bool RadixTree::persist_manifest(const std::string& model_id_hash) {
+    std::string manifest_buf;
+    {
+        std::shared_lock<std::shared_mutex> lock(rw_lock_);
+        manifest_buf = serialize_manifest_locked(model_id_hash);
     }
-    return true;
+    return write_manifest_to_disk(manifest_buf);
+}
+
+bool RadixTree::persist_manifest_locked(const std::string& model_id_hash) {
+    std::string manifest_buf = serialize_manifest_locked(model_id_hash);
+    return write_manifest_to_disk(manifest_buf);
 }
 
 bool RadixTree::restore_manifest(const std::string& model_id_hash) {
