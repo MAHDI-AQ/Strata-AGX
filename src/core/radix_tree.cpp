@@ -1656,6 +1656,9 @@ bool RadixTree::fork_to_session(
     const int64_t pages = (target_prefix + qs.page_size - 1) / qs.page_size;
     const size_t qsa_rows = (size_t) pages * qs.n_head_kv * qs.page_size;
     std::vector<int32_t> block_table = resolve_virtual_block_table(target_node);
+    if (kv_pool_ && !block_table.empty()) {
+        kv_pool_->retain_pages(block_table);
+    }
 
     if (target_node->has_device_snapshot()) {
         for (size_t st = 0; st < n_stages && st < target_node->stage_snapshots.size(); ++st) {

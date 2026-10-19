@@ -156,6 +156,71 @@ void test_radix_compactor() {
     std::printf("  [PASS] RadixCompactor defragmentation metrics verified!\n");
 }
 
+void test_dual_watermarks_and_preemption() {
+    std::printf("[TEST 4/4] ContinuousScheduler: Dual-Watermark Preemption, Victim Scoring & Guarding...\n");
+
+    strata::core::ContinuousScheduler sched(4);
+    // Allocate 4 slots
+    int s0 = sched.allocate_slot(1001, 128, 50, 4096);
+    int s1 = sched.allocate_slot(1002, 128, 50, 4096);
+    int s2 = sched.allocate_slot(1003, 128, 50, 4096);
+    int s3 = sched.allocate_slot(1004, 128, 50, 4096);
+    assert(s0 == 0 && s1 == 1 && s2 == 2 && s3 == 3);
+
+    sched.set_slot_state(s0, strata::core::SlotState::DECODING);
+    sched.set_slot_state(s1, strata::core::SlotState::AWAITING_TOOL);
+    sched.set_slot_state(s2, strata::core::SlotState::DECODING);
+    sched.set_slot_state(s3, strata::core::SlotState::DECODING);
+
+    // Step some tokens to differentiate progress
+    sched.step_token(s0, 42, false);
+    sched.step_token(s0, 43, false);
+    sched.step_token(s0, 44, false); // 3 tokens
+
+    sched.step_token(s2, 50, false); // 1 token
+    sched.step_token(s3, 60, false);
+    sched.step_token(s3, 61, false); // 2 tokens
+
+    // Watermark check under normal pool (50% free)
+    size_t total_pages = 10000;
+    size_t free_pages = 5000;
+    auto a0 = sched.check_watermarks(free_pages, total_pages);
+    assert(a0 == strata::core::ContinuousScheduler::WatermarkAction::NONE);
+    assert(!sched.is_prefill_throttled());
+
+    // Watermark check under throttle (12% free -> <= 15%)
+    free_pages = 1200;
+    auto a1 = sched.check_watermarks(free_pages, total_pages);
+    assert(a1 == strata::core::ContinuousScheduler::WatermarkAction::THROTTLE_PREFILL);
+    assert(sched.is_prefill_throttled());
+
+    // Watermark check under critical pressure (6% free -> <= 8%)
+    free_pages = 600;
+    auto a2 = sched.check_watermarks(free_pages, total_pages);
+    assert(a2 == strata::core::ContinuousScheduler::WatermarkAction::TRIGGER_PREEMPTION);
+
+    // Select victim: s1 is AWAITING_TOOL, must be chosen first!
+    int v1 = sched.select_preemption_victim();
+    assert(v1 == s1);
+
+    // Guard s1 (e.g. tool callback arrived) -> next victim must be s2 (only 1 token generated vs s3 with 2 and s0 with 3)
+    sched.set_slot_guard(s1, true);
+    assert(sched.is_slot_guarded(s1));
+    int v2 = sched.select_preemption_victim();
+    assert(v2 == s2);
+
+    // Preempt s2 to L2 Host RAM
+    sched.set_slot_state(s2, strata::core::SlotState::PREEMPTED_L2);
+
+    // Memory recovers above resume threshold (25% free -> >= 22%)
+    free_pages = 2500;
+    auto a3 = sched.check_watermarks(free_pages, total_pages);
+    assert(a3 == strata::core::ContinuousScheduler::WatermarkAction::TRIGGER_RESUME);
+    assert(!sched.is_prefill_throttled());
+
+    std::printf("  [PASS] Dual-watermark preemption, priority victim selection & hardware guards verified!\n");
+}
+
 } // namespace
 
 int main() {
@@ -166,6 +231,7 @@ int main() {
     test_continuous_scheduler_high_churn();
     test_scheduling_overhead();
     test_radix_compactor();
+    test_dual_watermarks_and_preemption();
 
     std::printf("\n================================================================================\n");
     std::printf("  All continuous scheduling & KV compaction unit tests passed successfully!\n");

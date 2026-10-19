@@ -400,6 +400,7 @@ struct ConcurrentServe::Impl {
         std::shared_ptr<core::RadixNode> radix_node = nullptr;
         std::string cache_tier = "Fresh";
         std::vector<int32_t> saved_consumed;
+        std::vector<int32_t> shared_kv_pages; // Pillar 2: Retained physical KV pages from Radix prefix fork
         ~Slot() {
             // TODO(C4 run-side): free under OnDevice(last stage / stage device) once stages can be non-zero.
             if (history_device) cudaFree(history_device);
@@ -976,7 +977,9 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         // - Single active decode (active_decodes == 1): clamp to 1024 tokens to bound ITL < 15ms while keeping ~1,500 tok/s.
         // - Parallel prefill contest (active_decodes == 0 && active_prefills >= 2): balance bandwidth at 2048 tokens.
         // - Idle/solo prefill (active_decodes == 0 && active_prefills <= 1): expand up to 4096 for saturated Ada SM89 GEMM (>3,000 tok/s).
-        if (active_decodes >= 2) {
+        if (continuous_sched.is_prefill_throttled()) {
+            dynamic_chunk = std::min<int64_t>(dynamic_chunk, 1024);
+        } else if (active_decodes >= 2) {
             dynamic_chunk = std::min<int64_t>(dynamic_chunk, 512);
         } else if (active_decodes == 1) {
             dynamic_chunk = std::min<int64_t>(dynamic_chunk, 1024);
@@ -1298,6 +1301,12 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                         (long long) s.generated, s.request.tokens.size(), s.prompt_ms.load(), decode, reason,
                         (long long) s.accepted, (long long) s.offered, (long long) s.reused_prefix, s.cache_tier.c_str(), live_l2_bytes);
             std::fflush(stdout);
+        }
+        if (!s.shared_kv_pages.empty()) {
+            if (auto pool = radix_tree.kv_pool()) {
+                pool->release_pages(s.shared_kv_pages);
+            }
+            s.shared_kv_pages.clear();
         }
         if (defer_snapshot && !is_cancelled) {
             pending_snapshots.push_back(&s);   // flushed with its snapshot at a safe point
@@ -1663,6 +1672,11 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             // stage-0 pass between them and the next stage-1 pass that overwrites the residual R
             // they read; the pipeline does not, so the next pass is gated on the drafters' idle.
             for (auto* ptr : u.ready) if (!ptr->draft->idle(err)) return false;
+        for (auto* ptr : u.ready) {
+            for (size_t si = 0; si < m.slots.size(); ++si) {
+                if (m.slots[si].get() == ptr) continuous_sched.set_slot_guard((int) si, false);
+            }
+        }
         return true;
     };
     // LANE overlap-width (merged drain): a slot re-enters only after its unit's EPILOGUE ran
@@ -1835,6 +1849,12 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         if (reused == 0) {
             s.saved_prefix = 0;
             s.saved_consumed.clear();
+            if (!s.shared_kv_pages.empty()) {
+                if (auto pool = radix_tree.kv_pool()) {
+                    pool->release_pages(s.shared_kv_pages);
+                }
+                s.shared_kv_pages.clear();
+            }
             s.cache_tier = "Fresh";
             if (s.radix_node) {
                 radix_tree.release(s.radix_node);
@@ -1873,6 +1893,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             if (s.draft) s.draft->kv_restore(reused);
             if (s.radix_node && s.radix_node != radix_parent) radix_tree.release(s.radix_node);
             s.radix_node = radix_parent; // Already holds ref_count acquired in match_prefix()
+            s.shared_kv_pages = radix_tree.resolve_virtual_block_table(radix_parent);
             s.cache_tier = radix_parent->has_device_snapshot() ? "VRAM" : "Host";
             std::fprintf(stderr, "strata-agx concurrent: radix-tree fork: slot forks %lld tokens from RadixNode #%lld (%s)\n", (long long) reused, (long long) radix_parent->id, s.cache_tier.c_str());
         } else if (parent != nullptr) {
@@ -2393,6 +2414,47 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 }
             }
         }
+        // Pillar 1: Dual-Watermark Preemption & HiCache Swapping Evaluation
+        if (auto pool = radix_tree.kv_pool()) {
+            const size_t free_pgs = pool->free_pages_count();
+            const size_t total_pgs = pool->total_pages();
+            auto wm_action = continuous_sched.check_watermarks(free_pgs, total_pgs);
+            if (wm_action == core::ContinuousScheduler::WatermarkAction::TRIGGER_PREEMPTION) {
+                int victim_id = continuous_sched.select_preemption_victim();
+                if (victim_id >= 0 && victim_id < (int) m.slots.size()) {
+                    auto& vs = *m.slots[victim_id];
+                    if (vs.active.load() && !continuous_sched.is_slot_guarded(victim_id)) {
+                        std::fprintf(stderr, "strata-agx concurrent: WATERMARK CRITICAL (%zu/%zu free pages, %.1f%%): preempting slot %d to L2 Host RAM\n",
+                                     free_pgs, total_pgs, 100.0f * (float)free_pgs / (float)total_pgs, victim_id);
+                        save_slot_snapshot(vs, (int64_t) vs.consumed.size(), vs.consumed, /*safe_no_evict=*/true);
+                        if (vs.radix_node) {
+                            vs.radix_node->park_to_host();
+                        }
+                        continuous_sched.set_slot_state(victim_id, core::SlotState::PREEMPTED_L2);
+                        std::lock_guard<std::mutex> lock(s_stdout_mutex);
+                        std::printf("R %llu PREEMPTED_L2 slot=%d\n", (unsigned long long) vs.request.id, victim_id);
+                        std::fflush(stdout);
+                    }
+                }
+            } else if (wm_action == core::ContinuousScheduler::WatermarkAction::TRIGGER_RESUME) {
+                for (size_t si = 0; si < m.slots.size(); ++si) {
+                    auto info = continuous_sched.get_slot_info((int) si);
+                    if (info.state == core::SlotState::PREEMPTED_L2) {
+                        auto& rs = *m.slots[si];
+                        if (rs.radix_node && rs.radix_node->has_host_snapshot()) {
+                            std::fprintf(stderr, "strata-agx concurrent: WATERMARK RESUME (%zu/%zu free pages): re-hydrating slot %zu from L2 Host RAM\n",
+                                         free_pgs, total_pgs, si);
+                            continuous_sched.set_slot_state((int) si, core::SlotState::READY_DECODE);
+                            std::lock_guard<std::mutex> lock(s_stdout_mutex);
+                            std::printf("R %llu RESUMED slot=%zu\n", (unsigned long long) rs.request.id, si);
+                            std::fflush(stdout);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         std::vector<Impl::Slot*> ready;
         std::vector<int> wanted;
         for (size_t j = 0; j < m.slots.size(); ++j) {
@@ -2484,6 +2546,11 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             }
             // Sync ready vector order to match sorted win_slots
             ready = win_slots;
+            for (auto* ws : win_slots) {
+                for (size_t si = 0; si < m.slots.size(); ++si) {
+                    if (m.slots[si].get() == ws) continuous_sched.set_slot_guard((int) si, true);
+                }
+            }
             const auto start = Clock::now();
             dispatch.failed = false;
             // C3/C4 (design-wiring §5): refresh EVERY stage's publish target for THIS round before it runs.

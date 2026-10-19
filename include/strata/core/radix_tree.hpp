@@ -43,45 +43,107 @@ inline size_t align_down_page(size_t tokens, size_t page_size = kPageTokens) {
     return (tokens / page_size) * page_size;
 }
 
-/// Thread-safe Physical KV Page Allocator for Decoupled Page-Table Virtualization (O(T) scaling)
+/// Thread-safe Physical KV Page Allocator with Atomic Page Reference Counting (SGLang / vLLM Parity)
 class PagedKVPool {
 public:
     explicit PagedKVPool(size_t total_pages = 65536)
-        : total_pages_(total_pages), next_free_id_(0), allocated_pages_(0) {}
+        : total_pages_(total_pages), next_free_id_(0), allocated_pages_(0) {
+        page_ref_counts_ = std::make_unique<std::atomic<uint16_t>[]>(total_pages_);
+        for (size_t i = 0; i < total_pages_; ++i) {
+            page_ref_counts_[i].store(0, std::memory_order_relaxed);
+        }
+    }
 
     std::vector<int32_t> allocate_pages(size_t n) {
         std::lock_guard<std::mutex> lock(mutex_);
         std::vector<int32_t> pages;
         pages.reserve(n);
         while (pages.size() < n && !free_list_.empty()) {
-            pages.push_back(free_list_.back());
+            int32_t p = free_list_.back();
             free_list_.pop_back();
+            page_ref_counts_[p].store(1, std::memory_order_relaxed);
+            pages.push_back(p);
         }
         while (pages.size() < n) {
             assert(static_cast<size_t>(next_free_id_) < total_pages_);
-            pages.push_back(next_free_id_++);
+            int32_t p = next_free_id_++;
+            page_ref_counts_[p].store(1, std::memory_order_relaxed);
+            pages.push_back(p);
         }
         assert(static_cast<size_t>(next_free_id_) <= total_pages_);
         allocated_pages_ += n;
         return pages;
     }
 
-    void free_pages(const std::vector<int32_t>& pages) {
-        std::lock_guard<std::mutex> lock(mutex_);
+    void retain_page(int32_t page_id) {
+        if (page_id >= 0 && static_cast<size_t>(page_id) < total_pages_) {
+            page_ref_counts_[page_id].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    void retain_pages(const std::vector<int32_t>& pages) {
         for (int32_t p : pages) {
-            free_list_.push_back(p);
+            retain_page(p);
         }
-        if (allocated_pages_ >= pages.size()) {
-            allocated_pages_ -= pages.size();
-        } else {
-            allocated_pages_ = 0;
+    }
+
+    void release_page(int32_t page_id) {
+        if (page_id < 0 || static_cast<size_t>(page_id) >= total_pages_) return;
+        uint16_t prev = page_ref_counts_[page_id].fetch_sub(1, std::memory_order_acq_rel);
+        if (prev == 1) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            free_list_.push_back(page_id);
+            if (allocated_pages_ > 0) --allocated_pages_;
+        } else if (prev == 0) {
+            page_ref_counts_[page_id].store(0, std::memory_order_relaxed);
         }
-        assert(static_cast<size_t>(next_free_id_) <= total_pages_);
+    }
+
+    void release_pages(const std::vector<int32_t>& pages) {
+        std::vector<int32_t> to_free;
+        to_free.reserve(pages.size());
+        for (int32_t p : pages) {
+            if (p >= 0 && static_cast<size_t>(p) < total_pages_) {
+                uint16_t prev = page_ref_counts_[p].fetch_sub(1, std::memory_order_acq_rel);
+                if (prev == 1) {
+                    to_free.push_back(p);
+                } else if (prev == 0) {
+                    page_ref_counts_[p].store(0, std::memory_order_relaxed);
+                }
+            }
+        }
+        if (!to_free.empty()) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (int32_t p : to_free) {
+                free_list_.push_back(p);
+            }
+            if (allocated_pages_ >= to_free.size()) {
+                allocated_pages_ -= to_free.size();
+            } else {
+                allocated_pages_ = 0;
+            }
+        }
+    }
+
+    void free_pages(const std::vector<int32_t>& pages) {
+        release_pages(pages);
+    }
+
+    uint16_t page_ref_count(int32_t page_id) const {
+        if (page_id >= 0 && static_cast<size_t>(page_id) < total_pages_) {
+            return page_ref_counts_[page_id].load(std::memory_order_relaxed);
+        }
+        return 0;
     }
 
     size_t allocated_pages() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return allocated_pages_;
+    }
+
+    size_t free_pages_count() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return (total_pages_ > allocated_pages_) ? (total_pages_ - allocated_pages_) : 0;
     }
 
     size_t total_pages() const { return total_pages_; }
@@ -91,6 +153,9 @@ public:
         free_list_.clear();
         next_free_id_ = 0;
         allocated_pages_ = 0;
+        for (size_t i = 0; i < total_pages_; ++i) {
+            page_ref_counts_[i].store(0, std::memory_order_relaxed);
+        }
     }
 
 private:
@@ -99,6 +164,7 @@ private:
     int32_t next_free_id_{0};
     size_t allocated_pages_{0};
     std::vector<int32_t> free_list_;
+    std::unique_ptr<std::atomic<uint16_t>[]> page_ref_counts_;
 };
 
 

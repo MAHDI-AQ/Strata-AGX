@@ -364,6 +364,52 @@ int main() {
         cudaStreamDestroy(strm);
     }
 
+    // --- Phase 3: PagedKVPool Atomic Page Ref-Counting & Multi-Tenant Prefix Sharing ---
+    {
+        std::cout << "  [TEST] Phase 3: PagedKVPool Atomic Page Ref-Counting & Cross-Slot Sharing... " << std::flush;
+        strata::core::PagedKVPool pool(1000);
+
+        // 1. Initial allocate 100 pages for System Prompt
+        auto sys_pages = pool.allocate_pages(100);
+        assert(sys_pages.size() == 100);
+        assert(pool.allocated_pages() == 100);
+        for (int32_t p : sys_pages) {
+            assert(pool.page_ref_count(p) == 1);
+        }
+
+        // 2. Slot 1 and Slot 2 fork and retain the SAME 100 physical pages
+        pool.retain_pages(sys_pages); // Slot 1 retains
+        pool.retain_pages(sys_pages); // Slot 2 retains
+        for (int32_t p : sys_pages) {
+            assert(pool.page_ref_count(p) == 3);
+        }
+        // Allocated pages MUST still be 100! (True deduplication across slots)
+        assert(pool.allocated_pages() == 100);
+
+        // 3. Slot 1 finishes and releases pages
+        pool.release_pages(sys_pages);
+        for (int32_t p : sys_pages) {
+            assert(pool.page_ref_count(p) == 2);
+        }
+        assert(pool.allocated_pages() == 100); // Still 100 allocated because Slot 2 and RadixNode hold it!
+
+        // 4. Slot 2 finishes and releases pages
+        pool.release_pages(sys_pages);
+        for (int32_t p : sys_pages) {
+            assert(pool.page_ref_count(p) == 1);
+        }
+        assert(pool.allocated_pages() == 100); // Still 100 allocated because RadixNode holds it!
+
+        // 5. RadixNode is finally evicted and frees pages
+        pool.free_pages(sys_pages);
+        for (int32_t p : sys_pages) {
+            assert(pool.page_ref_count(p) == 0);
+        }
+        assert(pool.allocated_pages() == 0); // Reclaimed completely!
+        assert(pool.free_pages_count() == 1000);
+        std::cout << "[PASS]" << std::endl;
+    }
+
     std::cout << "All RadixTree & HiCache L2 unit tests passed successfully!" << std::endl;
     return 0;
 }

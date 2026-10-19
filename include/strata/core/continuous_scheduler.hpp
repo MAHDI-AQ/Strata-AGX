@@ -27,8 +27,11 @@ enum class SlotState : uint8_t {
     PREFILL = 1,
     READY_DECODE = 2,
     DECODING = 3,
-    FINISHED = 4,
-    CANCELLED = 5
+    AWAITING_TOOL = 4,  // Waiting on client tool execution (prime preemption candidate)
+    PREEMPTED_L2 = 5,   // Swapped out to host RAM HiCache
+    PAUSED = 6,         // Paused under critical memory pressure
+    FINISHED = 7,
+    CANCELLED = 8
 };
 
 inline const char* slot_state_to_string(SlotState s) {
@@ -37,6 +40,9 @@ inline const char* slot_state_to_string(SlotState s) {
         case SlotState::PREFILL: return "PREFILL";
         case SlotState::READY_DECODE: return "READY_DECODE";
         case SlotState::DECODING: return "DECODING";
+        case SlotState::AWAITING_TOOL: return "AWAITING_TOOL";
+        case SlotState::PREEMPTED_L2: return "PREEMPTED_L2";
+        case SlotState::PAUSED: return "PAUSED";
         case SlotState::FINISHED: return "FINISHED";
         case SlotState::CANCELLED: return "CANCELLED";
         default: return "UNKNOWN";
@@ -56,6 +62,8 @@ struct ScheduledSlot {
     int32_t last_token = -1;
     std::chrono::steady_clock::time_point admit_time{};
     std::chrono::steady_clock::time_point finish_time{};
+    std::chrono::steady_clock::time_point last_token_time{};
+    bool protected_from_preemption = false;
 };
 
 /// High-performance continuous scheduler managing iteration-level slot allocations.
@@ -153,6 +161,7 @@ public:
         }
 
         s.last_token = token;
+        s.last_token_time = t0;
         ++s.tokens_generated;
         ++s.position;
         ++total_tokens_stepped_;
@@ -250,6 +259,100 @@ public:
         overhead_samples_ = 0;
     }
 
+    // ========================================================================
+    // Strata AGX v5.5.0: Dual-Watermark Preemption & Lifecycle (Pillars 1 & 4)
+    // ========================================================================
+    enum class WatermarkAction : uint8_t {
+        NONE = 0,
+        THROTTLE_PREFILL = 1,
+        TRIGGER_PREEMPTION = 2,
+        TRIGGER_RESUME = 3
+    };
+
+    struct WatermarkConfig {
+        float watermark_low_ratio = 0.15f;    // 15% free: throttle prefill micro-chunks
+        float watermark_crit_ratio = 0.08f;   // 8% free: preempt victim slot
+        float watermark_resume_ratio = 0.22f; // 22% free: resume preempted slots
+    };
+
+    void set_slot_guard(int slot_id, bool guarded) {
+        if (slot_id < 0 || slot_id >= num_slots_) return;
+        std::lock_guard<std::mutex> lock(sched_mutex_);
+        slots_[slot_id].protected_from_preemption = guarded;
+    }
+
+    bool is_slot_guarded(int slot_id) const {
+        if (slot_id < 0 || slot_id >= num_slots_) return false;
+        std::lock_guard<std::mutex> lock(sched_mutex_);
+        return slots_[slot_id].protected_from_preemption;
+    }
+
+    void set_watermark_config(WatermarkConfig cfg) {
+        std::lock_guard<std::mutex> lock(sched_mutex_);
+        watermark_cfg_ = cfg;
+    }
+
+    WatermarkConfig get_watermark_config() const {
+        std::lock_guard<std::mutex> lock(sched_mutex_);
+        return watermark_cfg_;
+    }
+
+    bool is_prefill_throttled() const {
+        return prefill_throttled_.load(std::memory_order_relaxed);
+    }
+
+    WatermarkAction check_watermarks(size_t free_pages, size_t total_pages) {
+        if (total_pages == 0) return WatermarkAction::NONE;
+        float free_ratio = static_cast<float>(free_pages) / static_cast<float>(total_pages);
+        if (free_ratio <= watermark_cfg_.watermark_crit_ratio) {
+            prefill_throttled_.store(true, std::memory_order_relaxed);
+            return WatermarkAction::TRIGGER_PREEMPTION;
+        }
+        if (free_ratio <= watermark_cfg_.watermark_low_ratio) {
+            prefill_throttled_.store(true, std::memory_order_relaxed);
+            return WatermarkAction::THROTTLE_PREFILL;
+        }
+        prefill_throttled_.store(false, std::memory_order_relaxed);
+        if (free_ratio >= watermark_cfg_.watermark_resume_ratio) {
+            std::lock_guard<std::mutex> lock(sched_mutex_);
+            for (int i = 0; i < num_slots_; ++i) {
+                if (slots_[i].state == SlotState::PREEMPTED_L2 || slots_[i].state == SlotState::PAUSED) {
+                    return WatermarkAction::TRIGGER_RESUME;
+                }
+            }
+        }
+        return WatermarkAction::NONE;
+    }
+
+    int select_preemption_victim() const {
+        std::lock_guard<std::mutex> lock(sched_mutex_);
+        int victim = -1;
+        // 1. Prefer AWAITING_TOOL (oldest wait time first)
+        auto oldest_time = std::chrono::steady_clock::time_point::max();
+        for (int i = 0; i < num_slots_; ++i) {
+            if (slots_[i].state == SlotState::AWAITING_TOOL && !slots_[i].protected_from_preemption) {
+                if (slots_[i].last_token_time < oldest_time) {
+                    oldest_time = slots_[i].last_token_time;
+                    victim = i;
+                }
+            }
+        }
+        if (victim >= 0) return victim;
+
+        // 2. Otherwise pick active decoding slot with lowest generated tokens
+        int64_t min_tokens = std::numeric_limits<int64_t>::max();
+        for (int i = 0; i < num_slots_; ++i) {
+            if ((slots_[i].state == SlotState::DECODING || slots_[i].state == SlotState::READY_DECODE) &&
+                !slots_[i].protected_from_preemption) {
+                if (slots_[i].tokens_generated < min_tokens) {
+                    min_tokens = slots_[i].tokens_generated;
+                    victim = i;
+                }
+            }
+        }
+        return victim;
+    }
+
 private:
     void record_overhead(std::chrono::steady_clock::time_point t0) {
         const auto t1 = std::chrono::steady_clock::now();
@@ -261,6 +364,8 @@ private:
     int num_slots_ = 4;
     mutable std::mutex sched_mutex_;
     std::vector<ScheduledSlot> slots_;
+    WatermarkConfig watermark_cfg_{};
+    std::atomic<bool> prefill_throttled_{false};
 
     std::atomic<uint64_t> total_admissions_{0};
     std::atomic<uint64_t> total_recycles_{0};
