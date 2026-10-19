@@ -1737,7 +1737,19 @@ class Service:
         kv_quant = eng_info.get("kv", "q4_0").upper()
         conc_slots = eng_info.get("concurrency", len(slots_data) or 2)
         ctx_k = int(eng_info.get("max_context", 262144) or 262144) // 1024
-        max_vram_toks = conc_slots * ctx_k * 1024
+        # Physical working pool capacity in VRAM is fixed at 524,288 tokens (512k)
+        # shared across all concurrent slots (SGLang/vLLM-parity paged virtual pool).
+        pool_env = (os.environ.get("STRATA_KV_POOL_TOKENS") or 
+                    os.environ.get("STRATA_RADIX_VRAM_POOL_TOKENS") or
+                    (getattr(self, "cfg", {}) or {}).get("kv_pool_tokens") or
+                    (getattr(self, "cfg", {}) or {}).get("env", {}).get("STRATA_KV_POOL_TOKENS"))
+        if pool_env:
+            max_vram_toks = int(pool_env)
+        elif "kv_pool_tokens" in eng_info:
+            max_vram_toks = int(eng_info["kv_pool_tokens"])
+        else:
+            # Default physical pool capacity: 524,288 tokens (512k)
+            max_vram_toks = 524288
         l2_cap_gib = float(os.environ.get("STRATA_RADIX_HOST_GIB") or 4.0)
         l3_cap_gib = float(os.environ.get("STRATA_RADIX_NVME_MAX_GIB") or 128.0)
 
@@ -1781,6 +1793,7 @@ class Service:
             "l1_max_tokens": max_vram_toks,
             "l1_vram_bytes": l1_vram_bytes,
             "l1_kv_quant": kv_quant,
+            "l1_vram_pool": f"{max_vram_toks // 1024}k Context Pool ({kv_quant})",
             "l1_display": f"{total_active_tokens:,} / {max_vram_toks:,} toks ({active_slots}/{conc_slots} slots)" if active_slots > 0 else f"{total_active_tokens:,} / {max_vram_toks:,} toks (retained)",
 
             # L2 Host RAM Tier (Parked DDR4 Prefix Nodes)
@@ -3740,6 +3753,9 @@ def main() -> int:
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
+    svc.cfg = cfg
+    for k, v in (cfg.get("env") or {}).items():
+        os.environ.setdefault(str(k), str(v))
     try:
         svc.set_aliases(cfg.get("aliases"))             # #297: other names the model answers to
     except ValueError as e:

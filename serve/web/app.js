@@ -399,7 +399,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, slots
 
   // context fill & parallel slot rendering
   const ctx = eng.max_context || 0;
-  if ($("slots-summary")) $("slots-summary").textContent = `${numSlots} Parallel Slots · ${ctxfmt(ctx)} each`;
+  if ($("slots-summary")) $("slots-summary").textContent = `${numSlots} Parallel Slots · ${ctxfmt(ctx)} each (512K shared pool)`;
 
   // Render each slot individually (dynamic for numSlots)
   for (let sId = 0; sId < numSlots; sId++) {
@@ -472,7 +472,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, slots
       } else if (radixData.l1_active_tokens != null && radixData.l1_total_tokens != null) {
         $("radix-l1-val").textContent = `${eng.concurrency || 2} slots · ${fmt(radixData.l1_active_tokens)} / ${fmt(radixData.l1_total_tokens)} toks`;
       } else {
-        const poolDesc = radixData.l1_vram_pool || `${eng.concurrency || 2} slots · ${(eng.max_context || 262144)/1024}k (${(eng.kv || "q4_0").toUpperCase()})`;
+        const poolDesc = radixData.l1_vram_pool || `512k Context Pool (${(eng.kv || "q4_0").toUpperCase()})`;
         const activeTok = radixData.l1_active_tokens != null ? `${fmt(radixData.l1_active_tokens)} toks` : "0 toks";
         const l1Text = radixData.l1_vram_note || `${poolDesc} · ${activeTok} · ${expStr}`;
         $("radix-l1-val").textContent = l1Text;
