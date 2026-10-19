@@ -555,6 +555,12 @@ void RadixNode::free_nvme(NVMeStorageTier& nvme) {
 RadixNode::~RadixNode() {
     free_device();
     free_host();
+    if (!kv_page_ids.empty()) {
+        if (auto pool = kv_pool.lock()) {
+            pool->free_pages(kv_page_ids);
+            kv_page_ids.clear();
+        }
+    }
 }
 
 RadixTree::RadixTree(size_t max_cached_snapshots, size_t max_host_snapshots)
@@ -590,6 +596,7 @@ RadixTree::RadixTree(size_t max_cached_snapshots, size_t max_host_snapshots)
     root_->last_accessed = std::chrono::steady_clock::now();
     node_count_ = 1;
     kv_pool_ = std::make_shared<PagedKVPool>();
+    root_->kv_pool = kv_pool_;
 
     nvme_worker_ = std::thread(&RadixTree::nvme_worker_loop, this);
 }
@@ -1039,15 +1046,7 @@ RadixMatch RadixTree::match_prefix(const int32_t* tokens, size_t n) const {
         if (match_edge == edge.size()) {
             matched_len += edge.size();
             curr = child;
-            uint32_t hits = curr->hit_count.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (hits >= 2 && !curr->is_permanent && curr->kind != RadixNodeKind::SYSTEM_ROOT) {
-                if (!curr->is_staging_to_nvme.load(std::memory_order_relaxed) &&
-                    !curr->is_l3_offloaded &&
-                    !curr->has_l3_persisted &&
-                    curr->has_host_snapshot()) {
-                    const_cast<RadixTree*>(this)->queue_nvme_write_through_locked(curr);
-                }
-            }
+            curr->hit_count.fetch_add(1, std::memory_order_relaxed);
             // P18 L1: a node is fork-usable only when the query extends at least one token past its
             // coverage (the reused prefix must not pass the query's last index); a shorter hit falls
             // back to the next-shallower snapshotted ancestor already held in `best`.
@@ -1063,7 +1062,7 @@ RadixMatch RadixTree::match_prefix(const int32_t* tokens, size_t n) const {
         }
     }
     if (best.node) {
-        const_cast<RadixTree*>(this)->acquire(best.node);
+        acquire(best.node);
     }
     return best;
 }
@@ -1119,15 +1118,7 @@ RadixMatch RadixTree::match_prefix(const int64_t* tokens, size_t n) const {
         if (match_edge == edge.size()) {
             matched_len += edge.size();
             curr = child;
-            uint32_t hits = curr->hit_count.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (hits >= 2 && !curr->is_permanent && curr->kind != RadixNodeKind::SYSTEM_ROOT) {
-                if (!curr->is_staging_to_nvme.load(std::memory_order_relaxed) &&
-                    !curr->is_l3_offloaded &&
-                    !curr->has_l3_persisted &&
-                    curr->has_host_snapshot()) {
-                    const_cast<RadixTree*>(this)->queue_nvme_write_through_locked(curr);
-                }
-            }
+            curr->hit_count.fetch_add(1, std::memory_order_relaxed);
             // P18 L1: a node is fork-usable only when the query extends at least one token past its
             // coverage (the reused prefix must not pass the query's last index); a shorter hit falls
             // back to the next-shallower snapshotted ancestor already held in `best`.
@@ -1143,7 +1134,7 @@ RadixMatch RadixTree::match_prefix(const int64_t* tokens, size_t n) const {
         }
     }
     if (best.node) {
-        const_cast<RadixTree*>(this)->acquire(best.node);
+        acquire(best.node);
     }
     return best;
 }
@@ -1173,6 +1164,7 @@ std::shared_ptr<RadixNode> RadixTree::insert(
         auto it = curr->children.find(next_tok);
         if (it == curr->children.end()) {
             auto new_node = std::make_shared<RadixNode>();
+            new_node->kv_pool = kv_pool_;
             new_node->id = next_node_id_++;
             new_node->prefix_len = (int64_t) prefix_len;
             new_node->edge_tokens.assign(tokens + matched_len, tokens + prefix_len);
@@ -1206,6 +1198,7 @@ std::shared_ptr<RadixNode> RadixTree::insert(
             curr = child;
         } else {
             auto split_node = std::make_shared<RadixNode>();
+            split_node->kv_pool = kv_pool_;
             split_node->id = next_node_id_++;
             split_node->prefix_len = curr->prefix_len + (int64_t) match_edge;
             split_node->edge_tokens.assign(edge.begin(), edge.begin() + match_edge);
@@ -1215,7 +1208,25 @@ std::shared_ptr<RadixNode> RadixTree::insert(
 
             size_t split_pages = (match_edge + 15) / 16;
             split_node->kv_page_ids = child->slice_page_ids(0, split_pages);
-            child->kv_page_ids = child->slice_page_ids(split_pages, child->kv_page_ids.size() > split_pages ? child->kv_page_ids.size() - split_pages : 0);
+
+            if (match_edge % 16 == 0) {
+                child->kv_page_ids = child->slice_page_ids(split_pages, child->kv_page_ids.size() > split_pages ? child->kv_page_ids.size() - split_pages : 0);
+            } else {
+                std::vector<int32_t> child_pages;
+                int32_t boundary_page = -1;
+                if (kv_pool_) {
+                    auto alloc = kv_pool_->allocate_pages(1);
+                    if (!alloc.empty()) boundary_page = alloc[0];
+                } else if (split_pages > 0 && split_pages - 1 < child->kv_page_ids.size()) {
+                    boundary_page = child->kv_page_ids[split_pages - 1];
+                }
+                if (boundary_page >= 0) {
+                    child_pages.push_back(boundary_page);
+                }
+                auto tail_pages = child->slice_page_ids(split_pages, child->kv_page_ids.size() > split_pages ? child->kv_page_ids.size() - split_pages : 0);
+                child_pages.insert(child_pages.end(), tail_pages.begin(), tail_pages.end());
+                child->kv_page_ids = std::move(child_pages);
+            }
 
             child->edge_tokens.erase(child->edge_tokens.begin(), child->edge_tokens.begin() + match_edge);
             child->update_chunk_hashes();
@@ -1225,6 +1236,15 @@ std::shared_ptr<RadixNode> RadixTree::insert(
             if (child->kv_page_ids.size() < child_rem_pages && kv_pool_) {
                 auto extra = kv_pool_->allocate_pages(child_rem_pages - child->kv_page_ids.size());
                 child->kv_page_ids.insert(child->kv_page_ids.end(), extra.begin(), extra.end());
+            } else if (child->kv_page_ids.size() > child_rem_pages) {
+                if (kv_pool_) {
+                    std::vector<int32_t> excess(child->kv_page_ids.begin() + child_rem_pages, child->kv_page_ids.end());
+                    kv_pool_->free_pages(excess);
+                }
+                child->kv_page_ids.resize(child_rem_pages);
+            }
+            if (kv_pool_) {
+                assert(child->kv_page_ids.size() == (child->edge_tokens.size() + 15) / 16);
             }
 
             split_node->children[child->edge_tokens[0]] = child;
@@ -1237,6 +1257,7 @@ std::shared_ptr<RadixNode> RadixTree::insert(
                 curr = split_node;
             } else {
                 auto new_node = std::make_shared<RadixNode>();
+                new_node->kv_pool = kv_pool_;
                 new_node->id = next_node_id_++;
                 new_node->prefix_len = (int64_t) prefix_len;
                 new_node->edge_tokens.assign(tokens + matched_len, tokens + prefix_len);
@@ -1508,11 +1529,11 @@ std::vector<int32_t> RadixTree::resolve_virtual_block_table(const std::shared_pt
     return block_table;
 }
 
-void RadixTree::acquire(const std::shared_ptr<RadixNode>& node) {
+void RadixTree::acquire(const std::shared_ptr<RadixNode>& node) const {
     if (node) ++node->ref_count;
 }
 
-void RadixTree::release(const std::shared_ptr<RadixNode>& node) {
+void RadixTree::release(const std::shared_ptr<RadixNode>& node) const {
     if (node && node->ref_count > 0) --node->ref_count;
 }
 
@@ -2041,6 +2062,10 @@ size_t RadixTree::evict_lru_locked(size_t max_snapshots, size_t min_free_vram_mi
                 if (cached_nvme_snapshots_.load(std::memory_order_relaxed) > 0) cached_nvme_snapshots_.fetch_sub(1, std::memory_order_relaxed);
             }
             if (!host_victim->has_snapshot() && !host_victim->is_staging_to_nvme.load()) {
+                if (kv_pool_ && !host_victim->kv_page_ids.empty()) {
+                    kv_pool_->free_pages(host_victim->kv_page_ids);
+                    host_victim->kv_page_ids.clear();
+                }
                 if (auto p = host_victim->parent.lock()) {
                     if (!host_victim->edge_tokens.empty()) {
                         p->children.erase(host_victim->edge_tokens[0]);
@@ -2198,6 +2223,7 @@ std::shared_ptr<RadixNode> RadixTree::insert_direct_device_to_host(
         auto it = curr->children.find(next_tok);
         if (it == curr->children.end()) {
             auto new_node = std::make_shared<RadixNode>();
+            new_node->kv_pool = kv_pool_;
             new_node->id = next_node_id_++;
             new_node->prefix_len = (int64_t) prefix_len;
             new_node->edge_tokens.assign(tokens + matched_len, tokens + prefix_len);
@@ -2231,6 +2257,7 @@ std::shared_ptr<RadixNode> RadixTree::insert_direct_device_to_host(
             curr = child;
         } else {
             auto split_node = std::make_shared<RadixNode>();
+            split_node->kv_pool = kv_pool_;
             split_node->id = next_node_id_++;
             split_node->prefix_len = curr->prefix_len + (int64_t) match_edge;
             split_node->edge_tokens.assign(edge.begin(), edge.begin() + match_edge);
@@ -2240,7 +2267,25 @@ std::shared_ptr<RadixNode> RadixTree::insert_direct_device_to_host(
 
             size_t split_pages = (match_edge + 15) / 16;
             split_node->kv_page_ids = child->slice_page_ids(0, split_pages);
-            child->kv_page_ids = child->slice_page_ids(split_pages, child->kv_page_ids.size() > split_pages ? child->kv_page_ids.size() - split_pages : 0);
+
+            if (match_edge % 16 == 0) {
+                child->kv_page_ids = child->slice_page_ids(split_pages, child->kv_page_ids.size() > split_pages ? child->kv_page_ids.size() - split_pages : 0);
+            } else {
+                std::vector<int32_t> child_pages;
+                int32_t boundary_page = -1;
+                if (kv_pool_) {
+                    auto alloc = kv_pool_->allocate_pages(1);
+                    if (!alloc.empty()) boundary_page = alloc[0];
+                } else if (split_pages > 0 && split_pages - 1 < child->kv_page_ids.size()) {
+                    boundary_page = child->kv_page_ids[split_pages - 1];
+                }
+                if (boundary_page >= 0) {
+                    child_pages.push_back(boundary_page);
+                }
+                auto tail_pages = child->slice_page_ids(split_pages, child->kv_page_ids.size() > split_pages ? child->kv_page_ids.size() - split_pages : 0);
+                child_pages.insert(child_pages.end(), tail_pages.begin(), tail_pages.end());
+                child->kv_page_ids = std::move(child_pages);
+            }
 
             child->edge_tokens.erase(child->edge_tokens.begin(), child->edge_tokens.begin() + match_edge);
             child->update_chunk_hashes();
@@ -2250,6 +2295,15 @@ std::shared_ptr<RadixNode> RadixTree::insert_direct_device_to_host(
             if (child->kv_page_ids.size() < child_rem_pages && kv_pool_) {
                 auto extra = kv_pool_->allocate_pages(child_rem_pages - child->kv_page_ids.size());
                 child->kv_page_ids.insert(child->kv_page_ids.end(), extra.begin(), extra.end());
+            } else if (child->kv_page_ids.size() > child_rem_pages) {
+                if (kv_pool_) {
+                    std::vector<int32_t> excess(child->kv_page_ids.begin() + child_rem_pages, child->kv_page_ids.end());
+                    kv_pool_->free_pages(excess);
+                }
+                child->kv_page_ids.resize(child_rem_pages);
+            }
+            if (kv_pool_) {
+                assert(child->kv_page_ids.size() == (child->edge_tokens.size() + 15) / 16);
             }
 
             split_node->children[child->edge_tokens[0]] = child;
@@ -2262,6 +2316,7 @@ std::shared_ptr<RadixNode> RadixTree::insert_direct_device_to_host(
                 curr = split_node;
             } else {
                 auto new_node = std::make_shared<RadixNode>();
+                new_node->kv_pool = kv_pool_;
                 new_node->id = next_node_id_++;
                 new_node->prefix_len = (int64_t) prefix_len;
                 new_node->edge_tokens.assign(tokens + matched_len, tokens + prefix_len);
@@ -2605,6 +2660,7 @@ bool RadixTree::restore_manifest(const std::string& model_id_hash) {
         if (!ifs.good()) break;
 
         auto node = std::make_shared<RadixNode>();
+        node->kv_pool = kv_pool_;
         node->id = rec.node_id;
         node->prefix_len = rec.prefix_len;
         node->l3_bytes = rec.l3_bytes;

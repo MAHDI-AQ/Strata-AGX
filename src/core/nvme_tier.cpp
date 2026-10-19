@@ -392,9 +392,8 @@ bool NVMeStorageTier::read_node_direct(int64_t node_id, void* out_data, size_t b
         }
     }
 
-    ::close(fd);
-
     if (total_read < bytes) {
+        ::close(fd);
         return false;
     }
 
@@ -422,10 +421,13 @@ bool NVMeStorageTier::read_node_direct(int64_t node_id, void* out_data, size_t b
                         ::unlink(path.c_str());
                     }
                 }
+                ::close(fd);
                 return false;
             }
         }
     }
+
+    ::close(fd);
 
     bytes_read_.fetch_add(total_read, std::memory_order_relaxed);
     return true;
@@ -728,14 +730,32 @@ IOUringStorage::~IOUringStorage() {
 
 int IOUringStorage::sync_direct_io(int fd, void* buf, size_t bytes, off_t offset, bool is_write) {
     if (!buf || bytes == 0) return 0;
-    if ((reinterpret_cast<uintptr_t>(buf) % 4096 != 0) || (bytes % 4096 != 0) || (offset % 4096 != 0)) {
+    if (offset % 4096 != 0) {
         return -EINVAL;
     }
+
+    AlignedBuffer bounce;
+    size_t aligned_bytes = AlignedBuffer::align_up(bytes, 4096);
+    void* io_buf = buf;
+    if ((reinterpret_cast<uintptr_t>(buf) % 4096 != 0) || (bytes != aligned_bytes)) {
+        bounce.allocate(aligned_bytes);
+        if (bounce.empty() || !bounce.data()) {
+            return -ENOMEM;
+        }
+        if (is_write) {
+            std::memcpy(bounce.data(), buf, bytes);
+            if (aligned_bytes > bytes) {
+                std::memset(bounce.data() + bytes, 0, aligned_bytes - bytes);
+            }
+        }
+        io_buf = bounce.data();
+    }
+
     size_t total = 0;
-    uint8_t* ptr = static_cast<uint8_t*>(buf);
-    while (total < bytes) {
-        ssize_t rc = is_write ? ::pwrite(fd, ptr + total, bytes - total, offset + total)
-                              : ::pread(fd, ptr + total, bytes - total, offset + total);
+    uint8_t* ptr = static_cast<uint8_t*>(io_buf);
+    while (total < aligned_bytes) {
+        ssize_t rc = is_write ? ::pwrite(fd, ptr + total, aligned_bytes - total, offset + total)
+                              : ::pread(fd, ptr + total, aligned_bytes - total, offset + total);
         if (rc < 0) {
             if (errno == EINTR) continue;
             return -errno;
@@ -743,7 +763,10 @@ int IOUringStorage::sync_direct_io(int fd, void* buf, size_t bytes, off_t offset
         if (rc == 0) break;
         total += rc;
     }
-    return total == bytes ? 0 : -EIO;
+    if (!is_write && io_buf != buf && total >= bytes) {
+        std::memcpy(buf, bounce.data(), bytes);
+    }
+    return total >= bytes ? 0 : -EIO;
 }
 
 int IOUringStorage::submit_io_batch(int fd, void* buf, size_t bytes, off_t offset, size_t chunk_bytes, bool is_write) {
@@ -752,25 +775,42 @@ int IOUringStorage::submit_io_batch(int fd, void* buf, size_t bytes, off_t offse
         return sync_direct_io(fd, buf, bytes, offset, is_write);
     }
     if (!buf || bytes == 0) return 0;
-    if ((reinterpret_cast<uintptr_t>(buf) % 4096 != 0) || (bytes % 4096 != 0) || (offset % 4096 != 0)) {
+    if (offset % 4096 != 0) {
         return sync_direct_io(fd, buf, bytes, offset, is_write);
+    }
+
+    AlignedBuffer bounce;
+    size_t aligned_bytes = AlignedBuffer::align_up(bytes, 4096);
+    void* io_buf = buf;
+    if ((reinterpret_cast<uintptr_t>(buf) % 4096 != 0) || (bytes != aligned_bytes)) {
+        bounce.allocate(aligned_bytes);
+        if (bounce.empty() || !bounce.data()) {
+            return -ENOMEM;
+        }
+        if (is_write) {
+            std::memcpy(bounce.data(), buf, bytes);
+            if (aligned_bytes > bytes) {
+                std::memset(bounce.data() + bytes, 0, aligned_bytes - bytes);
+            }
+        }
+        io_buf = bounce.data();
     }
 
     std::lock_guard<std::mutex> lock(ring_mutex_);
 
     size_t processed = 0;
-    uint8_t* ptr = static_cast<uint8_t*>(buf);
+    uint8_t* ptr = static_cast<uint8_t*>(io_buf);
 
     if (chunk_bytes == 0) chunk_bytes = 1048576;
     chunk_bytes = AlignedBuffer::align_up(chunk_bytes, 4096);
 
-    while (processed < bytes) {
+    while (processed < aligned_bytes) {
         size_t batch_bytes = 0;
         size_t batch_sqes = 0;
         uint32_t tail = *sq_tail_;
 
-        while (processed + batch_bytes < bytes && batch_sqes < queue_depth_) {
-            size_t remaining = bytes - (processed + batch_bytes);
+        while (processed + batch_bytes < aligned_bytes && batch_sqes < queue_depth_) {
+            size_t remaining = aligned_bytes - (processed + batch_bytes);
             size_t this_chunk = std::min(chunk_bytes, remaining);
             this_chunk = AlignedBuffer::align_up(this_chunk, 4096);
             if (this_chunk > remaining) this_chunk = remaining;
@@ -796,29 +836,55 @@ int IOUringStorage::submit_io_batch(int fd, void* buf, size_t bytes, off_t offse
 
         int ret = syscall(__NR_io_uring_enter, ring_fd_, batch_sqes, batch_sqes, IORING_ENTER_GETEVENTS, nullptr);
         if (ret < 0) {
-            return -errno;
+            int err = -errno;
+            while (true) {
+                uint32_t c_head = __atomic_load_n(cq_head_, __ATOMIC_ACQUIRE);
+                if (c_head == *cq_tail_) break;
+                __atomic_store_n(cq_head_, c_head + 1, __ATOMIC_RELEASE);
+            }
+            return err;
         }
 
         size_t reaped = 0;
+        int first_error = 0;
         while (reaped < batch_sqes) {
             uint32_t c_head = __atomic_load_n(cq_head_, __ATOMIC_ACQUIRE);
             if (c_head != *cq_tail_) {
                 struct io_uring_cqe* cqe = &static_cast<struct io_uring_cqe*>(cqes_)[c_head & *cq_mask_];
-                if (cqe->res < 0) {
-                    __atomic_store_n(cq_head_, c_head + 1, __ATOMIC_RELEASE);
-                    return cqe->res;
+                if (cqe->res < 0 && first_error == 0) {
+                    first_error = cqe->res;
                 }
                 __atomic_store_n(cq_head_, c_head + 1, __ATOMIC_RELEASE);
                 ++reaped;
             } else {
-                syscall(__NR_io_uring_enter, ring_fd_, 0, 1, IORING_ENTER_GETEVENTS, nullptr);
+                int enter_ret = syscall(__NR_io_uring_enter, ring_fd_, 0, 1, IORING_ENTER_GETEVENTS, nullptr);
+                if (enter_ret < 0 && errno != EINTR) {
+                    if (first_error == 0) first_error = -errno;
+                    while (reaped < batch_sqes) {
+                        uint32_t ch = __atomic_load_n(cq_head_, __ATOMIC_ACQUIRE);
+                        if (ch == *cq_tail_) break;
+                        __atomic_store_n(cq_head_, ch + 1, __ATOMIC_RELEASE);
+                        ++reaped;
+                    }
+                    break;
+                }
             }
+        }
+
+        if (first_error < 0) {
+            return first_error;
         }
 
         processed += batch_bytes;
     }
 
-    return (processed == bytes) ? 0 : -EIO;
+    if (processed == aligned_bytes) {
+        if (!is_write && io_buf != buf) {
+            std::memcpy(buf, bounce.data(), bytes);
+        }
+        return 0;
+    }
+    return -EIO;
 #else
     return sync_direct_io(fd, buf, bytes, offset, is_write);
 #endif

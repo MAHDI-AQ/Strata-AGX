@@ -49,7 +49,7 @@ from typing import Iterator, Protocol
 from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
-STRATA_AGX_VERSION = "0.1.40-agx.5.2.0"
+STRATA_AGX_VERSION = "0.1.40-agx.5.3.0"
 
 def get_git_commit() -> str:
     commit = os.environ.get("STRATA_COMMIT")
@@ -353,7 +353,10 @@ class ShmConsumer:
         if not self.m:
             return
         head, = struct.unpack_from("<I", self.m, 0)
-        while ((head - self.tail) & 0xFFFFFFFF) > 0:
+        diff = (head - self.tail) & 0xFFFFFFFF
+        if diff > 0x7FFFFFFF:
+            diff -= 0x100000000
+        while diff > 0:
             idx = self.tail & (self.capacity - 1)
             off = self.HEADER_SIZE + idx * self.ENTRY_SIZE
             msg_type, flags, reserved, token, req_id, p_read, p_total = struct.unpack_from(self.ENTRY_FMT, self.m, off)
@@ -361,6 +364,10 @@ class ShmConsumer:
                 yield (req_id, msg_type, token, p_read, p_total)
             self.tail = (self.tail + 1) & 0xFFFFFFFF
             struct.pack_into("<I", self.m, 4, self.tail)
+            head, = struct.unpack_from("<I", self.m, 0)
+            diff = (head - self.tail) & 0xFFFFFFFF
+            if diff > 0x7FFFFFFF:
+                diff -= 0x100000000
 
     def close(self):
         if self.m:
@@ -502,12 +509,17 @@ class StrataEngine:
                             try:
                                 channel.put_nowait(payload)
                             except queue.Full:
-                                # CRIT-05: Do not drop tokens silently under SHM backpressure.
-                                # Send error sentinel so consumer terminates cleanly rather than corrupting context.
                                 try:
-                                    channel.put_nowait("ERR queue_full\n")
-                                except Exception:
-                                    pass
+                                    channel.put(payload, timeout=0.05)
+                                except queue.Full:
+                                    try:
+                                        channel.get_nowait()
+                                    except queue.Empty:
+                                        pass
+                                    try:
+                                        channel.put_nowait("ERR queue_full\n")
+                                    except Exception:
+                                        pass
             if not had_any:
                 time.sleep(0.0002)
 
@@ -524,8 +536,6 @@ class StrataEngine:
             if len(fields) != 3 or fields[0] != "R" or not fields[1].isdigit():
                 continue
             number, payload = int(fields[1]), fields[2] + "\n"
-            if getattr(self, "_shm_active", False) and payload.startswith("PP "):
-                continue
             overflow = False
             with self._channels_lock:
                 channel = self._channels.get(number)
@@ -533,14 +543,19 @@ class StrataEngine:
                     try:
                         channel.put_nowait(payload)
                     except queue.Full:
-                        self._channels.pop(number, None)
-                        while not channel.empty():
+                        try:
+                            channel.put(payload, timeout=0.05)
+                        except queue.Full:
+                            self._channels.pop(number, None)
                             try:
                                 channel.get_nowait()
                             except queue.Empty:
-                                break
-                        channel.put_nowait("ERR client output queue exceeded 256 events")
-                        overflow = True
+                                pass
+                            try:
+                                channel.put_nowait("ERR client output queue exceeded 256 events\n")
+                            except Exception:
+                                pass
+                            overflow = True
             if overflow:
                 try:
                     self._send(f"CSTOP {number}")
@@ -803,11 +818,17 @@ class StrataEngine:
                     raise ValueError(line[4:].strip())
         finally:
             if sent and not done:                     # stopped early (stop token, cancel, disconnect)
+                try:
+                    self._send(f"CSTOP {number}")
+                except OSError:
+                    pass
                 deadline = time.monotonic() + MULTIPLEX_DONE_DRAIN_S
                 while time.monotonic() < deadline:
                     try:
                         payload = channel.get(timeout=0.25)
                     except queue.Empty:
+                        if not self.alive():
+                            break
                         continue
                     if payload is None:               # engine gone
                         break
@@ -819,15 +840,13 @@ class StrataEngine:
                         except ValueError:
                             pass
                         break
+                    elif payload.startswith("ERR "):
+                        done = True
+                        break
             with self._channels_lock:
                 self._channels.pop(number, None)
             self._shared_progress.pop(number, None)          # lock-free (see progress)
             self._shared_queue_wait.pop(number, None)        # D1: lock-free (see progress)
-            if sent and not done:
-                try:
-                    self._send(f"CSTOP {number}")
-                except OSError:
-                    pass
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         if getattr(self, "multiplex", False):
@@ -1873,8 +1892,12 @@ class Service:
                 s_dict.setdefault("context_len", (s_dict.get("prompt_tokens", 0) or 0) + (s_dict.get("generated", 0) or 0))
                 if s_dict.get("status") == "reading":
                     s_dict.setdefault("prefill_tok_s", getattr(self.engine, "prefill_tok_s_mean", None))
-            s_dict.setdefault("state", s_dict.get("status"))
+            s_dict.setdefault("state", s_dict.get("status", "idle"))
+            s_dict.setdefault("read", s_dict.get("prompt_read", 0))
+            s_dict.setdefault("total", s_dict.get("prompt_tokens", 0))
+            s_dict.setdefault("tokens", s_dict.get("generated", 0))
             formatted_slots.append(s_dict)
+        live["slots"] = formatted_slots
 
         radix = self._radix_stats()
         mtp = self._mtp_stats()
@@ -1925,13 +1948,18 @@ class Service:
     def encode_prompt(self, messages, tools, kwargs):
         """Render and encode messages so that template structural tokens become control tokens,
         while user prompt text cannot synthesize <|im_start|> or <|im_end|> control tokens."""
-        specials = (
+        specials_set = {
             "<|im_start|>", "<|im_end|>", "<|endoftext|>",
             "<|vision_start|>", "<|vision_end|>", "<|video_start|>", "<|video_end|>",
             "<|image_pad|>", "<|video_pad|>",
             "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>",
             "</think>", "<think>"
-        )
+        }
+        if hasattr(self.tok, "all_special_tokens") and self.tok.all_special_tokens:
+            specials_set.update(self.tok.all_special_tokens)
+        if hasattr(self.tok, "SPECIALS") and self.tok.SPECIALS:
+            specials_set.update(self.tok.SPECIALS)
+        specials = tuple(sorted(specials_set, key=len, reverse=True))
         token_sub = {s: f"\x00_STRATA_RAW_{i}_{uuid.uuid4().hex}_\x00" for i, s in enumerate(specials)}
 
         def _escape(obj):

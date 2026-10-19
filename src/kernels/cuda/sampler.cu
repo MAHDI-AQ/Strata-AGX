@@ -395,6 +395,10 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
     }
     // temperature only: the penalties were applied once, before the selection (issue #53: they were applied a
     // second time here, after the temperature scaling - llama.cpp's chain has one penalties stage)
+    if (p.temperature < 1e-4f || inv_t == 0.0f) {
+        if (threadIdx.x == 0) out[t] = sel_ids[0];
+        return;
+    }
     auto scaled = [&](int i) { return sel_logit[i] * inv_t; };
     float smx = scaled(0);
     for (int i = 1; i < n_keep; ++i) smx = fmaxf(smx, scaled(i));
@@ -459,6 +463,15 @@ __device__ void sampled_tail_warp(const int* sel_ids, const float* sel_logit, in
                                   int* __restrict__ out, double* ex, float* prob_out = nullptr) {
     const int lane = (int) (threadIdx.x & 31);
     const float inv_t = p.temperature > 0.0f ? 1.0f / p.temperature : 0.0f;
+    if (p.temperature < 1e-4f || inv_t == 0.0f) {
+        if (lane == 0) {
+            out[t] = sel_ids[0];
+            if constexpr (kProb) {
+                if (prob_out) *prob_out = 1.0f;
+            }
+        }
+        return;
+    }
     int n_keep = k;
     float mx = sel_logit[0];
     for (int i = 1; i < k; ++i) mx = fmaxf(mx, sel_logit[i]);

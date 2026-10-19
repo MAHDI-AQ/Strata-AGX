@@ -16,6 +16,7 @@
 #include "strata/core/radix_compactor.hpp"
 #include "strata/core/nvme_tier.hpp"
 
+#include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <map>
@@ -57,8 +58,10 @@ public:
             free_list_.pop_back();
         }
         while (pages.size() < n) {
+            assert(static_cast<size_t>(next_free_id_) < total_pages_);
             pages.push_back(next_free_id_++);
         }
+        assert(static_cast<size_t>(next_free_id_) <= total_pages_);
         allocated_pages_ += n;
         return pages;
     }
@@ -73,6 +76,7 @@ public:
         } else {
             allocated_pages_ = 0;
         }
+        assert(static_cast<size_t>(next_free_id_) <= total_pages_);
     }
 
     size_t allocated_pages() const {
@@ -362,6 +366,7 @@ struct RadixNode : public std::enable_shared_from_this<RadixNode> {
 
     // Phase 3: Decoupled Memory Paging (kv_page_ids)
     std::vector<int32_t> kv_page_ids;
+    std::weak_ptr<PagedKVPool> kv_pool;
     size_t num_pages() const { return kv_page_ids.size(); }
     void set_page_ids(const std::vector<int32_t>& page_ids) { kv_page_ids = page_ids; }
     void append_page_id(int32_t page_id) { kv_page_ids.push_back(page_id); }
@@ -491,8 +496,8 @@ public:
         return insert_direct_device_to_host(tokens.data(), tokens.size(), prefix_len, stage_devices, states, R_ptrs, g, streams, safe_no_evict);
     }
 
-    void acquire(const std::shared_ptr<RadixNode>& node);
-    void release(const std::shared_ptr<RadixNode>& node);
+    void acquire(const std::shared_ptr<RadixNode>& node) const;
+    void release(const std::shared_ptr<RadixNode>& node) const;
 
     std::vector<int32_t> resolve_virtual_block_table(const std::shared_ptr<RadixNode>& node) const;
     std::shared_ptr<PagedKVPool> kv_pool() { return kv_pool_; }

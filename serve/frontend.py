@@ -926,6 +926,8 @@ class OutputParser:
                 safe = rest.find(PARAM_END) if end == -2 else len(rest) - self._hold(rest, (PARAM_END, FUNC_END, CALL_END, "<parameter="))
                 if safe > 0 and rest[safe - 1] == "\n":   # may be the trailing newline before </parameter>
                     safe -= 1
+                while safe > 0 and rest[safe - 1] == '\\':   # CRIT-API-03: Hold trailing backslash to avoid double-escaping
+                    safe -= 1
                 if safe > 0:
                     if getattr(self, "cur_pname", None) in self.seen_params:
                         self.seen_params[self.cur_pname].append(rest[:safe])
@@ -1070,19 +1072,14 @@ class OutputParser:
                 self.buf = self.buf[i + len(THINK_END):]
                 self.state, self.lead = "content", True
             elif self.state == "content":
-                if self.lead:                                   # newlines right after </think> or a call
-                    stripped = self.buf.lstrip("\n")
-                    if not stripped:
-                        self.buf = ""
-                        return out
-                    self.buf, self.lead = stripped, False
-                # Strip duplicate leading or orphan closing tool tags between calls
+                # Strip duplicate leading or orphan closing tool tags between calls or leading think closure
                 while True:
                     s_buf = self.buf.lstrip()
                     if s_buf.startswith(CALL_END):
                         self.buf = s_buf[len(CALL_END):].lstrip()
                     elif s_buf.startswith(THINK_END):
-                        self.buf = s_buf[len(THINK_END):].lstrip()
+                        self.buf = s_buf[len(THINK_END):]
+                        self.lead = True
                     elif s_buf.startswith(CALL_START):
                         after_probe = s_buf[len(CALL_START):].lstrip()
                         if after_probe.startswith(CALL_START):
@@ -1091,11 +1088,17 @@ class OutputParser:
                             break
                     else:
                         break
+                if self.lead:                                   # newlines right after </think> or a call
+                    stripped = self.buf.lstrip("\n")
+                    if not stripped:
+                        self.buf = ""
+                        return out
+                    self.buf, self.lead = stripped, False
                 i = self.buf.find(CALL_START)
                 if i < 0:
                     # Hold a partial tag AND the newlines before it: if a tool call follows, they are dropped,
                     # so emitting them early would make streamed and whole outputs differ.
-                    j = len(self.buf) - self._hold(self.buf, (CALL_START,))
+                    j = len(self.buf) - self._hold(self.buf, (CALL_START, THINK_END))
                     while j > 0 and self.buf[j - 1] == "\n":
                         j -= 1
                     if j > 0:
@@ -1157,6 +1160,8 @@ class OutputParser:
             self.buf = ""
             self._reset_scan()
             return out
+        if self.pending:
+            out += self._release(False)
         if self.buf:
             # Check if self.buf holds a complete tool call that merely missed </tool_call> at end of stream
             if self.state in ("rcall", "call"):

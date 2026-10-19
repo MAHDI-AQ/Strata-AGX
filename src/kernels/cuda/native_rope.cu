@@ -46,8 +46,8 @@ template <bool TAB>
 __global__ void apply(const float* x, float* out, int rows, int width,
                       int n_rot, float theta_scale, float freq_scale, float corr_low, float corr_high,
                       float ext_factor, float mscale, const int* positions, const int32_t* mtab, RopeTab rt) {
-    const int row = blockIdx.y;
-    const int pair = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.x;
+    const int pair = blockIdx.y * blockDim.x + threadIdx.x;
     if (row >= rows || pair >= width / 2) return;
     const size_t start = size_t(row) * width;
     if (pair >= n_rot / 2) {
@@ -134,7 +134,7 @@ void native_rope_apply(const float* x, float* out, int rows, int head_dim,
     const float theta_scale = powf((float) scaling.freq_base, -2.0f / n_rot);
     const RopeKernelArgs k = scaling.kernel_args(n_rot);   // none: the identity constants
     const RopeTab rt = rope_table_for(scaling);
-    const dim3 grid((head_dim / 2 + 127) / 128, rows);
+    const dim3 grid(rows, (head_dim / 2 + 127) / 128);
     if (rt.cos != nullptr)
         apply<true><<<grid, 128, 0, static_cast<cudaStream_t>(stream)>>>(x, out, rows, head_dim, n_rot, theta_scale,
             k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor, positions, mrope_table(), rt);

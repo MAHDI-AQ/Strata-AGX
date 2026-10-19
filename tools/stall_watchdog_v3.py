@@ -119,6 +119,7 @@ def main():
     last_gen = None
     last_pr = None
     last_pf = None
+    last_slots = None
     down_logged = 0.0
     no_channel_logged = 0.0
 
@@ -128,7 +129,7 @@ def main():
             if time.time() - down_logged > 300:
                 log(f"server unreachable ({m['_error'][:80]}) - not restarting (operator's call)")
                 down_logged = time.time()
-            last_gen, last_pf = None, None
+            last_gen, last_pf, last_slots = None, None, None
             last_progress = time.time()
             time.sleep(a.interval)
             continue
@@ -139,11 +140,18 @@ def main():
         active = live.get("active_requests") or 0
         pr = live.get("prompt_read")        # real prefill progress (chunk reads), multiplex-aware
         pf = prefill_progress()
-        if gen != last_gen or (pr is not None and pr != last_pr) or (pf is not None and pf != last_pf):
+        # CRIT-SCHED-05: Monitor per-slot progress across all concurrent slots
+        slots = m.get("slots") or live.get("slots") or []
+        slots_progress = tuple(
+            (s.get("id"), s.get("read") or s.get("prompt_read"), s.get("tokens") or s.get("generated"))
+            for s in slots
+        )
+        if (gen != last_gen or (pr is not None and pr != last_pr) or (pf is not None and pf != last_pf) or
+            (slots_progress and slots_progress != last_slots)):
             last_progress = time.time()
         if not active:
             last_progress = time.time()
-        last_gen, last_pr, last_pf = gen, pr, pf
+        last_gen, last_pr, last_pf, last_slots = gen, pr, pf, slots_progress
 
         stuck = time.time() - last_progress
         if active and stuck > a.stall_seconds:

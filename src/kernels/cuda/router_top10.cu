@@ -60,6 +60,8 @@
 //     version was O(k*n) with a serial `exp` inside.
 #include <unistd.h>
 #include "strata/kernels/router_top10.hpp"
+#include <stdexcept>
+#include <string>
 
 #include <cuda_runtime.h>
 
@@ -174,10 +176,18 @@ __global__ void router_top10_kernel(const float* __restrict__ logits, int n_toke
                 const int oi = __shfl_down_sync(0xffffffffu, ix, off);
                 if (ov > v || (ov == v && oi < ix)) { v = ov; ix = oi; }
             }
-            if (tid == 0 && ix < n_expert) {
+            if (tid == 0) {
+                if (ix >= n_expert) {
+                    ix = 0;
+                    for (int e = 0; e < n_expert; ++e) {
+                        if (!s_taken[e]) { ix = e; break; }
+                    }
+                    v = 0.0f;
+                }
+                const float safe_v = (v > 0.0f && !isnan(v) && !isinf(v)) ? v : 0.0f;
                 ids[(size_t) t * k + i] = ix;
-                weights[(size_t) t * k + i] = v;
-                s_taken[ix] = 1;
+                weights[(size_t) t * k + i] = safe_v;
+                if (ix < n_expert) s_taken[ix] = 1;
             }
         }
         __syncthreads();
@@ -287,9 +297,18 @@ __global__ void router_top10_fast_kernel(const float* __restrict__ logits, int n
             const int oi = __shfl_xor_sync(0xffffffffu, bi, off);
             if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
         }
-        if (bi >= n_expert) break;   // as router_top10_kernel: no rank i or later is written (every p left is NaN)
-        if ((bi & 31) == lane) live &= ~(1u << (bi >> 5));
-        if (lane == i) { my_w = bv; my_id = bi; }
+        if (bi >= n_expert) {
+            int fallback_id = 0;
+            for (int e = 0; e < n_expert; ++e) {
+                if ((live >> (e % 32)) & 1u) { fallback_id = e; live &= ~(1u << (e % 32)); break; }
+            }
+            bv = 0.0f;
+            bi = fallback_id;
+        } else {
+            if ((bi & 31) == lane) live &= ~(1u << (bi >> 5));
+        }
+        const float safe_bv = (bv > 0.0f && !isnan(bv) && !isinf(bv)) ? bv : 0.0f;
+        if (lane == i) { my_w = safe_bv; my_id = bi; }
         nsel = i + 1;
     }
     if (nsel == k) {
@@ -354,13 +373,13 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
             const cudaError_t e = cudaGetLastError();
             if (e != cudaSuccess) {
                 std::fprintf(stderr, "router_top10 launch: %s\n", cudaGetErrorString(e));
-                _exit(1);
+                throw std::runtime_error(std::string("router_top10 launch: ") + cudaGetErrorString(e));
             }
             if (stream == nullptr) {
                 const cudaError_t s = cudaDeviceSynchronize();
                 if (s != cudaSuccess) {
                     std::fprintf(stderr, "router_top10: %s\n", cudaGetErrorString(s));
-                    _exit(1);
+                    throw std::runtime_error(std::string("router_top10: ") + cudaGetErrorString(s));
                 }
             }
             return;
@@ -370,12 +389,12 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
     if (n_tokens <= 0 || n_expert <= 0 || k <= 0) return;
     if (k > 64) {
         std::fprintf(stderr, "router_top10: k %d exceeds the kernel's 64\n", k);
-        _exit(1);
+        throw std::invalid_argument("router_top10: k exceeds 64");
     }
     if (n_expert > RT_MAX_THREADS * 64) {
         std::fprintf(stderr, "router_top10: n_expert %d is past the kernel's %d\n", n_expert,
                      RT_MAX_THREADS * 64);
-        _exit(1);
+        throw std::invalid_argument("router_top10: n_expert is past max");
     }
     int threads = n_expert < RT_MAX_THREADS ? n_expert : RT_MAX_THREADS;
     threads = (threads + 31) & ~31;                  // at least one full warp, for the reductions
@@ -389,13 +408,13 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "router_top10 launch: %s\n", cudaGetErrorString(e));
-        _exit(1);
+        throw std::runtime_error(std::string("router_top10 launch: ") + cudaGetErrorString(e));
     }
     if (stream == nullptr) {
         const cudaError_t s = cudaDeviceSynchronize();
         if (s != cudaSuccess) {
             std::fprintf(stderr, "router_top10: %s\n", cudaGetErrorString(s));
-            _exit(1);
+            throw std::runtime_error(std::string("router_top10: ") + cudaGetErrorString(s));
         }
     }
 }

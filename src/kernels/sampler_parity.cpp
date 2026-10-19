@@ -207,6 +207,7 @@ int sampled_reference(const std::vector<float>& l, const std::vector<int>& hist,
             if (sel_logit[(size_t) i] < thresh) { n_keep = i; break; }
     }
     const float inv_t = p.temperature > 0.0f ? 1.0f / p.temperature : 0.0f;
+    if (p.temperature < 1e-4f || inv_t == 0.0f) return sel_ids[0];
     auto scaled = [&](int i) { return sel_logit[(size_t) i] * inv_t; };   // one penalties stage, before (#53)
     float smx = scaled(0);
     for (int i = 1; i < n_keep; ++i) smx = std::fmax(smx, scaled(i));

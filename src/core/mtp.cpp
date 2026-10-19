@@ -1037,13 +1037,64 @@ bool MtpDrafter::draft_begin(int T, const int32_t* tokens, int64_t p, int a, std
         L = std::max(1, std::min(std::min(max_t_ - 1, max_drafts_), alloc_share_));
         if (!capture_fused(N_ack, L, cp, err)) return false;
     } else if (!capture_round(N_ack, cp, err)) return false;
+    // Invalidate / zero ghost speculative KV entries on rollback
+    if (a < T - 1) {
+        const strata::kernels::QsaShapes s = shapes_of(*g_);
+        const int64_t rollback_pos = p + a + 1;
+        if (st_.kv_mode == 2 && st_.host.present()) {
+            kv_restore(rollback_pos);
+        }
+        for (int64_t c = rollback_pos; c < p + T; ++c) {
+            if (c >= 0 && c < st_.max_cells) {
+                const int64_t page_idx = c / s.page_size;
+                const int64_t slot_in_page = c % s.page_size;
+                const int64_t page = (st_.kv_mode == 2) ? (page_idx % st_.n_slots) : page_idx;
+                const int64_t q4_row_bytes = strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
+                for (int64_t h = 0; h < s.n_head_kv; ++h) {
+                    const size_t row_idx = (size_t)(page * s.n_head_kv + h) * s.page_size + slot_in_page;
+                    if (st_.kv_q4) {
+                        cudaMemsetAsync(st_.k_q4 + row_idx * q4_row_bytes, 0, q4_row_bytes, cs_);
+                        cudaMemsetAsync(st_.v_q4 + row_idx * q4_row_bytes, 0, q4_row_bytes, cs_);
+                    } else if (st_.kv_int8) {
+                        cudaMemsetAsync(st_.k_q + row_idx * s.head_dim, 0, s.head_dim, cs_);
+                        cudaMemsetAsync(st_.v_q + row_idx * s.head_dim, 0, s.head_dim, cs_);
+                        cudaMemsetAsync(st_.k_scale + row_idx * (s.head_dim / strata::kernels::KV_Q8_GROUP), 0,
+                                        (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs_);
+                        cudaMemsetAsync(st_.v_scale + row_idx * (s.head_dim / strata::kernels::KV_Q8_GROUP), 0,
+                                        (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs_);
+                    } else if (st_.k_pool) {
+                        cudaMemsetAsync(st_.k_pool + row_idx * s.head_dim, 0, s.head_dim * sizeof(uint16_t), cs_);
+                        cudaMemsetAsync(st_.v_pool + row_idx * s.head_dim, 0, s.head_dim * sizeof(uint16_t), cs_);
+                    }
+                }
+            }
+        }
+    }
+
     const Clock::time_point t0 = Clock::now();
     for (int t = 0; t < N_ack; ++t) {
         h_tok_[t] = tokens[t];
         put_row(t, p + t);
     }
+    // Roll back and zero unused/rejected step counters so attention never attends to ghost slots
+    for (int t = N_ack; t < T; ++t) {
+        h_tok_[t] = 0;
+        h_step_[t * 4 + 0] = -1;
+        h_step_[t * 4 + 1] = 0;
+        h_step_[t * 4 + 2] = 0;
+        h_step_[t * 4 + 3] = 0;
+        for (int64_t h = 0; h < g_->n_head; ++h) h_pos_[t * g_->n_head + h] = 0;
+    }
     put_row(2 * max_t_ - 1, coupled_draft_cell(p, a, 0));   // p + a: draft 0's cell
     for (int j = 1; fused && j < L; ++j) put_row(max_t_ + j - 1, coupled_draft_cell(p, a, j));   // p + a + j
+    for (int j = L; j < max_t_ - 1; ++j) {
+        const int row = max_t_ + j - 1;
+        h_step_[row * 4 + 0] = -1;
+        h_step_[row * 4 + 1] = 0;
+        h_step_[row * 4 + 2] = 0;
+        h_step_[row * 4 + 3] = 0;
+        for (int64_t h = 0; h < g_->n_head; ++h) h_pos_[row * g_->n_head + h] = 0;
+    }
     h_row_[0] = a;
     h_row_[1] = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);

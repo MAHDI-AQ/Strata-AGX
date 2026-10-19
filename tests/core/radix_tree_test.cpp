@@ -336,9 +336,32 @@ int main() {
         assert(vbt_branch.size() == 325);
         for (size_t i = 0; i < 250; ++i) assert(vbt_branch[i] == node0->kv_page_ids[i]);
         for (size_t i = 0; i < 50; ++i) assert(vbt_branch[250 + i] == split_parent->kv_page_ids[i]);
+        std::cout << "[PASS]" << std::endl;
+
+        // CRIT-MEM-01: Arbitrary non-page-aligned prefix split (match_edge % 16 != 0)
+        std::cout << "  [TEST] Phase 2: CRIT-MEM-01 Arbitrary non-page-aligned prefix split (match_edge % 16 != 0)... " << std::flush;
+        std::vector<int32_t> unaligned_tokens = branch_tokens;
+        unaligned_tokens.resize(4800 + 400 + 100);
+        // Split into delta edge (400 tokens) at offset 205 (205 % 16 == 13 != 0)
+        size_t unaligned_split_pos = 4800 + 205;
+        unaligned_tokens[unaligned_split_pos] = 888888;
+        for (size_t i = unaligned_split_pos + 1; i < unaligned_tokens.size(); ++i) {
+            unaligned_tokens[i] = 7000 + (i % 100);
+        }
+        auto unaligned_node = tree_paged.insert(unaligned_tokens.data(), unaligned_tokens.size(), unaligned_tokens.size(),
+                                                s_devs, s_states, s_R, geom, s_streams);
+        assert(unaligned_node != nullptr);
+        auto unaligned_split_parent = unaligned_node->parent.lock();
+        assert(unaligned_split_parent != nullptr);
+        assert(unaligned_split_parent->edge_tokens.size() == 205);
+        assert(unaligned_split_parent->kv_page_ids.size() == (205 + 15) / 16);
+        assert(unaligned_node->kv_page_ids.size() == (unaligned_node->edge_tokens.size() + 15) / 16);
+        auto vbt_unaligned = tree_paged.resolve_virtual_block_table(unaligned_node);
+        size_t expected_total_pages = 250 + 50 + ((205 + 15) / 16) + ((unaligned_node->edge_tokens.size() + 15) / 16);
+        assert(vbt_unaligned.size() == expected_total_pages); (void) expected_total_pages;
+        std::cout << "[PASS]" << std::endl;
 
         cudaStreamDestroy(strm);
-        std::cout << "[PASS]" << std::endl;
     }
 
     std::cout << "All RadixTree & HiCache L2 unit tests passed successfully!" << std::endl;

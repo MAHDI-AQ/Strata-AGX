@@ -64,6 +64,114 @@ bool gpu_alloc(void** p, size_t bytes, int reserve, std::string& err) {
     if (cudaMalloc(p, bytes) != cudaSuccess) { err = "concurrency: allocation failed"; return false; }
     return true;
 }
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+
+__attribute__((target("avx2,fma")))
+static inline __m256 exp256_ps(__m256 x) {
+    x = _mm256_max_ps(x, _mm256_set1_ps(-87.336544f));
+    x = _mm256_min_ps(x, _mm256_set1_ps(88.722839f));
+    const __m256 log2e = _mm256_set1_ps(1.44269504088896341f);
+    const __m256 x_log2e = _mm256_mul_ps(x, log2e);
+    const __m256 k_float = _mm256_round_ps(x_log2e, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    const __m256i k_int = _mm256_cvtps_epi32(k_float);
+    const __m256 c1 = _mm256_set1_ps(0.693359375f);
+    const __m256 c2 = _mm256_set1_ps(-2.12194440e-4f);
+    __m256 r = _mm256_fnmadd_ps(k_float, c1, x);
+    r = _mm256_fnmadd_ps(k_float, c2, r);
+    __m256 p = _mm256_set1_ps(1.9875691500E-4f);
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.3981999507E-3f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(8.3334519073E-3f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(4.1665795894E-2f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.6666665459E-1f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(5.0000001201E-1f));
+    p = _mm256_fmadd_ps(p, _mm256_mul_ps(r, r), r);
+    p = _mm256_add_ps(p, _mm256_set1_ps(1.0f));
+    const __m256i exp_bias = _mm256_set1_epi32(127);
+    const __m256i scale = _mm256_slli_epi32(_mm256_add_epi32(k_int, exp_bias), 23);
+    return _mm256_mul_ps(p, _mm256_castsi256_ps(scale));
+}
+
+__attribute__((target("avx2,fma")))
+static inline float avx2_max_logit(const float* l, int64_t n) {
+    __m256 max_v = _mm256_set1_ps(-1e30f);
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        max_v = _mm256_max_ps(max_v, _mm256_loadu_ps(l + i));
+    }
+    alignas(32) float tmp[8];
+    _mm256_store_ps(tmp, max_v);
+    float m = tmp[0];
+    for (int j = 1; j < 8; ++j) if (tmp[j] > m) m = tmp[j];
+    for (; i < n; ++i) if (l[i] > m) m = l[i];
+    return m;
+}
+
+__attribute__((target("avx2,fma")))
+static inline int32_t sample_residual_avx2(float* logits, int64_t nv, float inv_temp,
+                                           int32_t draft_tok, float q, float r, int32_t fallback_tok) {
+    if (nv <= 0) return fallback_tok;
+    const float max_l = avx2_max_logit(logits, nv);
+    const __m256 v_max = _mm256_set1_ps(max_l);
+    const __m256 v_inv_t = _mm256_set1_ps(inv_temp);
+    __m256 v_sum_exp = _mm256_setzero_ps();
+
+    int64_t i = 0;
+    for (; i + 8 <= nv; i += 8) {
+        __m256 l = _mm256_loadu_ps(logits + i);
+        __m256 scaled = _mm256_mul_ps(_mm256_sub_ps(l, v_max), v_inv_t);
+        __m256 e = exp256_ps(scaled);
+        _mm256_storeu_ps(logits + i, e);
+        v_sum_exp = _mm256_add_ps(v_sum_exp, e);
+    }
+    alignas(32) float tmp[8];
+    _mm256_store_ps(tmp, v_sum_exp);
+    float sum_exp = tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
+    for (; i < nv; ++i) {
+        float e = std::exp((logits[i] - max_l) * inv_temp);
+        logits[i] = e;
+        sum_exp += e;
+    }
+    const float inv_sum = sum_exp > 0.0f ? (1.0f / sum_exp) : 0.0f;
+    const __m256 v_inv_sum = _mm256_set1_ps(inv_sum);
+    const __m256 v_zero = _mm256_setzero_ps();
+    __m256 v_sum_res = _mm256_setzero_ps();
+
+    i = 0;
+    for (; i + 8 <= nv; i += 8) {
+        __m256 e = _mm256_loadu_ps(logits + i);
+        __m256 p_y = _mm256_mul_ps(e, v_inv_sum);
+        if (draft_tok >= i && draft_tok < i + 8) {
+            alignas(32) float p_arr[8];
+            _mm256_store_ps(p_arr, p_y);
+            p_arr[draft_tok - i] = std::max(0.0f, p_arr[draft_tok - i] - q);
+            p_y = _mm256_load_ps(p_arr);
+        }
+        p_y = _mm256_max_ps(v_zero, p_y);
+        _mm256_storeu_ps(logits + i, p_y);
+        v_sum_res = _mm256_add_ps(v_sum_res, p_y);
+    }
+    _mm256_store_ps(tmp, v_sum_res);
+    float sum_res = tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
+    for (; i < nv; ++i) {
+        float p_y = logits[i] * inv_sum;
+        float q_y = (i == (int64_t) draft_tok) ? q : 0.0f;
+        float diff = std::max(0.0f, p_y - q_y);
+        logits[i] = diff;
+        sum_res += diff;
+    }
+
+    if (sum_res <= 0.0f) return fallback_tok;
+    const float thresh = r * sum_res;
+    float cdf = 0.0f;
+    for (int64_t idx = 0; idx < nv; ++idx) {
+        cdf += logits[idx];
+        if (cdf >= thresh) return (int32_t) idx;
+    }
+    return fallback_tok;
+}
+#endif
+
 struct Input {
     std::mutex mutex;
     std::condition_variable cv;
@@ -80,6 +188,7 @@ struct Request {
     std::string sve_path;
     std::vector<float> img_rows;
     std::vector<const float*> row_ptr;
+    Clock::time_point arrival{Clock::now()};
 };
 bool parse_request(const std::string& line, const ConcurrentConfig& config, const core::ModelGeometry& g, int64_t vocab, Request& r, std::string& err) {
     std::istringstream input(line);
@@ -320,7 +429,8 @@ struct ConcurrentServe::Impl {
     // loop (the loop returns 1 exactly where the inline call used to).
     std::mutex pump_mutex;
     std::condition_variable pump_cv;
-    bool pump_paused = false, pump_busy = false;
+    bool pump_paused = false;
+    std::atomic<bool> pump_busy{false};
     std::atomic<bool> pump_failed{false};
     std::string pump_err;
     std::atomic<size_t> prompt_rotation{0};   // thread-safe: accessed by pump and admission loops
@@ -966,12 +1076,12 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 }
                 if (pick == m.slots.size()) continue;   // raced away (cancel/exit); the wait re-checks
                 m.prompt_rotation.store((pick + 1) % m.slots.size(), std::memory_order_relaxed);
-                m.pump_busy = true;
+                m.pump_busy.store(true, std::memory_order_release);
                 lock.unlock();
                 std::string chunk_err;
                 const bool ok = run_chunk(pick, chunk_err);
                 lock.lock();
-                m.pump_busy = false;
+                m.pump_busy.store(false, std::memory_order_release);
                 if (!ok) {
                     m.pump_err = chunk_err;
                     m.pump_failed.store(true, std::memory_order_release);
@@ -998,7 +1108,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         std::unique_lock<std::mutex> lock(m.pump_mutex);
         m.pump_paused = true;
         m.pump_cv.notify_all();
-        m.pump_cv.wait(lock, [&] { return !m.pump_busy || m.pump_failed.load(std::memory_order_acquire); });
+        m.pump_cv.wait(lock, [&] { return !m.pump_busy.load(std::memory_order_acquire) || m.pump_failed.load(std::memory_order_acquire); });
         if (m.pump_failed.load(std::memory_order_acquire)) { err = m.pump_err; return false; }
         return chain_drain_all();
     };
@@ -1383,14 +1493,10 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                     // Greedy mode: linear prefix match
                     while (accepted < s.count - 1 && s.window[accepted + 1] == s.output[accepted]) ++accepted;
                 } else {
-                    // Temperature > 0: Leviathan / vLLM speculative residual rejection sampling
+                    // Temperature > 0: Leviathan / vLLM speculative residual rejection sampling (Algorithm 1)
                     for (int t = 0; t < s.count - 1; ++t) {
                         const int32_t draft_tok = s.window[t + 1];
                         const int32_t target_tok = s.output[t];
-                        if (draft_tok == target_tok) {
-                            accepted = t + 1;
-                            continue;
-                        }
                         const float q = (s.probability[t] > 0.0f) ? s.probability[t] : 1.0f;
                         const float p = (s.stages[0].verify.target_draft_prob(t) > 0.0f)
                                             ? s.stages[0].verify.target_draft_prob(t)
@@ -1409,11 +1515,16 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                             if (nv > 0) {
                                 std::vector<float> logits((size_t) nv);
                                 if (s.stages[0].verify.copy_logits(t, logits.data())) {
+                                    draw_state = draw_state * 6364136223846793005ULL + 1442695040888963407ULL;
+                                    const float r = (float)((draw_state >> 32) & 0xFFFFFF) / 16777216.0f;
+                                    const float inv_temp = 1.0f / s.request.sampling.temperature;
+#if defined(__x86_64__) || defined(_M_X64)
+                                    s.output[t] = sample_residual_avx2(logits.data(), nv, inv_temp, draft_tok, q, r, target_tok);
+#else
                                     float max_l = -1e30f;
                                     for (int64_t i = 0; i < nv; ++i) {
                                         if (logits[i] > max_l) max_l = logits[i];
                                     }
-                                    const float inv_temp = 1.0f / s.request.sampling.temperature;
                                     float sum_exp = 0.0f;
                                     for (int64_t i = 0; i < nv; ++i) {
                                         logits[i] = std::exp((logits[i] - max_l) * inv_temp);
@@ -1429,8 +1540,6 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                                         sum_res += diff;
                                     }
                                     if (sum_res > 0.0f) {
-                                        draw_state = draw_state * 6364136223846793005ULL + 1442695040888963407ULL;
-                                        const float r = (float)((draw_state >> 32) & 0xFFFFFF) / 16777216.0f;
                                         const float thresh = r * sum_res;
                                         float cdf = 0.0f;
                                         int32_t rep_tok = target_tok;
@@ -1443,6 +1552,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                                         }
                                         s.output[t] = rep_tok;
                                     }
+#endif
                                 }
                             }
                             break;
@@ -1857,18 +1967,39 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 continue;
             }
             if (line.rfind("CSTOP ", 0) == 0) {
-                // Task 1.2: Thread-Safe Cancellation with pump synchronization
+                // CRIT-SCHED-03: Thread-Safe Cancellation with pump synchronization
                 uint64_t id = 0; std::istringstream(line.substr(6)) >> id;
-                if (!pump_fence()) return 1;
-                for (auto& s : m.slots) {
-                    if (s->active.load() && s->request.id == id) {
-                        finish(*s, "cancel");
+                bool found_pending = false;
+                for (auto p = pending.begin(); p != pending.end();) {
+                    if (p->id == id) {
+                        error(id, "cancelled before admission");
+                        live.erase(id);
+                        p = pending.erase(p);
+                        found_pending = true;
+                    } else {
+                        ++p;
                     }
                 }
-                pump_resume();
-                for (auto p = pending.begin(); p != pending.end();) {
-                    if (p->id == id) { error(id, "cancelled before admission"); live.erase(id); p = pending.erase(p); }
-                    else ++p;
+                if (found_pending) continue;
+
+                Impl::Slot* target_slot = nullptr;
+                for (auto& s : m.slots) {
+                    if (s->active.load() && s->request.id == id) {
+                        target_slot = s.get();
+                        break;
+                    }
+                }
+                if (target_slot != nullptr) {
+                    const bool prefill_active = (target_slot->read.load(std::memory_order_acquire) <
+                                                 target_slot->position.load(std::memory_order_relaxed)) &&
+                                                m.pump_busy.load(std::memory_order_acquire);
+                    if (prefill_active) {
+                        if (!pump_fence()) return 1;
+                    }
+                    finish(*target_slot, "cancel");
+                    if (prefill_active) {
+                        pump_resume();
+                    }
                 }
                 continue;
             }
@@ -1885,8 +2016,19 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         core::progress().busy.store(!live.empty());
         // Fence: session_zero and its stream sync run on the stage prompt streams the pump shares.  Only
         // when a request will actually be admitted - with every slot busy there is nothing to reset.
-        const bool admitting = !pending.empty() &&
-            std::any_of(m.slots.begin(), m.slots.end(), [](const auto& ptr) { return !ptr->active.load(); });
+        const bool decode_ready = std::any_of(m.slots.begin(), m.slots.end(), [](const auto& ptr) {
+            return ptr->active.load(std::memory_order_relaxed) &&
+                   ptr->read.load(std::memory_order_acquire) >= ptr->position.load(std::memory_order_relaxed);
+        });
+        const bool has_idle_slot = std::any_of(m.slots.begin(), m.slots.end(), [](const auto& ptr) {
+            return !ptr->active.load(std::memory_order_relaxed);
+        });
+        // CRIT-SCHED-03: Defer admission fence if pump is busy and active decode slots are ready,
+        // preventing asymmetric decode starvation on Slot 1 during long prefill chunks on Slot 0.
+        bool admitting = !pending.empty() && has_idle_slot;
+        if (admitting && m.pump_busy.load(std::memory_order_acquire) && decode_ready) {
+            admitting = false;
+        }
         if (admitting && !pump_fence()) return 1;
         // S26f3: flush deferred radix captures strictly before every admission (the design intent;
         // continuous traffic previously never reached the loop's input-side flush). Safe: the pump
@@ -1915,8 +2057,11 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         constexpr size_t kAdmissionScanQueue = 32;   // the pending deque's own cap (see the overflow check above; M2 raise 16->32 for burst headroom)
         const auto admit_start = retain ? Clock::now() : Clock::time_point{};
         std::vector<Impl::Slot*> admitted_this_round;
+        if (admitting) {
+        // CRIT-SCHED-04: Eliminate D1 admission priority inversion via arrival timestamp and 5.0s wait ceiling
+        const bool fifo_starvation = !pending.empty() && (Clock::now() - pending[0].arrival > std::chrono::milliseconds(5000));
         // Pass 0: Intra-Slot VRAM Warm Snapshot Retention (0ms TTFT, zero PCIe transfer, zero session_zero wipe)
-        while (retain && !pending.empty()) {
+        while (!fifo_starvation && retain && !pending.empty()) {
             Impl::Slot* pick = nullptr;
             size_t pick_q = 0;
             int64_t best = 0;
@@ -1960,7 +2105,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         }
 
         // SPRINT 4: Dynamic RadixTree prefix fork pass
-        while (retain && !pending.empty()) {
+        while (!fifo_starvation && retain && !pending.empty()) {
             size_t pick_q = 0;
             int64_t best = 0;
             std::shared_ptr<core::RadixNode> best_node = nullptr;
@@ -2016,7 +2161,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         }
 
         // SPRINT 1: Cross-slot prefix fork pass.
-        while (retain && !pending.empty()) {
+        while (!fifo_starvation && retain && !pending.empty()) {
             Impl::Slot* pick_parent = nullptr;
             size_t pick_q = 0;
             int64_t best = 0;
@@ -2152,8 +2297,8 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 ++q;
             }
         }
-
         pump_resume();   // new prefillable slots are announced here (a no-op when the pump is off)
+        }
         core::progress().busy.store(!live.empty());
         if (!pump.joinable()) {
             // A/B arm (STRATA_PREFILL_PUMP=0): the pre-change inline path - at most ONE bounded prompt chunk

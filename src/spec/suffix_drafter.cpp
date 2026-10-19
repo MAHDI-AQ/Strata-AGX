@@ -16,7 +16,8 @@ uint64_t mix(uint64_t x) {
 }  // namespace
 
 SuffixDrafter::SuffixDrafter(int min_match, int max_match, size_t capacity_tokens)
-    : min_match_(std::max(3, min_match)), max_match_(std::max(min_match, max_match)) {
+    : min_match_(std::max(3, min_match)), max_match_(std::max(min_match, max_match)),
+      eos_tokens_({151643, 151645}) {
     size_t cap = 1;
     while (cap < capacity_tokens * 2) cap <<= 1;          // load factor <= 0.5 at the nominal capacity
     table_.assign(cap, Slot{});
@@ -36,7 +37,7 @@ uint64_t SuffixDrafter::key_at(size_t end) const {
 }
 
 SuffixDrafter::Slot* SuffixDrafter::find_slot(uint64_t key, bool insert) {
-    for (size_t i = key & mask_, probes = 0; probes < 64 && probes <= mask_; i = (i + 1) & mask_, ++probes) {
+    for (size_t i = key & mask_, probes = 0; probes < 256 && probes <= mask_; i = (i + 1) & mask_, ++probes) {
         Slot& s = table_[i];
         if (s.key == key) return &s;
         if (s.key == 0) {
@@ -84,8 +85,8 @@ int SuffixDrafter::propose(int max_k, int32_t* out) {
     for (size_t q = best_end + 1; q <= cur && k < max_k; ++q) {
         int32_t tok = hist_[q];
         out[k++] = tok;
-        // Task 3.3: Terminate draft proposals immediately on EOS to prevent garbage verification
-        if (tok == 151643 || tok == 151645) { // <|endoftext|>, <|im_end|>
+        // Terminate draft proposals immediately on EOS to prevent garbage verification
+        if (is_eos(tok)) {
             break;
         }
     }

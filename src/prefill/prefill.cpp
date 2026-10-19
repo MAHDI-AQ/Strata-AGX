@@ -2284,7 +2284,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     }
                     bool p2p_done = false;
                     if (next_->impl_->device >= 0 && next_->impl_->R != nullptr) {
-                        if (cudaMemcpyPeerAsync(next_->impl_->R + (size_t) u0 * D, next_->impl_->device,
+                        if (cudaMemcpyPeerAsync(next_->impl_->R, next_->impl_->device,
                                                 m.R + (size_t) u0 * D, m.device,
                                                 (size_t) uT * D * sizeof(float), copy_stream) == cudaSuccess) {
                             p2p_done = true;

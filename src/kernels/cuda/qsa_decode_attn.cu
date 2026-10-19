@@ -10,6 +10,8 @@
 #include <cfloat>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
+#include <string>
 
 namespace strata::kernels {
 namespace {
@@ -113,10 +115,15 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __rest
         long long r = -1;
         if (t < n_here) {
             const int cell = ids[c0 + t];
-            const long long page = (long long) p.page_table[cell / page_size];
-            // a block the KV streaming could not make resident keeps page -1 (ctl[3]); its cells are masked
-            // (score -FLT_MAX, weight 0) instead of being read from before the pool.
-            if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+            if (cell >= 0) {
+                const int page_idx = cell / page_size;
+                if (page_idx >= 0 && page_idx < 65536) {
+                    const long long page = (long long) p.page_table[page_idx];
+                    // a block the KV streaming could not make resident keeps page -1 (ctl[3]); its cells are masked
+                    // (score -FLT_MAX, weight 0) instead of being read from before the pool.
+                    if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+                }
+            }
         }
         srow[t] = r;
     }
@@ -255,7 +262,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !steps ||
         !pools.page_table || n_q > 65535) {
         std::fprintf(stderr, "qsa_decode_attn_batch: unsupported geometry or missing buffers\n");
-        _exit(1);
+        throw std::invalid_argument("qsa_decode_attn_batch: unsupported geometry or missing buffers");
     }
     const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
                         : (pools.k_q != nullptr ? 1 : 0));
@@ -285,7 +292,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "qsa_decode_attn_batch: %s\n", cudaGetErrorString(e));
-        _exit(1);
+        throw std::runtime_error(std::string("qsa_decode_attn_batch: ") + cudaGetErrorString(e));
     }
 }
 
@@ -301,7 +308,7 @@ void qsa_decode_attn_batch_fused_gate(const float* q, const QsaAttnPools& pools,
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !steps ||
         !pools.page_table || !q_full || !output_attn32 || n_q > 65535) {
         std::fprintf(stderr, "qsa_decode_attn_batch_fused_gate: unsupported geometry or missing buffers\n");
-        _exit(1);
+        throw std::invalid_argument("qsa_decode_attn_batch_fused_gate: unsupported geometry or missing buffers");
     }
     const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
                         : (pools.k_q != nullptr ? 1 : 0));
@@ -331,7 +338,7 @@ void qsa_decode_attn_batch_fused_gate(const float* q, const QsaAttnPools& pools,
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "qsa_decode_attn_batch_fused_gate: %s\n", cudaGetErrorString(e));
-        _exit(1);
+        throw std::runtime_error(std::string("qsa_decode_attn_batch_fused_gate: ") + cudaGetErrorString(e));
     }
 }
 
@@ -340,7 +347,7 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !step ||
         !pools.page_table) {
         std::fprintf(stderr, "qsa_decode_attn: unsupported geometry or missing buffers\n");
-        _exit(1);
+        throw std::invalid_argument("qsa_decode_attn: unsupported geometry or missing buffers");
     }
     const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
                         : (pools.k_q != nullptr ? 1 : 0));
@@ -348,7 +355,7 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
                      : (kv_mode == 2 ? (!pools.v_q4) : (kv_mode == 1 ? (!pools.v_q || !pools.k_scale || !pools.v_scale)
                                                                      : (!pools.k_pool || !pools.v_pool)))) {
         std::fprintf(stderr, "qsa_decode_attn: incomplete KV pools\n");
-        _exit(1);
+        throw std::invalid_argument("qsa_decode_attn: incomplete KV pools");
     }
     const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
     float* part_acc = scratch;
@@ -373,7 +380,7 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "qsa_decode_attn: %s\n", cudaGetErrorString(e));
-        _exit(1);
+        throw std::runtime_error(std::string("qsa_decode_attn: ") + cudaGetErrorString(e));
     }
 }
 

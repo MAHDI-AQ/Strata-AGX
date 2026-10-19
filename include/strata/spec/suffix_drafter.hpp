@@ -34,6 +34,14 @@ public:
     int last_match() const { return last_match_; }
     size_t size() const { return hist_.size(); }
 
+    /// Dynamic EOS tokens configuration to terminate draft proposals early.
+    void set_eos_tokens(const std::vector<int32_t>& eos = {151643, 151645, 198, 2}) { eos_tokens_ = eos; }
+    void add_eos_token(int32_t tok) { eos_tokens_.push_back(tok); }
+    bool is_eos(int32_t tok) const {
+        for (int32_t e : eos_tokens_) if (e == tok) return true;
+        return false;
+    }
+
 private:
     struct Slot {
         uint64_t key = 0;             // trigram hash + 1 (0 = empty)
@@ -48,6 +56,7 @@ private:
     std::vector<Slot> table_;
     size_t mask_ = 0;
     int last_match_ = 0;
+    std::vector<int32_t> eos_tokens_;
 };
 
 }  // namespace strata::spec
