@@ -26,6 +26,11 @@ std::string NVMeStorageTier::detect_default_storage_path() {
         return std::string(env_path);
     }
     std::error_code ec;
+    for (const auto& p : {"/srv/lab/cache/strata/nvme_radix", "/srv/ai-temp/cache/strata_nvme_radix", "/mnt/nvme/strata_radix"}) {
+        if (fs::exists(p, ec) || fs::create_directories(p, ec)) {
+            if (!ec) return p;
+        }
+    }
     const char* home = std::getenv("HOME");
     if (home) {
         std::string home_path = std::string(home) + "/.cache/strata/nvme_radix";
@@ -82,11 +87,14 @@ bool NVMeStorageTier::init() {
         direct_io_supported_ = false;
     }
 
+    // Initialize io_uring engine if supported
+    io_uring_ = std::make_unique<IOUringStorage>(64);
+
     return true;
 }
 
 void NVMeStorageTier::shutdown() {
-    // Retain directory on graceful shutdown
+    io_uring_.reset();
 }
 
 std::string NVMeStorageTier::node_file_path(int64_t node_id) const {
@@ -276,16 +284,28 @@ bool NVMeStorageTier::write_node_direct(int64_t node_id, const void* data, size_
     ::fallocate(fd, 0, 0, static_cast<off_t>(write_bytes));
 #endif
 
-    size_t total_written = 0;
-    const uint8_t* p = static_cast<const uint8_t*>(write_ptr);
-    while (total_written < write_bytes) {
-        ssize_t rc = ::write(fd, p + total_written, write_bytes - total_written);
-        if (rc <= 0) {
-            if (rc < 0 && errno == EINTR) continue;
-            record_failure(errno);
-            return false;
+    bool io_done = false;
+    if (io_uring_ && io_uring_->is_uring_available() && direct_io_supported_ &&
+        (reinterpret_cast<uintptr_t>(write_ptr) % kDirectBlockAlignment == 0) &&
+        (write_bytes % kDirectBlockAlignment == 0)) {
+        int uring_rc = io_uring_->submit_write_batch(fd, write_ptr, write_bytes, 0, 1048576);
+        if (uring_rc == 0) {
+            io_done = true;
         }
-        total_written += rc;
+    }
+
+    if (!io_done) {
+        size_t total_written = 0;
+        const uint8_t* p = static_cast<const uint8_t*>(write_ptr);
+        while (total_written < write_bytes) {
+            ssize_t rc = ::write(fd, p + total_written, write_bytes - total_written);
+            if (rc <= 0) {
+                if (rc < 0 && errno == EINTR) continue;
+                record_failure(errno);
+                return false;
+            }
+            total_written += rc;
+        }
     }
 
     // Force commit to disk to eliminate volatile NAND cache drops
@@ -347,16 +367,29 @@ bool NVMeStorageTier::read_node_direct(int64_t node_id, void* out_data, size_t b
     }
 
     size_t total_read = 0;
-    uint8_t* p = static_cast<uint8_t*>(read_ptr);
-    while (total_read < read_bytes) {
-        ssize_t rc = ::read(fd, p + total_read, read_bytes - total_read);
-        if (rc < 0) {
-            if (errno == EINTR) continue;
-            ::close(fd);
-            return false;
+    bool io_done = false;
+    if (io_uring_ && io_uring_->is_uring_available() && direct_io_supported_ &&
+        (reinterpret_cast<uintptr_t>(read_ptr) % kDirectBlockAlignment == 0) &&
+        (read_bytes % kDirectBlockAlignment == 0)) {
+        int uring_rc = io_uring_->submit_read_batch(fd, read_ptr, read_bytes, 0, 1048576);
+        if (uring_rc == 0) {
+            io_done = true;
+            total_read = read_bytes;
         }
-        if (rc == 0) break; // EOF
-        total_read += rc;
+    }
+
+    if (!io_done) {
+        uint8_t* p = static_cast<uint8_t*>(read_ptr);
+        while (total_read < read_bytes) {
+            ssize_t rc = ::read(fd, p + total_read, read_bytes - total_read);
+            if (rc < 0) {
+                if (errno == EINTR) continue;
+                ::close(fd);
+                return false;
+            }
+            if (rc == 0) break; // EOF
+            total_read += rc;
+        }
     }
 
     ::close(fd);
@@ -512,9 +545,9 @@ double NVMeStorageTier::benchmark_write_throughput_mb_s(size_t total_bytes, size
     chunk_bytes = AlignedBuffer::align_up(chunk_bytes, kDirectBlockAlignment);
     total_bytes = AlignedBuffer::align_up(total_bytes, chunk_bytes);
 
-    AlignedBuffer buf(chunk_bytes);
+    AlignedBuffer buf(total_bytes);
     if (!buf.data()) return 0.0;
-    std::memset(buf.data(), 0x5A, chunk_bytes);
+    std::memset(buf.data(), 0x5A, total_bytes);
 
     std::string bench_file = base_path_ + "/.bench_write.bin";
     int flags = O_WRONLY | O_CREAT | O_TRUNC;
@@ -523,12 +556,22 @@ double NVMeStorageTier::benchmark_write_throughput_mb_s(size_t total_bytes, size
     int fd = ::open(bench_file.c_str(), flags, 0644);
     if (fd < 0) return 0.0;
 
+#if defined(__linux__)
+    ::fallocate(fd, 0, 0, static_cast<off_t>(total_bytes));
+#endif
+
     auto t0 = std::chrono::high_resolution_clock::now();
     size_t written = 0;
-    while (written < total_bytes) {
-        ssize_t rc = ::write(fd, buf.data(), chunk_bytes);
-        if (rc <= 0) break;
-        written += rc;
+    if (io_uring_ && io_uring_->is_uring_available() && direct_io_supported_) {
+        int rc = io_uring_->submit_write_batch(fd, buf.data(), total_bytes, 0, chunk_bytes);
+        if (rc == 0) written = total_bytes;
+    }
+    if (written == 0) {
+        while (written < total_bytes) {
+            ssize_t rc = ::write(fd, buf.data() + written, chunk_bytes);
+            if (rc <= 0) break;
+            written += rc;
+        }
     }
     ::close(fd);
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -543,22 +586,31 @@ double NVMeStorageTier::benchmark_read_throughput_mb_s(size_t total_bytes, size_
     chunk_bytes = AlignedBuffer::align_up(chunk_bytes, kDirectBlockAlignment);
     total_bytes = AlignedBuffer::align_up(total_bytes, chunk_bytes);
 
-    AlignedBuffer wbuf(chunk_bytes);
+    AlignedBuffer wbuf(total_bytes);
     if (!wbuf.data()) return 0.0;
-    std::memset(wbuf.data(), 0x3C, chunk_bytes);
+    std::memset(wbuf.data(), 0x3C, total_bytes);
 
     std::string bench_file = base_path_ + "/.bench_read.bin";
     int wfd = ::open(bench_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC | (direct_io_supported_ ? O_DIRECT : 0), 0644);
     if (wfd < 0) return 0.0;
-    size_t prep = 0;
-    while (prep < total_bytes) {
-        ssize_t rc = ::write(wfd, wbuf.data(), chunk_bytes);
-        if (rc <= 0) break;
-        prep += rc;
+
+#if defined(__linux__)
+    ::fallocate(wfd, 0, 0, static_cast<off_t>(total_bytes));
+#endif
+
+    if (io_uring_ && io_uring_->is_uring_available() && direct_io_supported_) {
+        io_uring_->submit_write_batch(wfd, wbuf.data(), total_bytes, 0, chunk_bytes);
+    } else {
+        size_t prep = 0;
+        while (prep < total_bytes) {
+            ssize_t rc = ::write(wfd, wbuf.data() + prep, chunk_bytes);
+            if (rc <= 0) break;
+            prep += rc;
+        }
     }
     ::close(wfd);
 
-    AlignedBuffer rbuf(chunk_bytes);
+    AlignedBuffer rbuf(total_bytes);
     if (!rbuf.data()) {
         ::unlink(bench_file.c_str());
         return 0.0;
@@ -571,10 +623,16 @@ double NVMeStorageTier::benchmark_read_throughput_mb_s(size_t total_bytes, size_
 
     auto t0 = std::chrono::high_resolution_clock::now();
     size_t nread = 0;
-    while (nread < total_bytes) {
-        ssize_t rc = ::read(rfd, rbuf.data(), chunk_bytes);
-        if (rc <= 0) break;
-        nread += rc;
+    if (io_uring_ && io_uring_->is_uring_available() && direct_io_supported_) {
+        int rc = io_uring_->submit_read_batch(rfd, rbuf.data(), total_bytes, 0, chunk_bytes);
+        if (rc == 0) nread = total_bytes;
+    }
+    if (nread == 0) {
+        while (nread < total_bytes) {
+            ssize_t rc = ::read(rfd, rbuf.data() + nread, chunk_bytes);
+            if (rc <= 0) break;
+            nread += rc;
+        }
     }
     auto t1 = std::chrono::high_resolution_clock::now();
     ::close(rfd);
@@ -591,26 +649,81 @@ double NVMeStorageTier::benchmark_read_throughput_mb_s(size_t total_bytes, size_
 // --- Phase 3: IOUringStorage DirectStorage Implementation ---
 namespace strata::core {
 
-IOUringStorage::IOUringStorage(size_t queue_depth) : queue_depth_(queue_depth) {
+bool IOUringStorage::init_rings() {
 #if STRATA_HAS_IO_URING
     struct io_uring_params params;
     std::memset(&params, 0, sizeof(params));
     ring_fd_ = syscall(__NR_io_uring_setup, static_cast<unsigned>(queue_depth_), &params);
-    if (ring_fd_ >= 0) {
-        uring_initialized_.store(true, std::memory_order_release);
-    } else {
-        uring_initialized_.store(false, std::memory_order_release);
+    if (ring_fd_ < 0) {
+        return false;
     }
+
+    sq_ring_sz_ = params.sq_off.array + params.sq_entries * sizeof(__u32);
+    cq_ring_sz_ = params.cq_off.cqes + params.cq_entries * sizeof(struct io_uring_cqe);
+    sqes_sz_ = params.sq_entries * sizeof(struct io_uring_sqe);
+
+    sq_ring_ = static_cast<uint8_t*>(mmap(0, sq_ring_sz_, PROT_READ | PROT_WRITE,
+                                          MAP_SHARED | MAP_POPULATE, ring_fd_, IORING_OFF_SQ_RING));
+    cq_ring_ = static_cast<uint8_t*>(mmap(0, cq_ring_sz_, PROT_READ | PROT_WRITE,
+                                          MAP_SHARED | MAP_POPULATE, ring_fd_, IORING_OFF_CQ_RING));
+    sqes_ = static_cast<struct io_uring_sqe*>(mmap(0, sqes_sz_, PROT_READ | PROT_WRITE,
+                                                   MAP_SHARED | MAP_POPULATE, ring_fd_, IORING_OFF_SQES));
+
+    if (sq_ring_ == MAP_FAILED || cq_ring_ == MAP_FAILED || sqes_ == MAP_FAILED) {
+        cleanup_rings();
+        return false;
+    }
+
+    sq_head_ = reinterpret_cast<uint32_t*>(sq_ring_ + params.sq_off.head);
+    sq_tail_ = reinterpret_cast<uint32_t*>(sq_ring_ + params.sq_off.tail);
+    sq_mask_ = reinterpret_cast<uint32_t*>(sq_ring_ + params.sq_off.ring_mask);
+    sq_array_ = reinterpret_cast<uint32_t*>(sq_ring_ + params.sq_off.array);
+
+    cq_head_ = reinterpret_cast<uint32_t*>(cq_ring_ + params.cq_off.head);
+    cq_tail_ = reinterpret_cast<uint32_t*>(cq_ring_ + params.cq_off.tail);
+    cq_mask_ = reinterpret_cast<uint32_t*>(cq_ring_ + params.cq_off.ring_mask);
+    cqes_ = reinterpret_cast<void*>(cq_ring_ + params.cq_off.cqes);
+
+    return true;
 #else
-    uring_initialized_.store(false, std::memory_order_release);
+    return false;
 #endif
 }
 
-IOUringStorage::~IOUringStorage() {
+void IOUringStorage::cleanup_rings() {
+#if STRATA_HAS_IO_URING
+    if (sqes_ && sqes_ != MAP_FAILED) {
+        munmap(sqes_, sqes_sz_);
+        sqes_ = nullptr;
+    }
+    if (cq_ring_ && cq_ring_ != MAP_FAILED) {
+        munmap(cq_ring_, cq_ring_sz_);
+        cq_ring_ = nullptr;
+    }
+    if (sq_ring_ && sq_ring_ != MAP_FAILED) {
+        munmap(sq_ring_, sq_ring_sz_);
+        sq_ring_ = nullptr;
+    }
     if (ring_fd_ >= 0) {
         ::close(ring_fd_);
         ring_fd_ = -1;
     }
+    sq_head_ = sq_tail_ = sq_mask_ = sq_array_ = nullptr;
+    cq_head_ = cq_tail_ = cq_mask_ = nullptr;
+    cqes_ = nullptr;
+#endif
+}
+
+IOUringStorage::IOUringStorage(size_t queue_depth) : queue_depth_(queue_depth) {
+    if (init_rings()) {
+        uring_initialized_.store(true, std::memory_order_release);
+    } else {
+        uring_initialized_.store(false, std::memory_order_release);
+    }
+}
+
+IOUringStorage::~IOUringStorage() {
+    cleanup_rings();
 }
 
 int IOUringStorage::sync_direct_io(int fd, void* buf, size_t bytes, off_t offset, bool is_write) {
@@ -633,12 +746,98 @@ int IOUringStorage::sync_direct_io(int fd, void* buf, size_t bytes, off_t offset
     return total == bytes ? 0 : -EIO;
 }
 
+int IOUringStorage::submit_io_batch(int fd, void* buf, size_t bytes, off_t offset, size_t chunk_bytes, bool is_write) {
+#if STRATA_HAS_IO_URING
+    if (!is_uring_available()) {
+        return sync_direct_io(fd, buf, bytes, offset, is_write);
+    }
+    if (!buf || bytes == 0) return 0;
+    if ((reinterpret_cast<uintptr_t>(buf) % 4096 != 0) || (bytes % 4096 != 0) || (offset % 4096 != 0)) {
+        return sync_direct_io(fd, buf, bytes, offset, is_write);
+    }
+
+    std::lock_guard<std::mutex> lock(ring_mutex_);
+
+    size_t processed = 0;
+    uint8_t* ptr = static_cast<uint8_t*>(buf);
+
+    if (chunk_bytes == 0) chunk_bytes = 1048576;
+    chunk_bytes = AlignedBuffer::align_up(chunk_bytes, 4096);
+
+    while (processed < bytes) {
+        size_t batch_bytes = 0;
+        size_t batch_sqes = 0;
+        uint32_t tail = *sq_tail_;
+
+        while (processed + batch_bytes < bytes && batch_sqes < queue_depth_) {
+            size_t remaining = bytes - (processed + batch_bytes);
+            size_t this_chunk = std::min(chunk_bytes, remaining);
+            this_chunk = AlignedBuffer::align_up(this_chunk, 4096);
+            if (this_chunk > remaining) this_chunk = remaining;
+
+            uint32_t idx = (tail + batch_sqes) & *sq_mask_;
+            struct io_uring_sqe* sqe = &static_cast<struct io_uring_sqe*>(sqes_)[idx];
+            std::memset(sqe, 0, sizeof(*sqe));
+            sqe->opcode = is_write ? IORING_OP_WRITE : IORING_OP_READ;
+            sqe->fd = fd;
+            sqe->addr = reinterpret_cast<uint64_t>(ptr + processed + batch_bytes);
+            sqe->len = static_cast<uint32_t>(this_chunk);
+            sqe->off = static_cast<uint64_t>(offset + processed + batch_bytes);
+            sqe->user_data = batch_sqes + 1;
+
+            sq_array_[idx] = idx;
+            batch_bytes += this_chunk;
+            batch_sqes++;
+        }
+
+        if (batch_sqes == 0) break;
+
+        __atomic_store_n(sq_tail_, tail + batch_sqes, __ATOMIC_RELEASE);
+
+        int ret = syscall(__NR_io_uring_enter, ring_fd_, batch_sqes, batch_sqes, IORING_ENTER_GETEVENTS, nullptr);
+        if (ret < 0) {
+            return -errno;
+        }
+
+        size_t reaped = 0;
+        while (reaped < batch_sqes) {
+            uint32_t c_head = __atomic_load_n(cq_head_, __ATOMIC_ACQUIRE);
+            if (c_head != *cq_tail_) {
+                struct io_uring_cqe* cqe = &static_cast<struct io_uring_cqe*>(cqes_)[c_head & *cq_mask_];
+                if (cqe->res < 0) {
+                    __atomic_store_n(cq_head_, c_head + 1, __ATOMIC_RELEASE);
+                    return cqe->res;
+                }
+                __atomic_store_n(cq_head_, c_head + 1, __ATOMIC_RELEASE);
+                ++reaped;
+            } else {
+                syscall(__NR_io_uring_enter, ring_fd_, 0, 1, IORING_ENTER_GETEVENTS, nullptr);
+            }
+        }
+
+        processed += batch_bytes;
+    }
+
+    return (processed == bytes) ? 0 : -EIO;
+#else
+    return sync_direct_io(fd, buf, bytes, offset, is_write);
+#endif
+}
+
 int IOUringStorage::submit_read_direct(int fd, void* aligned_buf, size_t bytes, off_t offset) {
-    return sync_direct_io(fd, aligned_buf, bytes, offset, false);
+    return submit_io_batch(fd, aligned_buf, bytes, offset, std::min(bytes, size_t(1048576)), false);
 }
 
 int IOUringStorage::submit_write_direct(int fd, const void* aligned_buf, size_t bytes, off_t offset) {
-    return sync_direct_io(fd, const_cast<void*>(aligned_buf), bytes, offset, true);
+    return submit_io_batch(fd, const_cast<void*>(aligned_buf), bytes, offset, std::min(bytes, size_t(1048576)), true);
+}
+
+int IOUringStorage::submit_read_batch(int fd, void* aligned_buf, size_t bytes, off_t offset, size_t chunk_bytes) {
+    return submit_io_batch(fd, aligned_buf, bytes, offset, chunk_bytes, false);
+}
+
+int IOUringStorage::submit_write_batch(int fd, const void* aligned_buf, size_t bytes, off_t offset, size_t chunk_bytes) {
+    return submit_io_batch(fd, const_cast<void*>(aligned_buf), bytes, offset, chunk_bytes, true);
 }
 
 int IOUringStorage::wait_completions(size_t) {

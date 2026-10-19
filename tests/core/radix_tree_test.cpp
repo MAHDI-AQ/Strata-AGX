@@ -230,6 +230,117 @@ int main() {
         std::cout << "[PASS]" << std::endl;
     }
 
+    // --- Phase 2: Decoupled Page-Table Virtualization (PagedKVPool O(T) Memory Scaling) ---
+    {
+        std::cout << "  [TEST] Phase 2: PagedKVPool allocation, recycling & duplicate resistance... " << std::flush;
+        strata::core::PagedKVPool pool(1024);
+        auto p1 = pool.allocate_pages(10);
+        assert(p1.size() == 10);
+        assert(pool.allocated_pages() == 10);
+        std::unordered_set<int32_t> seen(p1.begin(), p1.end());
+        assert(seen.size() == 10);
+
+        pool.free_pages({p1[2], p1[5], p1[8]});
+        assert(pool.allocated_pages() == 7);
+
+        auto p2 = pool.allocate_pages(2);
+        assert(p2.size() == 2);
+        assert(pool.allocated_pages() == 9);
+        for (int32_t pg : p2) {
+            assert(pg == p1[8] || pg == p1[5] || pg == p1[2]);
+        }
+        std::cout << "[PASS]" << std::endl;
+
+        std::cout << "  [TEST] Phase 2: Multi-turn O(T) incremental delta page allocation... " << std::flush;
+        strata::core::RadixTree tree_paged(8, 64);
+
+        // Turn 0: System prompt (4000 tokens -> 250 pages)
+        std::vector<int32_t> turn0_tokens(4000);
+        for (size_t i = 0; i < turn0_tokens.size(); ++i) turn0_tokens[i] = 1000 + (i % 500);
+
+        // Mock state to satisfy insert checks
+        strata::core::SessionState mock_state;
+        mock_state.gdn_alloc = 0;
+        mock_state.qsa_alloc = 0;
+        std::vector<int> s_devs = {0};
+        std::vector<const strata::core::SessionState*> s_states = {&mock_state};
+        std::vector<const float*> s_R = {nullptr};
+        cudaStream_t strm;
+        cudaStreamCreate(&strm);
+        std::vector<void*> s_streams = {(void*) strm};
+        strata::core::ModelGeometry geom{};
+
+        auto node0 = tree_paged.insert(turn0_tokens.data(), 4000, 4000, s_devs, s_states, s_R, geom, s_streams);
+        assert(node0 != nullptr);
+        assert(node0->edge_tokens.size() == 4000);
+        assert(node0->kv_page_ids.size() == 250); // Exact 250 pages
+
+        // Turn 1: 1600 delta tokens (prefix_len = 5600 -> 100 delta pages)
+        std::vector<int32_t> turn1_tokens = turn0_tokens;
+        turn1_tokens.resize(5600);
+        for (size_t i = 4000; i < 5600; ++i) turn1_tokens[i] = 2000 + (i % 500);
+
+        auto node1 = tree_paged.insert(turn1_tokens.data(), 5600, 5600, s_devs, s_states, s_R, geom, s_streams);
+        assert(node1 != nullptr);
+        assert(node1->edge_tokens.size() == 1600);
+        assert(node1->kv_page_ids.size() == 100); // ONLY 100 delta pages! (O(T) scaling, NOT 350!)
+
+        // Turn 2: 2400 delta tokens (prefix_len = 8000 -> 150 delta pages)
+        std::vector<int32_t> turn2_tokens = turn1_tokens;
+        turn2_tokens.resize(8000);
+        for (size_t i = 5600; i < 8000; ++i) turn2_tokens[i] = 3000 + (i % 500);
+
+        auto node2 = tree_paged.insert(turn2_tokens.data(), 8000, 8000, s_devs, s_states, s_R, geom, s_streams);
+        assert(node2 != nullptr);
+        assert(node2->edge_tokens.size() == 2400);
+        assert(node2->kv_page_ids.size() == 150); // ONLY 150 delta pages! (NOT 500!)
+
+        // Zero duplicate page allocations across all 3 nodes
+        std::unordered_set<int32_t> all_pages;
+        for (int32_t id : node0->kv_page_ids) {
+            assert(all_pages.insert(id).second);
+        }
+        for (int32_t id : node1->kv_page_ids) {
+            assert(all_pages.insert(id).second);
+        }
+        for (int32_t id : node2->kv_page_ids) {
+            assert(all_pages.insert(id).second);
+        }
+        assert(all_pages.size() == 500); // Exactly 250 + 100 + 150 = 500 pages total
+        std::cout << "[PASS]" << std::endl;
+
+        std::cout << "  [TEST] Phase 2: Virtual block table resolution & node split page slicing... " << std::flush;
+        auto vbt2 = tree_paged.resolve_virtual_block_table(node2);
+        assert(vbt2.size() == 500);
+        for (size_t i = 0; i < 250; ++i) assert(vbt2[i] == node0->kv_page_ids[i]);
+        for (size_t i = 0; i < 100; ++i) assert(vbt2[250 + i] == node1->kv_page_ids[i]);
+        for (size_t i = 0; i < 150; ++i) assert(vbt2[350 + i] == node2->kv_page_ids[i]);
+
+        // Branching off Turn 1 with node splitting:
+        // Branch at token 4800 (halfway through Turn 1's 1600 tokens -> splits at 800 tokens = 50 pages)
+        std::vector<int32_t> branch_tokens = turn1_tokens;
+        branch_tokens.resize(4800 + 400);
+        branch_tokens[4800] = 999999;
+        for (size_t i = 4801; i < branch_tokens.size(); ++i) branch_tokens[i] = 4000 + (i % 300);
+
+        auto branch_node = tree_paged.insert(branch_tokens.data(), branch_tokens.size(), branch_tokens.size(),
+                                             s_devs, s_states, s_R, geom, s_streams);
+        assert(branch_node != nullptr);
+        auto split_parent = branch_node->parent.lock();
+        assert(split_parent != nullptr);
+        assert(split_parent->edge_tokens.size() == 800);
+        assert(split_parent->kv_page_ids.size() == 50);
+
+        // Virtual block table for branch_node: 250 (node0) + 50 (split) + 25 (delta) = 325 pages
+        auto vbt_branch = tree_paged.resolve_virtual_block_table(branch_node);
+        assert(vbt_branch.size() == 325);
+        for (size_t i = 0; i < 250; ++i) assert(vbt_branch[i] == node0->kv_page_ids[i]);
+        for (size_t i = 0; i < 50; ++i) assert(vbt_branch[250 + i] == split_parent->kv_page_ids[i]);
+
+        cudaStreamDestroy(strm);
+        std::cout << "[PASS]" << std::endl;
+    }
+
     std::cout << "All RadixTree & HiCache L2 unit tests passed successfully!" << std::endl;
     return 0;
 }

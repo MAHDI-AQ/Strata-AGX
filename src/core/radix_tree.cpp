@@ -589,6 +589,7 @@ RadixTree::RadixTree(size_t max_cached_snapshots, size_t max_host_snapshots)
     root_->prefix_len = 0;
     root_->last_accessed = std::chrono::steady_clock::now();
     node_count_ = 1;
+    kv_pool_ = std::make_shared<PagedKVPool>();
 
     nvme_worker_ = std::thread(&RadixTree::nvme_worker_loop, this);
 }
@@ -1178,6 +1179,10 @@ std::shared_ptr<RadixNode> RadixTree::insert(
             new_node->update_chunk_hashes();
             new_node->parent = curr;
             new_node->last_accessed = std::chrono::steady_clock::now();
+            size_t delta_pages = (new_node->edge_tokens.size() + 15) / 16;
+            if (kv_pool_) {
+                new_node->kv_page_ids = kv_pool_->allocate_pages(delta_pages);
+            }
             curr->children[next_tok] = new_node;
             ++node_count_;
             curr = new_node;
@@ -1208,11 +1213,21 @@ std::shared_ptr<RadixNode> RadixTree::insert(
             split_node->parent = curr;
             split_node->last_accessed = std::chrono::steady_clock::now();
 
+            size_t split_pages = (match_edge + 15) / 16;
+            split_node->kv_page_ids = child->slice_page_ids(0, split_pages);
+            child->kv_page_ids = child->slice_page_ids(split_pages, child->kv_page_ids.size() > split_pages ? child->kv_page_ids.size() - split_pages : 0);
+
             child->edge_tokens.erase(child->edge_tokens.begin(), child->edge_tokens.begin() + match_edge);
             child->update_chunk_hashes();
             child->parent = split_node;
-            split_node->children[child->edge_tokens[0]] = child;
 
+            size_t child_rem_pages = (child->edge_tokens.size() + 15) / 16;
+            if (child->kv_page_ids.size() < child_rem_pages && kv_pool_) {
+                auto extra = kv_pool_->allocate_pages(child_rem_pages - child->kv_page_ids.size());
+                child->kv_page_ids.insert(child->kv_page_ids.end(), extra.begin(), extra.end());
+            }
+
+            split_node->children[child->edge_tokens[0]] = child;
             curr->children[next_tok] = split_node;
             ++node_count_;
 
@@ -1228,6 +1243,10 @@ std::shared_ptr<RadixNode> RadixTree::insert(
                 new_node->update_chunk_hashes();
                 new_node->parent = split_node;
                 new_node->last_accessed = std::chrono::steady_clock::now();
+                size_t delta_pages = (new_node->edge_tokens.size() + 15) / 16;
+                if (kv_pool_) {
+                    new_node->kv_page_ids = kv_pool_->allocate_pages(delta_pages);
+                }
                 split_node->children[tokens[matched_len]] = new_node;
                 ++node_count_;
                 curr = new_node;
@@ -1238,6 +1257,12 @@ std::shared_ptr<RadixNode> RadixTree::insert(
     }
 
     curr->last_accessed = std::chrono::steady_clock::now();
+    if (curr != root_ && curr->kv_page_ids.empty()) {
+        size_t delta_pages = (curr->edge_tokens.size() + 15) / 16;
+        if (kv_pool_) {
+            curr->kv_page_ids = kv_pool_->allocate_pages(delta_pages);
+        }
+    }
 
     // S26f: byte-budget the device snapshot tier. Estimate the capture size; evict LRU (park to
     // host) until it fits; if it still cannot fit, keep the path but refuse the capture (a clean
@@ -1466,6 +1491,23 @@ std::shared_ptr<RadixNode> RadixTree::insert(
     return curr;
 }
 
+std::vector<int32_t> RadixTree::resolve_virtual_block_table(const std::shared_ptr<RadixNode>& node) const {
+    if (!node) return {};
+    std::vector<std::shared_ptr<RadixNode>> path;
+    auto cur = node;
+    while (cur && cur != root_) {
+        path.push_back(cur);
+        cur = cur->parent.lock();
+    }
+    std::reverse(path.begin(), path.end());
+
+    std::vector<int32_t> block_table;
+    for (const auto& nd : path) {
+        block_table.insert(block_table.end(), nd->kv_page_ids.begin(), nd->kv_page_ids.end());
+    }
+    return block_table;
+}
+
 void RadixTree::acquire(const std::shared_ptr<RadixNode>& node) {
     if (node) ++node->ref_count;
 }
@@ -1592,6 +1634,7 @@ bool RadixTree::fork_to_session(
     }
     const int64_t pages = (target_prefix + qs.page_size - 1) / qs.page_size;
     const size_t qsa_rows = (size_t) pages * qs.n_head_kv * qs.page_size;
+    std::vector<int32_t> block_table = resolve_virtual_block_table(target_node);
 
     if (target_node->has_device_snapshot()) {
         for (size_t st = 0; st < n_stages && st < target_node->stage_snapshots.size(); ++st) {
@@ -1651,6 +1694,10 @@ bool RadixTree::fork_to_session(
                 const int64_t pooled_rows = target_prefix / qs.idx_block;
                 if (pooled_rows > 0 && slice.idx_pooled && cst.idx_pooled) {
                     cudaMemcpyAsync(cst.idx_pooled, slice.idx_pooled, slice.idx_pooled_bytes, cudaMemcpyDeviceToDevice, cs);
+                }
+                if (cst.page_table && !block_table.empty() && cst.n_pages > 0) {
+                    size_t copy_pages = std::min((size_t) cst.n_pages, std::min(block_table.size(), (size_t) pages));
+                    cudaMemcpyAsync(cst.page_table, block_table.data(), copy_pages * sizeof(int32_t), cudaMemcpyHostToDevice, cs);
                 }
             }
         }
@@ -1712,6 +1759,10 @@ bool RadixTree::fork_to_session(
                 const int64_t pooled_rows = target_prefix / qs.idx_block;
                 if (pooled_rows > 0 && !slice.idx_pooled.empty() && cst.idx_pooled) {
                     cudaMemcpyAsync(cst.idx_pooled, slice.idx_pooled.data(), slice.idx_pooled.size(), cudaMemcpyHostToDevice, cs);
+                }
+                if (cst.page_table && !block_table.empty() && cst.n_pages > 0) {
+                    size_t copy_pages = std::min((size_t) cst.n_pages, std::min(block_table.size(), (size_t) pages));
+                    cudaMemcpyAsync(cst.page_table, block_table.data(), copy_pages * sizeof(int32_t), cudaMemcpyHostToDevice, cs);
                 }
             }
         }
@@ -2042,6 +2093,10 @@ CompactionStats RadixTree::compact_tree() {
             auto victim = curr->children[k];
             if (victim) {
                 stats.bytes_reclaimed += victim->total_vram_bytes() + victim->total_host_bytes();
+                if (kv_pool_ && !victim->kv_page_ids.empty()) {
+                    kv_pool_->free_pages(victim->kv_page_ids);
+                    victim->kv_page_ids.clear();
+                }
             }
             curr->children.erase(k);
             if (node_count_ > 0) --node_count_;
@@ -2060,6 +2115,7 @@ CompactionStats RadixTree::compact_tree() {
             auto child = curr->children.begin()->second;
             if (child && child->ref_count == 0 && !child->holds_recurrent_state() && !child->is_staging_to_nvme.load()) {
                 curr->edge_tokens.insert(curr->edge_tokens.end(), child->edge_tokens.begin(), child->edge_tokens.end());
+                curr->kv_page_ids.insert(curr->kv_page_ids.end(), child->kv_page_ids.begin(), child->kv_page_ids.end());
                 curr->update_chunk_hashes();
                 curr->children = std::move(child->children);
                 for (auto& c_kv : curr->children) {
@@ -2148,6 +2204,10 @@ std::shared_ptr<RadixNode> RadixTree::insert_direct_device_to_host(
             new_node->update_chunk_hashes();
             new_node->parent = curr;
             new_node->last_accessed = std::chrono::steady_clock::now();
+            size_t delta_pages = (new_node->edge_tokens.size() + 15) / 16;
+            if (kv_pool_) {
+                new_node->kv_page_ids = kv_pool_->allocate_pages(delta_pages);
+            }
             curr->children[next_tok] = new_node;
             ++node_count_;
             curr = new_node;
@@ -2178,11 +2238,21 @@ std::shared_ptr<RadixNode> RadixTree::insert_direct_device_to_host(
             split_node->parent = curr;
             split_node->last_accessed = std::chrono::steady_clock::now();
 
+            size_t split_pages = (match_edge + 15) / 16;
+            split_node->kv_page_ids = child->slice_page_ids(0, split_pages);
+            child->kv_page_ids = child->slice_page_ids(split_pages, child->kv_page_ids.size() > split_pages ? child->kv_page_ids.size() - split_pages : 0);
+
             child->edge_tokens.erase(child->edge_tokens.begin(), child->edge_tokens.begin() + match_edge);
             child->update_chunk_hashes();
             child->parent = split_node;
-            split_node->children[child->edge_tokens[0]] = child;
 
+            size_t child_rem_pages = (child->edge_tokens.size() + 15) / 16;
+            if (child->kv_page_ids.size() < child_rem_pages && kv_pool_) {
+                auto extra = kv_pool_->allocate_pages(child_rem_pages - child->kv_page_ids.size());
+                child->kv_page_ids.insert(child->kv_page_ids.end(), extra.begin(), extra.end());
+            }
+
+            split_node->children[child->edge_tokens[0]] = child;
             curr->children[next_tok] = split_node;
             ++node_count_;
 
@@ -2198,6 +2268,10 @@ std::shared_ptr<RadixNode> RadixTree::insert_direct_device_to_host(
                 new_node->update_chunk_hashes();
                 new_node->parent = split_node;
                 new_node->last_accessed = std::chrono::steady_clock::now();
+                size_t delta_pages = (new_node->edge_tokens.size() + 15) / 16;
+                if (kv_pool_) {
+                    new_node->kv_page_ids = kv_pool_->allocate_pages(delta_pages);
+                }
                 split_node->children[tokens[matched_len]] = new_node;
                 ++node_count_;
                 curr = new_node;
@@ -2208,6 +2282,12 @@ std::shared_ptr<RadixNode> RadixTree::insert_direct_device_to_host(
     }
 
     curr->last_accessed = std::chrono::steady_clock::now();
+    if (curr != root_ && curr->kv_page_ids.empty()) {
+        size_t delta_pages = (curr->edge_tokens.size() + 15) / 16;
+        if (kv_pool_) {
+            curr->kv_page_ids = kv_pool_->allocate_pages(delta_pages);
+        }
+    }
 
     // Mandate 1 & 2: Direct-to-Host DMA Capture with Zero Persistent VRAM Allocation
     if (max_host_snapshots_ == 0) {

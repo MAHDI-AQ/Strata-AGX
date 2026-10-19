@@ -18,6 +18,19 @@
 #include <atomic>
 #include <unordered_set>
 
+#if defined(__linux__)
+#include <sys/syscall.h>
+#if defined(__NR_io_uring_setup) && defined(__NR_io_uring_enter)
+#if __has_include(<linux/io_uring.h>)
+#include <linux/io_uring.h>
+#include <sys/mman.h>
+#ifndef STRATA_HAS_IO_URING
+#define STRATA_HAS_IO_URING 1
+#endif
+#endif
+#endif
+#endif
+
 namespace strata::core {
 
 static constexpr size_t kDirectBlockAlignment = 4096;
@@ -193,14 +206,37 @@ public:
 
     int submit_read_direct(int fd, void* aligned_buf, size_t bytes, off_t offset);
     int submit_write_direct(int fd, const void* aligned_buf, size_t bytes, off_t offset);
+    int submit_read_batch(int fd, void* aligned_buf, size_t bytes, off_t offset, size_t chunk_bytes = 1048576);
+    int submit_write_batch(int fd, const void* aligned_buf, size_t bytes, off_t offset, size_t chunk_bytes = 1048576);
     int wait_completions(size_t min_complete = 1);
 
 private:
     std::atomic<bool> uring_initialized_{false};
     int ring_fd_{-1};
     size_t queue_depth_{64};
+    mutable std::mutex ring_mutex_;
 
+    uint8_t* sq_ring_{nullptr};
+    uint8_t* cq_ring_{nullptr};
+    void* sqes_{nullptr};
+    size_t sq_ring_sz_{0};
+    size_t cq_ring_sz_{0};
+    size_t sqes_sz_{0};
+
+    uint32_t* sq_head_{nullptr};
+    uint32_t* sq_tail_{nullptr};
+    uint32_t* sq_mask_{nullptr};
+    uint32_t* sq_array_{nullptr};
+
+    uint32_t* cq_head_{nullptr};
+    uint32_t* cq_tail_{nullptr};
+    uint32_t* cq_mask_{nullptr};
+    void* cqes_{nullptr};
+
+    bool init_rings();
+    void cleanup_rings();
     int sync_direct_io(int fd, void* buf, size_t bytes, off_t offset, bool is_write);
+    int submit_io_batch(int fd, void* buf, size_t bytes, off_t offset, size_t chunk_bytes, bool is_write);
 };
 
 class NVMeStorageTier {
@@ -253,6 +289,9 @@ public:
     uint64_t total_bytes_written() const { return bytes_written_.load(std::memory_order_relaxed); }
     uint64_t total_bytes_read() const { return bytes_read_.load(std::memory_order_relaxed); }
 
+    IOUringStorage* io_uring() { return io_uring_.get(); }
+    const IOUringStorage* io_uring() const { return io_uring_.get(); }
+
     static std::string detect_default_storage_path();
 
 private:
@@ -269,6 +308,7 @@ private:
     std::string tmp_node_file_path(int64_t node_id) const;
     std::string manifest_file_path() const;
     std::string tmp_manifest_file_path() const;
+    std::unique_ptr<IOUringStorage> io_uring_;
 };
 
 }  // namespace strata::core

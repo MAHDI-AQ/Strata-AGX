@@ -44,6 +44,11 @@ void test_nvme_throughput_and_parity(NVMeStorageTier& nvme) {
 
     std::cout << "  -> Measured NVMe Write Throughput: " << write_mb_s << " MB/s" << std::endl;
     std::cout << "  -> Measured NVMe Read Throughput:  " << read_mb_s << " MB/s" << std::endl;
+    assert(nvme.io_uring() != nullptr);
+    assert(nvme.io_uring()->is_uring_available());
+    assert(write_mb_s >= 1500.0);
+    assert(read_mb_s >= 1800.0);
+    std::cout << "  -> PASS: Gate 1 io_uring DirectStorage throughput >= 1500 MB/s Write and >= 1800 MB/s Read verified." << std::endl;
 
     // Direct write & read roundtrip parity
     const size_t payload_size = 4 * 1024 * 1024; // 4MB

@@ -42,6 +42,61 @@ inline size_t align_down_page(size_t tokens, size_t page_size = kPageTokens) {
     return (tokens / page_size) * page_size;
 }
 
+/// Thread-safe Physical KV Page Allocator for Decoupled Page-Table Virtualization (O(T) scaling)
+class PagedKVPool {
+public:
+    explicit PagedKVPool(size_t total_pages = 65536)
+        : total_pages_(total_pages), next_free_id_(0), allocated_pages_(0) {}
+
+    std::vector<int32_t> allocate_pages(size_t n) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<int32_t> pages;
+        pages.reserve(n);
+        while (pages.size() < n && !free_list_.empty()) {
+            pages.push_back(free_list_.back());
+            free_list_.pop_back();
+        }
+        while (pages.size() < n) {
+            pages.push_back(next_free_id_++);
+        }
+        allocated_pages_ += n;
+        return pages;
+    }
+
+    void free_pages(const std::vector<int32_t>& pages) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (int32_t p : pages) {
+            free_list_.push_back(p);
+        }
+        if (allocated_pages_ >= pages.size()) {
+            allocated_pages_ -= pages.size();
+        } else {
+            allocated_pages_ = 0;
+        }
+    }
+
+    size_t allocated_pages() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return allocated_pages_;
+    }
+
+    size_t total_pages() const { return total_pages_; }
+
+    void reset() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        free_list_.clear();
+        next_free_id_ = 0;
+        allocated_pages_ = 0;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    size_t total_pages_{65536};
+    int32_t next_free_id_{0};
+    size_t allocated_pages_{0};
+    std::vector<int32_t> free_list_;
+};
+
 
 
 #if defined(__AVX2__)
@@ -439,6 +494,10 @@ public:
     void acquire(const std::shared_ptr<RadixNode>& node);
     void release(const std::shared_ptr<RadixNode>& node);
 
+    std::vector<int32_t> resolve_virtual_block_table(const std::shared_ptr<RadixNode>& node) const;
+    std::shared_ptr<PagedKVPool> kv_pool() { return kv_pool_; }
+    std::shared_ptr<const PagedKVPool> kv_pool() const { return kv_pool_; }
+
     bool fork_to_session(
         const std::shared_ptr<RadixNode>& node,
         int64_t prefix_len,
@@ -480,6 +539,7 @@ private:
     mutable std::shared_mutex rw_lock_;
     std::shared_ptr<RadixNode> root_;
     std::shared_ptr<class NVMeStorageTier> nvme_tier_;
+    std::shared_ptr<PagedKVPool> kv_pool_;
     size_t max_cached_snapshots_ = 4;
     size_t max_host_snapshots_ = 64;
     size_t host_ram_budget_ = (size_t) 32ULL << 30;   // 32 GiB calibrated L2 Host-RAM cache ceiling   // 16 GiB safety ceiling for Host RAM snapshots
