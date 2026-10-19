@@ -118,7 +118,13 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __rest
             if (cell >= 0) {
                 const int page_idx = cell / page_size;
                 if (page_idx >= 0 && page_idx < 65536) {
-                    const long long page = (long long) p.page_table[page_idx];
+                    long long page = -1;
+                    if (p.page_tables && p.query_slot_map) {
+                        const int slot_id = __ldg(p.query_slot_map + blockIdx.z);
+                        page = (long long) __ldg(p.page_tables + (slot_id << 14) + page_idx);
+                    } else if (p.page_table) {
+                        page = (long long) p.page_table[page_idx];
+                    }
                     // a block the KV streaming could not make resident keeps page -1 (ctl[3]); its cells are masked
                     // (score -FLT_MAX, weight 0) instead of being read from before the pool.
                     if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
@@ -260,7 +266,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
                            int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
     if (n_q <= 0) return;
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !steps ||
-        !pools.page_table || n_q > 65535) {
+        !(pools.page_table || pools.page_tables) || n_q > 65535) {
         std::fprintf(stderr, "qsa_decode_attn_batch: unsupported geometry or missing buffers\n");
         throw std::invalid_argument("qsa_decode_attn_batch: unsupported geometry or missing buffers");
     }
@@ -306,7 +312,7 @@ void qsa_decode_attn_batch_fused_gate(const float* q, const QsaAttnPools& pools,
                                       const float* q_full, float* output_attn32, int64_t n_q, void* stream) {
     if (n_q <= 0) return;
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !steps ||
-        !pools.page_table || !q_full || !output_attn32 || n_q > 65535) {
+        !(pools.page_table || pools.page_tables) || !q_full || !output_attn32 || n_q > 65535) {
         std::fprintf(stderr, "qsa_decode_attn_batch_fused_gate: unsupported geometry or missing buffers\n");
         throw std::invalid_argument("qsa_decode_attn_batch_fused_gate: unsupported geometry or missing buffers");
     }
@@ -345,7 +351,7 @@ void qsa_decode_attn_batch_fused_gate(const float* q, const QsaAttnPools& pools,
 void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* step,
                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, void* stream) {
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !step ||
-        !pools.page_table) {
+        !(pools.page_table || pools.page_tables)) {
         std::fprintf(stderr, "qsa_decode_attn: unsupported geometry or missing buffers\n");
         throw std::invalid_argument("qsa_decode_attn: unsupported geometry or missing buffers");
     }
