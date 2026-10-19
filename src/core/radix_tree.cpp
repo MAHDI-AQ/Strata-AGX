@@ -380,7 +380,7 @@ bool RadixNode::offload_to_nvme(NVMeStorageTier& nvme) {
 }
 
 bool RadixNode::hydrate_from_nvme(NVMeStorageTier& nvme) {
-    std::lock_guard<std::mutex> h_lock(hydrate_mutex_);
+    std::lock_guard<std::recursive_mutex> h_lock(hydrate_mutex_);
     if (!is_l3_offloaded) return true;
     if (l3_bytes == 0) return false;
 
@@ -1583,7 +1583,7 @@ bool RadixTree::fork_to_session(
     if (target_node->is_l3_offloaded && nvme_tier_) {
         bool hydrate_ok = true;
         {
-            std::unique_lock<std::mutex> h_lock(target_node->hydrate_mutex_);
+            std::unique_lock<std::recursive_mutex> h_lock(target_node->hydrate_mutex_);
             if (target_node->is_l3_offloaded) {
                 hydrate_ok = target_node->hydrate_from_nvme(*nvme_tier_);
             }
@@ -1631,7 +1631,7 @@ bool RadixTree::fork_to_session(
             target_prefix = target_node->prefix_len;
 
             if (target_node->is_l3_offloaded && nvme_tier_) {
-                std::unique_lock<std::mutex> h_lock(target_node->hydrate_mutex_);
+                std::unique_lock<std::recursive_mutex> h_lock(target_node->hydrate_mutex_);
                 if (target_node->is_l3_offloaded) {
                     if (!target_node->hydrate_from_nvme(*nvme_tier_)) {
                         err = "radix_fork: failed to hydrate fallback ancestor from NVMe L3";

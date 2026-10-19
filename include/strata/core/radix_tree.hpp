@@ -456,7 +456,7 @@ struct RadixNode : public std::enable_shared_from_this<RadixNode> {
 
     std::atomic<bool> is_staging_to_nvme{false};
     size_t l3_bytes = 0;
-    std::mutex hydrate_mutex_;
+    std::recursive_mutex hydrate_mutex_;
 
     void update_chunk_hashes() {
         edge_chunk_hashes.clear();

@@ -130,6 +130,16 @@ void mtp_tree_branch_select(const float* logits,
                             float* out_log_probs,
                             void* stream);
 
+void sample_residual_gpu(const float* logits,
+                         int n_vocab,
+                         float inv_temp,
+                         int32_t draft_tok,
+                         float q,
+                         float r,
+                         int32_t fallback_tok,
+                         int32_t* out_tok,
+                         void* stream);
+
 void spec_tree_verify_dp(const int32_t* tree_tokens,
                          const int32_t* target_tokens,
                          const int32_t* parents,

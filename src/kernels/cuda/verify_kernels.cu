@@ -1047,6 +1047,143 @@ void mtp_tree_branch_select(const float* logits,
     check("mtp_tree_branch_select");
 }
 
+#if !defined(__HIPCC__)
+__global__ void sample_residual_kernel(const float* __restrict__ logits,
+                                       int n_vocab,
+                                       float inv_temp,
+                                       int32_t draft_tok,
+                                       float q,
+                                       float r,
+                                       int32_t fallback_tok,
+                                       int32_t* __restrict__ out_tok) {
+    __shared__ float s_warp_max[32];
+    __shared__ float s_warp_sum[32];
+    __shared__ float s_warp_res[32];
+    __shared__ float g_max;
+    __shared__ float g_sum_exp;
+    __shared__ float g_sum_res;
+    __shared__ int32_t g_selected;
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int wid = tid >> 5;
+
+    // Pass 1: global max logit
+    float my_max = -1e30f;
+    for (int i = tid; i < n_vocab; i += blockDim.x) {
+        float val = logits[i];
+        if (val > my_max) my_max = val;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        my_max = fmaxf(my_max, __shfl_down_sync(0xffffffff, my_max, offset));
+    }
+    if (lane == 0) s_warp_max[wid] = my_max;
+    __syncthreads();
+
+    if (wid == 0) {
+        float b_max = (tid < 32) ? s_warp_max[tid] : -1e30f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            b_max = fmaxf(b_max, __shfl_down_sync(0xffffffff, b_max, offset));
+        }
+        if (tid == 0) g_max = b_max;
+    }
+    __syncthreads();
+
+    const float mx = g_max;
+
+    // Pass 2: sum of exp
+    float my_sum = 0.0f;
+    for (int i = tid; i < n_vocab; i += blockDim.x) {
+        float diff = (logits[i] - mx) * inv_temp;
+        my_sum += (diff > -80.0f) ? __expf(diff) : 0.0f;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        my_sum += __shfl_down_sync(0xffffffff, my_sum, offset);
+    }
+    if (lane == 0) s_warp_sum[wid] = my_sum;
+    __syncthreads();
+
+    if (wid == 0) {
+        float b_sum = (tid < 32) ? s_warp_sum[tid] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            b_sum += __shfl_down_sync(0xffffffff, b_sum, offset);
+        }
+        if (tid == 0) g_sum_exp = b_sum;
+    }
+    __syncthreads();
+
+    const float inv_sum_exp = g_sum_exp > 0.0f ? (1.0f / g_sum_exp) : 0.0f;
+
+    // Pass 3: sum of residual weights max(0, p(y) - q(y))
+    float my_res = 0.0f;
+    for (int i = tid; i < n_vocab; i += blockDim.x) {
+        float diff = (logits[i] - mx) * inv_temp;
+        float p_y = ((diff > -80.0f) ? __expf(diff) : 0.0f) * inv_sum_exp;
+        float q_y = (i == draft_tok) ? q : 0.0f;
+        my_res += fmaxf(0.0f, p_y - q_y);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        my_res += __shfl_down_sync(0xffffffff, my_res, offset);
+    }
+    if (lane == 0) s_warp_res[wid] = my_res;
+    __syncthreads();
+
+    if (wid == 0) {
+        float b_res = (tid < 32) ? s_warp_res[tid] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            b_res += __shfl_down_sync(0xffffffff, b_res, offset);
+        }
+        if (tid == 0) g_sum_res = b_res;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        g_selected = fallback_tok;
+        if (g_sum_res > 0.0f) {
+            const float thresh = r * g_sum_res;
+            float cdf = 0.0f;
+            int32_t chosen = fallback_tok;
+            for (int i = 0; i < n_vocab; ++i) {
+                float diff = (logits[i] - mx) * inv_temp;
+                float p_y = ((diff > -80.0f) ? __expf(diff) : 0.0f) * inv_sum_exp;
+                float q_y = (i == draft_tok) ? q : 0.0f;
+                float res_val = fmaxf(0.0f, p_y - q_y);
+                cdf += res_val;
+                if (cdf >= thresh) {
+                    chosen = i;
+                    break;
+                }
+            }
+            g_selected = chosen;
+        }
+    }
+    __syncthreads();
+
+    if (tid == 0 && out_tok != nullptr) {
+        *out_tok = g_selected;
+    }
+}
+#endif
+
+void sample_residual_gpu(const float* logits,
+                         int n_vocab,
+                         float inv_temp,
+                         int32_t draft_tok,
+                         float q,
+                         float r,
+                         int32_t fallback_tok,
+                         int32_t* out_tok,
+                         void* stream) {
+    if (!logits || n_vocab <= 0 || !out_tok) return;
+#if !defined(__HIPCC__)
+    sample_residual_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(
+        logits, n_vocab, inv_temp, draft_tok, q, r, fallback_tok, out_tok);
+    check("sample_residual_gpu");
+#else
+    *out_tok = fallback_tok;
+#endif
+}
+
 void spec_tree_verify_dp(const int32_t* tree_tokens,
                          const int32_t* target_tokens,
                          const int32_t* parents,

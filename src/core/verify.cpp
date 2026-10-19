@@ -2114,6 +2114,20 @@ float Verifier::target_draft_prob(int t) const {
     return h_probs_[t];
 }
 
+int32_t Verifier::sample_residual(int t, float inv_temp, int32_t draft_tok, float q, float r, int32_t fallback_tok) const {
+    if (next_ != nullptr) return next_->sample_residual(t, inv_temp, draft_tok, q, r, fallback_tok);
+    if (head_logits_ == nullptr || t < 0 || t >= max_t_ || n_vocab_ <= 0 || m_out_ == nullptr || h_out_ == nullptr) {
+        return fallback_tok;
+    }
+    const OnDevice on_device(device_);
+    strata::kernels::sample_residual_gpu(head_logits_ + (size_t) t * (size_t) n_vocab_, (int) n_vocab_,
+                                        inv_temp, draft_tok, q, r, fallback_tok, m_out_ + t, cs_);
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+        return fallback_tok;
+    }
+    return h_out_[t];
+}
+
 bool Verifier::copy_logits(int t, float* host) const {
     if (next_ != nullptr) return next_->copy_logits(t, host);   // a layer split: the head is on the last stage
     if (head_logits_ == nullptr || host == nullptr || t < 0 || n_vocab_ <= 0) return false;

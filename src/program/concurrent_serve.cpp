@@ -1518,52 +1518,11 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                             s.output[t] = draft_tok;
                             accepted = t + 1;
                         } else {
-                            // Rejected: sample replacement token from true normalized residual distribution
-                            // p_prime(y) = max(0, p(y) - q(y)) / sum_z max(0, p(z) - q(z))
-                            const int64_t nv = s.stages[0].verify.vocab();
-                            if (nv > 0) {
-                                std::vector<float> logits((size_t) nv);
-                                if (s.stages[0].verify.copy_logits(t, logits.data())) {
-                                    draw_state = draw_state * 6364136223846793005ULL + 1442695040888963407ULL;
-                                    const float r = (float)((draw_state >> 32) & 0xFFFFFF) / 16777216.0f;
-                                    const float inv_temp = 1.0f / s.request.sampling.temperature;
-#if defined(__x86_64__) || defined(_M_X64)
-                                    s.output[t] = sample_residual_avx2(logits.data(), nv, inv_temp, draft_tok, q, r, target_tok);
-#else
-                                    float max_l = -1e30f;
-                                    for (int64_t i = 0; i < nv; ++i) {
-                                        if (logits[i] > max_l) max_l = logits[i];
-                                    }
-                                    float sum_exp = 0.0f;
-                                    for (int64_t i = 0; i < nv; ++i) {
-                                        logits[i] = std::exp((logits[i] - max_l) * inv_temp);
-                                        sum_exp += logits[i];
-                                    }
-                                    const float inv_sum = sum_exp > 0.0f ? (1.0f / sum_exp) : 0.0f;
-                                    float sum_res = 0.0f;
-                                    for (int64_t i = 0; i < nv; ++i) {
-                                        const float p_y = logits[i] * inv_sum;
-                                        const float q_y = (i == (int64_t) draft_tok) ? q : 0.0f;
-                                        const float diff = std::max(0.0f, p_y - q_y);
-                                        logits[i] = diff;
-                                        sum_res += diff;
-                                    }
-                                    if (sum_res > 0.0f) {
-                                        const float thresh = r * sum_res;
-                                        float cdf = 0.0f;
-                                        int32_t rep_tok = target_tok;
-                                        for (int64_t i = 0; i < nv; ++i) {
-                                            cdf += logits[i];
-                                            if (cdf >= thresh) {
-                                                rep_tok = (int32_t) i;
-                                                break;
-                                            }
-                                        }
-                                        s.output[t] = rep_tok;
-                                    }
-#endif
-                                }
-                            }
+                            // Task 3.1 / CRIT-SPEC-01: Fused GPU Leviathan Residual Sampling (zero-PCIe D2H elimination)
+                            draw_state = draw_state * 6364136223846793005ULL + 1442695040888963407ULL;
+                            const float r = (float)((draw_state >> 32) & 0xFFFFFF) / 16777216.0f;
+                            const float inv_temp = 1.0f / s.request.sampling.temperature;
+                            s.output[t] = s.stages[0].verify.sample_residual(t, inv_temp, draft_tok, q, r, target_tok);
                             break;
                         }
                     }

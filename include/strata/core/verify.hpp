@@ -122,6 +122,7 @@ public:
     bool copy_logits(int t, float* host) const;
     /// Target draft probability for draft token t in the last window (Leviathan residual sampling). Valid after run().
     float target_draft_prob(int t) const;
+    int32_t sample_residual(int t, float inv_temp, int32_t draft_tok, float q, float r, int32_t fallback_tok) const;
     int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
     /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
     /// request; greedy by default.  The sampling itself runs OUTSIDE the captured graph - its

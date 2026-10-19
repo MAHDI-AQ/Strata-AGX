@@ -134,6 +134,10 @@ void native_rope_apply(const float* x, float* out, int rows, int head_dim,
     const float theta_scale = powf((float) scaling.freq_base, -2.0f / n_rot);
     const RopeKernelArgs k = scaling.kernel_args(n_rot);   // none: the identity constants
     const RopeTab rt = rope_table_for(scaling);
+    // CRIT-CUDA-02: Assert rows bounded to blockIdx.x hardware ceiling (2^31 - 1)
+    if (rows > 1048576) {
+        throw std::invalid_argument("native RoPE rows exceeds supported 1048576 ceiling");
+    }
     const dim3 grid(rows, (head_dim / 2 + 127) / 128);
     if (rt.cos != nullptr)
         apply<true><<<grid, 128, 0, static_cast<cudaStream_t>(stream)>>>(x, out, rows, head_dim, n_rot, theta_scale,

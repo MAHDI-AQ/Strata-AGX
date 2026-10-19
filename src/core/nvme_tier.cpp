@@ -274,6 +274,9 @@ bool NVMeStorageTier::write_node_direct(int64_t node_id, const void* data, size_
                 return false;
             }
             std::memcpy(staging.data(), data, bytes);
+            if (aligned_len > bytes) {
+                std::memset(staging.data() + bytes, 0, aligned_len - bytes);
+            }
             write_ptr = staging.data();
             write_bytes = aligned_len;
         }
