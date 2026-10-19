@@ -171,7 +171,7 @@ main { flex: 1; min-height: 0; display: flex; }
 }
 
 .ctx-card-header { display: flex; justify-content: space-between; align-items: baseline; }
-.slots-container { display: grid; grid-template-columns: 1fr 1fr; gap: var(--st-s-3); margin: var(--st-s-2) 0; }
+.slots-container { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: var(--st-s-3); margin: var(--st-s-2) 0; }
 .slot-box { background: var(--st-surface-2); border: 1px solid var(--st-line); border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
 .slot-head { display: flex; justify-content: space-between; align-items: center; }
 .slot-gauge-wrap { display: flex; justify-content: center; align-items: center; }

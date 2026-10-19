@@ -158,6 +158,35 @@ async function showDetail() {
   $("detail-error").hidden = !value.error; text("detail-error", value.error?.message || ""); content();
 }
 
+
+const SLOT_COLORS = ["var(--st-accent)", "#3b82f6", "#a855f7", "#f59e0b", "#ec4899", "#06b6d4", "#14b8a6", "#8b5cf6"];
+
+function syncMonitorSlots(numSlots) {
+  const container = $("slot-cards") || document.querySelector("#slot-cards");
+  if (!container) return;
+  container.style.gridTemplateColumns = numSlots === 1 ? "1fr" : (numSlots <= 4 ? `repeat(${numSlots}, 1fr)` : "repeat(auto-fit, minmax(280px, 1fr))");
+  const existing = container.querySelectorAll(".card[id^='slot-card-']");
+  if (existing.length !== numSlots) {
+    let html = "";
+    for (let sId = 0; sId < numSlots; sId++) {
+      const col = SLOT_COLORS[sId % SLOT_COLORS.length];
+      html += `
+<div class="card" id="slot-card-${sId}" style="border-left: 4px solid ${col};">
+  <div class="row" style="align-items: baseline;">
+    <div class="label" style="font-weight: 700; color: ${col};">Slot ${sId} · Concurrency Engine</div>
+    <span class="tag" id="slot${sId}-tag" style="margin-left:auto;">Idle</span>
+  </div>
+  <div class="value" style="font-size: 20px; margin: 4px 0;"><span id="slot${sId}-tokens">0 / 0 tokens</span></div>
+  <div class="small" id="slot${sId}-speed" style="color: var(--st-ink-muted);">Waiting for request</div>
+  <div style="background: var(--st-surface-2); height: 6px; border-radius: 3px; margin-top: 8px; overflow: hidden;">
+    <div id="slot${sId}-bar" style="background: ${col}; height: 100%; width: 0%;"></div>
+  </div>
+</div>`;
+    }
+    container.innerHTML = html;
+  }
+}
+
 async function refresh() {
   try {
     const [status, history, metrics] = await Promise.all([
@@ -180,7 +209,8 @@ async function refresh() {
     const loading = records.some(r => r.state === "loading");
     text("loaded", loading ? "Loading…" : inflight ? "In use" : status.loaded ? "Loaded" : "Unloaded");
     $("model-state").className = `value ${inflight || loading ? "busy" : status.loaded ? "loaded" : ""}`;
-    text("model", status.model);
+    const conc = metrics?.engine?.concurrency || status?.concurrency?.serving || 3;
+    text("model", `${status.model || "127.0.0.1:8096"} (C=${conc} Slots)`);
     text("count", records.length);
     text("active", inflight ? `${inflight} active / queued` : status.auto_load ? "Loads automatically on the next request" : "No active requests");
 
@@ -189,12 +219,15 @@ async function refresh() {
     text("speed", speed(last?.timings?.predicted_per_second));
 
     if (metrics && typeof metrics === "object") {
-      // Slot 0 & Slot 1 Rendering (metrics.slots handles array or object or missing)
+      // Dynamic Slot Rendering (supports 1, 2, 3... N slots)
       const slots = Array.isArray(metrics.slots)
         ? metrics.slots
         : (metrics.slots && typeof metrics.slots === "object" ? Object.values(metrics.slots) : []);
+      const eng = (metrics.engine && typeof metrics.engine === "object") ? metrics.engine : {};
+      const numSlots = slots.length || (eng.concurrency || (status?.concurrency?.serving || 2));
+      syncMonitorSlots(numSlots);
 
-      for (let sId = 0; sId < 2; sId++) {
+      for (let sId = 0; sId < numSlots; sId++) {
         const slot = slots.find(s => s && s.id === sId) || { id: sId, status: "idle", prompt_tokens: 0, generated: 0 };
         const tag = $(`slot${sId}-tag`);
         const tokEl = $(`slot${sId}-tokens`);

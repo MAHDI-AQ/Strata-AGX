@@ -207,23 +207,32 @@ function setPill(state, text) {
 function render(m) {
   const live = m.live || {}, hw = m.hardware || {}, st = m.hardware_static || {}, eng = m.engine || {}, h = m.history || {};
   const last = (m.requests || [])[0];
-  // the header pill (multi-slot aware)
+  // the header pill (dynamically slot-aware for 1, 2, 3... N slots)
   const slotsList = m.slots || [];
-  const s0 = slotsList.find(s => s.id === 0) || {};
-  const s1 = slotsList.find(s => s.id === 1) || {};
-  const anyGen = s0.status === "generating" || s1.status === "generating";
-  const anyRead = s0.status === "reading" || s1.status === "reading";
+  const numSlots = slotsList.length || (eng.concurrency || 2);
+  const filledSlots = [];
+  for (let i = 0; i < numSlots; i++) {
+    filledSlots.push(slotsList.find(s => s && s.id === i) || { id: i, status: "idle", prompt_tokens: 0, generated: 0 });
+  }
+  const anyGen = filledSlots.some(s => s.status === "generating");
+  const anyRead = filledSlots.some(s => s.status === "reading");
   if (anyGen) {
-    const s0Txt = s0.status === "generating" ? `${fmt(s0.tok_s || 0, 1)} t/s` : (s0.status || "idle");
-    const s1Txt = s1.status === "generating" ? `${fmt(s1.tok_s || 0, 1)} t/s` : (s1.status || "idle");
-    setPill("generating", `Active · S0: ${s0Txt} · S1: ${s1Txt}`);
+    const summary = filledSlots.map(s => {
+      const sp = s.status === "generating" ? `${fmt(s.tok_s || 0, 1)} t/s` : (s.status || "idle");
+      return `S${s.id}: ${sp}`;
+    }).join(" · ");
+    setPill("generating", `Active · ${summary}`);
   } else if (anyRead) {
-    const rSlot = s0.status === "reading" ? s0 : s1;
-    const tier = rSlot.cache_tier ? `[${rSlot.cache_tier}] ` : "";
-    const pTok = rSlot.prefill_tok_s ? ` · ${fmt(rSlot.prefill_tok_s)} t/s` : "";
-    setPill("reading", `Reading prompt · ${tier}S${rSlot.id || 0}${pTok}`);
+    const rSlots = filledSlots.filter(s => s.status === "reading");
+    const rSummary = rSlots.map(s => {
+      const tier = s.cache_tier ? `[${s.cache_tier}] ` : "";
+      const pTok = s.prefill_tok_s ? ` · ${fmt(s.prefill_tok_s)} t/s` : "";
+      return `${tier}S${s.id}${pTok}`;
+    }).join(", ");
+    setPill("reading", `Reading prompt · ${rSummary}`);
   } else {
-    setPill("idle", "Slots Ready · S0: Idle · S1: Idle");
+    const idleSummary = filledSlots.map(s => `S${s.id}: Idle`).join(" · ");
+    setPill("idle", `Slots Ready · ${idleSummary}`);
   }
   if (live.queued > 0) setPill("queued", `${live.queued} queued`);
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept, m.slots || [], m.radix, m.mtp);
@@ -239,10 +248,77 @@ function renderTotals(t) {
   return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
          `${fmt(t.output_tokens)} written${oSpeed}`;
 }
+const SLOT_COLORS = ["var(--st-accent)", "#3b82f6", "#a855f7", "#f59e0b", "#ec4899", "#06b6d4", "#14b8a6", "#8b5cf6"];
+
+function syncDynamicSlots(numSlots) {
+  // 1. Top state cards grid
+  const stateGrid = $("state-cards-grid") || document.querySelector(".state-cards-grid");
+  if (stateGrid) {
+    stateGrid.style.gridTemplateColumns = numSlots === 1 ? "1fr" : (numSlots <= 4 ? `repeat(${numSlots}, 1fr)` : "repeat(auto-fit, minmax(280px, 1fr))");
+    const existingCards = stateGrid.querySelectorAll(".state-card");
+    if (existingCards.length !== numSlots) {
+      let html = "";
+      for (let sId = 0; sId < numSlots; sId++) {
+        const color = SLOT_COLORS[sId % SLOT_COLORS.length];
+        html += `
+        <div class="st-card state-card" id="state-card-${sId}" style="border-left:4px solid ${color}">
+          <div class="state-card__head">
+            <span class="card-title" style="font-weight:700;color:${color}">Slot ${sId} State</span>
+            <span class="badges" id="state-badges-${sId}">
+              <span class="st-badge" data-s="idle">Idle</span>
+              <span class="st-badge st-badge--reading" data-s="reading">Reading</span>
+              <span class="st-badge st-badge--generating" data-s="generating">Generating</span>
+              <span class="st-badge st-badge--queued" data-s="queued">Queued</span>
+              <span class="st-badge st-badge--error" data-s="error">Error</span>
+            </span>
+          </div>
+          <div class="state-card__row"><span id="state-label-${sId}">Waiting for a request</span><span class="muted" id="state-detail-${sId}"></span></div>
+          <div class="st-progress" id="state-progress-${sId}"><div class="st-progress__bar" id="state-bar-${sId}" style="width:0%"></div></div>
+        </div>`;
+      }
+      stateGrid.innerHTML = html;
+    }
+  }
+
+  // 2. Bottom parallel slots & context fill container
+  const slotsCont = $("slots-container") || document.querySelector(".slots-container");
+  if (slotsCont) {
+    slotsCont.style.gridTemplateColumns = numSlots === 1 ? "1fr" : (numSlots <= 4 ? `repeat(${numSlots}, 1fr)` : "repeat(auto-fit, minmax(180px, 1fr))");
+    const existingBoxes = slotsCont.querySelectorAll(".slot-box");
+    if (existingBoxes.length !== numSlots) {
+      let html = "";
+      for (let sId = 0; sId < numSlots; sId++) {
+        html += `
+            <div class="slot-box" id="slot-${sId}">
+              <div class="slot-head">
+                <span class="slot-name"><b>Slot ${sId}</b></span>
+                <span class="st-badge" id="slot-badge-${sId}">Idle</span>
+              </div>
+              <div class="slot-gauge-wrap">
+                <div class="ctx-gauge ctx-gauge--sm">
+                  <svg class="st-gauge" viewBox="0 0 120 120" aria-hidden="true">
+                    <circle class="st-gauge__track" cx="60" cy="60" r="50" fill="none" stroke-width="10" stroke-linecap="round"
+                            stroke-dasharray="235.6 314.2" transform="rotate(135 60 60)"/>
+                    <circle class="st-gauge__fill" id="ctx-fill-${sId}" cx="60" cy="60" r="50" fill="none" stroke-width="10"
+                            stroke-linecap="round" stroke-dasharray="0 314.2" transform="rotate(135 60 60)"/>
+                  </svg>
+                  <div class="ctx-gauge__label"><span class="ctx-gauge__pct" id="ctx-pct-${sId}">0%</span><span class="muted" id="ctx-sub-${sId}">&ndash;</span></div>
+                </div>
+              </div>
+              <div class="slot-detail-row"><span class="muted">Req / Speed:</span> <span id="slot-speed-${sId}">&ndash;</span></div>
+            </div>`;
+      }
+      slotsCont.innerHTML = html;
+    }
+  }
+}
+
 function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, slotsList, radixData, mtpData) {
-  // Dual Slot State Cards rendering (Slot 0 and Slot 1)
+  // Dynamic Slot State Cards rendering (supports 1, 2, 3... N slots)
+  const numSlots = (slotsList && slotsList.length) ? slotsList.length : (eng.concurrency || 2);
+  syncDynamicSlots(numSlots);
   const slots = slotsList || [];
-  for (let sId = 0; sId < 2; sId++) {
+  for (let sId = 0; sId < numSlots; sId++) {
     const slot = slots.find(s => s.id === sId) || { id: sId, status: "idle", prompt_tokens: 0, generated: 0 };
     const onSlot = (slot.status === "reading" || slot.status === "generating") ? slot.status : (live.queued > 0 && sId === 0 ? "queued" : "idle");
     for (const b of document.querySelectorAll(`#state-badges-${sId} .st-badge`)) {
@@ -323,11 +399,10 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, slots
 
   // context fill & parallel slot rendering
   const ctx = eng.max_context || 0;
-  const numSlots = slots.length || (eng.concurrency || 2);
   if ($("slots-summary")) $("slots-summary").textContent = `${numSlots} Parallel Slots · ${ctxfmt(ctx)} each`;
 
-  // Render each slot individually
-  for (let sId = 0; sId < 2; sId++) {
+  // Render each slot individually (dynamic for numSlots)
+  for (let sId = 0; sId < numSlots; sId++) {
     const slot = slots.find(s => s.id === sId) || { id: sId, status: "idle", prompt_tokens: 0, generated: 0 };
     let sUsed = (slot.prompt_tokens || 0) + (slot.generated || 0);
     // If idle and this slot has a recorded last_request

@@ -25,8 +25,8 @@ header{height:70px;padding:0 32px;display:flex;align-items:center;justify-conten
 <div class="card"><div class="label">Last Decode Speed</div><div id="speed" class="value">—</div><div class="small">Engine timing · tokens / second</div></div>
 </div>
 
-<!-- Dual Slot State Cards -->
-<div class="cards" style="grid-template-columns: repeat(2, 1fr); margin: 0 0 14px 0; gap: 14px;">
+<!-- Dynamic Slot State Cards -->
+<div class="cards" id="slot-cards" style="grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); margin: 0 0 14px 0; gap: 14px;">
 <div class="card" id="slot-card-0" style="border-left: 4px solid var(--st-accent);">
   <div class="row" style="align-items: baseline;">
     <div class="label" style="font-weight: 700; color: var(--st-accent);">Slot 0 · Concurrency Engine</div>
@@ -113,7 +113,7 @@ header{height:70px;padding:0 32px;display:flex;align-items:center;justify-conten
 (function(){
   const grid = document.getElementById("fork-grid");
   if (grid) {
-    const facts = ["Continuation concurrency", "c2 slots x 262,144 tokens + queue"],
+    const facts = ["Continuation concurrency", "dynamic slots x 262,144 tokens + queue"],
  ["Unit packing (--unit-wait-ms)", "12 ms boundary wait: 2-agent aggregate ~211 tok/s"],
  ["Routed-only expert staging (ring)", "wait-copy 590-1165 ms \u2192 46-67 ms per chunk"],
  ["Capture-priority deep reserve", "deep RadixTree captures kept: census 33% \u2192 58-62%"],
@@ -140,7 +140,7 @@ header{height:70px;padding:0 32px;display:flex;align-items:center;justify-conten
       const el = document.getElementById("fork-live");
       const recs = (typeof records !== "undefined" && Array.isArray(records)) ? records : [];
       const act = recs.filter(x => !["completed", "error", "disconnected"].includes(x.state)).length;
-      const bits = [["engine", h.service || "strata-agx"], ["version", h.version || "?"], ["slots", "2"], ["active", act], ["events kept", recs.length]];
+      const bits = [["engine", h.service || "strata-agx"], ["version", h.version || "?"], ["slots", (typeof state !== "undefined" && state?.concurrency?.serving) ? state.concurrency.serving : (h.concurrency || 3)], ["active", act], ["events kept", recs.length]];
       el.replaceChildren(...bits.map(([k, v]) => {
         const sp = document.createElement("span");
         sp.appendChild(document.createTextNode(k + " "));

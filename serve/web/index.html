@@ -73,7 +73,7 @@
   <!-- ============================ Monitor ============================ -->
   <section class="view view--monitor" id="view-monitor" role="tabpanel" aria-labelledby="tab-btn-monitor" hidden>
     <div class="monitor">
-      <div class="state-cards-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+      <div class="state-cards-grid" id="state-cards-grid" style="display:grid;grid-template-columns:repeat(auto-fit, minmax(280px, 1fr));gap:16px;margin-bottom:16px">
         <div class="st-card state-card" id="state-card-0" style="border-left:4px solid var(--st-accent)">
           <div class="state-card__head">
             <span class="card-title" style="font-weight:700;color:var(--st-accent)">Slot 0 State</span>
