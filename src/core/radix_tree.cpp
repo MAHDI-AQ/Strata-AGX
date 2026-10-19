@@ -632,6 +632,7 @@ void RadixTree::nvme_worker_loop() {
             nvme_queue_.pop();
         }
 
+        try {
         if (nvme_tier_ && task.payload.data() && task.total_payload > 0) {
             // Task 4: I/O priority gate - yield background writes while active L3 read is in flight
             while (in_flight_l3_reads_.load(std::memory_order_relaxed) > 0 && !nvme_stop_.load()) {
@@ -647,7 +648,7 @@ void RadixTree::nvme_worker_loop() {
                     if (task.free_host_on_write) {
                         node->free_host();
                     }
-                    this->persist_manifest();
+                    this->persist_manifest_locked();
                 } else {
                     if (cached_nvme_snapshots_.load(std::memory_order_relaxed) > 0) cached_nvme_snapshots_.fetch_sub(1, std::memory_order_relaxed);
                 }
@@ -668,6 +669,11 @@ void RadixTree::nvme_worker_loop() {
             while (cur > 0 && !staging_nvme_bytes_.compare_exchange_weak(
                        cur, (cur >= task.total_payload) ? (cur - task.total_payload) : 0,
                        std::memory_order_relaxed)) {}
+        }
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[RadixTree] nvme_worker_loop caught exception: %s\n", e.what());
+        } catch (...) {
+            std::fprintf(stderr, "[RadixTree] nvme_worker_loop caught unknown exception\n");
         }
     }
 }
@@ -2577,6 +2583,10 @@ namespace strata::core {
 
 bool RadixTree::persist_manifest(const std::string& model_id_hash) {
     std::shared_lock<std::shared_mutex> lock(rw_lock_);
+    return persist_manifest_locked(model_id_hash);
+}
+
+bool RadixTree::persist_manifest_locked(const std::string& model_id_hash) {
     if (!nvme_tier_) return false;
 
     std::string manifest_path = nvme_tier_->base_path() + "/radix_manifest.bin";

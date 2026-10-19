@@ -2282,6 +2282,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         err = "prefill: copy stream wait on micro-chunk event failed";
                         return false;
                     }
+                    // CRIT-CUDA-01: Synchronize with GPU 1 before initiating next P2P copy to prevent WAR hazard on next_->impl_->R
+                    if (next_run.valid() && !next_run.get()) { err = next_err; return false; }
                     bool p2p_done = false;
                     if (next_->impl_->device >= 0 && next_->impl_->R != nullptr) {
                         if (cudaMemcpyPeerAsync(next_->impl_->R, next_->impl_->device,
@@ -2297,7 +2299,6 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         return false;
                     }
                     cudaEventRecord(ev_l24, copy_stream);
-                    if (next_run.valid() && !next_run.get()) { err = next_err; return false; }
                     ChainGate* gate = chain ? chain_gate_ : nullptr;
                     if (gate != nullptr) gate->acquire();
                     next_->hand_in_ = p2p_done ? (const float*) 0x1 : (h + (size_t) u0 * D);
@@ -2334,6 +2335,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 err = "prefill: copy stream wait on hand-off event failed";
                 return false;
             }
+            // CRIT-CUDA-01: Synchronize with GPU 1 before initiating next P2P copy to prevent WAR hazard on next_->impl_->R
+            if (next_run.valid() && !next_run.get()) { err = next_err; return false; }
             bool p2p_done = false;
             if (next_->impl_->device >= 0 && next_->impl_->R != nullptr) {
                 if (cudaMemcpyPeerAsync(next_->impl_->R, next_->impl_->device,
@@ -2348,7 +2351,6 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             }
             cudaEventRecord(ev_l24, copy_stream);
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
-            if (next_run.valid() && !next_run.get()) { err = next_err; return false; }
             ChainGate* gate = chain ? chain_gate_ : nullptr;
             if (gate != nullptr) gate->acquire();
             next_->hand_in_ = p2p_done ? (const float*) 0x1 : h;
