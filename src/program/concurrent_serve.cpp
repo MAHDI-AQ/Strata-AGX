@@ -2151,18 +2151,6 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                         pick = p;
                         pick_q = q;
                         pick_prompt_snap = false;
-                    } else if (p->prompt_saved_prefix >= 64 && p->prompt_saved_prefix <= nmax && p->prompt_saved_prefix > best && p->stages[0].prompt_gdn_saved) {
-                        // Multi-turn resilience: fallback to prompt-end snapshot if generation diverged
-                        bool prompt_match = true;
-                        for (int64_t i = 0; i < p->prompt_saved_prefix && prompt_match; ++i) {
-                            prompt_match = (p->prompt_saved_consumed[(size_t) i] == (int32_t) tokens[(size_t) i]);
-                        }
-                        if (prompt_match) {
-                            best = p->prompt_saved_prefix;
-                            pick = p;
-                            pick_q = q;
-                            pick_prompt_snap = true;
-                        }
                     }
                 }
             }
@@ -2259,17 +2247,6 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                         pick_parent = p;
                         pick_q = q;
                         pick_prompt_snap = false;
-                    } else if (p->prompt_saved_prefix >= 64 && p->prompt_saved_prefix <= nmax && p->prompt_saved_prefix > best && p->stages[0].prompt_gdn_saved) {
-                        bool prompt_same = true;
-                        for (int64_t i = 0; i < p->prompt_saved_prefix && prompt_same; ++i) {
-                            prompt_same = (p->prompt_saved_consumed[(size_t) i] == (int32_t) tokens[(size_t) i]);
-                        }
-                        if (prompt_same) {
-                            best = p->prompt_saved_prefix;
-                            pick_parent = p;
-                            pick_q = q;
-                            pick_prompt_snap = true;
-                        }
                     }
                 }
             }

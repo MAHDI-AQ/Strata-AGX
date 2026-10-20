@@ -246,11 +246,17 @@ bool session_fork(const SessionState& parent, SessionState& child, const ModelGe
             // Indexer tail and dead states
             const size_t tail_bytes = (size_t) (s.idx_block - 1) * s.idx_dim * sizeof(float);
             const size_t dead_bytes = (size_t) s.idx_dim * sizeof(float);
-            if (pst.idx_tail && cst.idx_tail) cudaMemcpyAsync(cst.idx_tail, pst.idx_tail, tail_bytes, cudaMemcpyDeviceToDevice, cs);
-            if (pst.idx_dead && cst.idx_dead) cudaMemcpyAsync(cst.idx_dead, pst.idx_dead, dead_bytes, cudaMemcpyDeviceToDevice, cs);
-            if (pst.idx_block_pos && cst.idx_block_pos) cudaMemcpyAsync(cst.idx_block_pos, pst.idx_block_pos, sizeof(int32_t), cudaMemcpyDeviceToDevice, cs);
+            if (pst.idx_tail && cst.idx_tail && pst.idx_tail != cst.idx_tail) cudaMemcpyAsync(cst.idx_tail, pst.idx_tail, tail_bytes, cudaMemcpyDeviceToDevice, cs);
+            if (pst.idx_dead && cst.idx_dead && pst.idx_dead != cst.idx_dead) cudaMemcpyAsync(cst.idx_dead, pst.idx_dead, dead_bytes, cudaMemcpyDeviceToDevice, cs);
+            if (cst.idx_block_pos) {
+                const int32_t expected_pos = (int32_t) (prefix_tokens % s.idx_block);
+                cudaMemcpy(cst.idx_block_pos, &expected_pos, sizeof(int32_t), cudaMemcpyHostToDevice);
+            }
+            if (prefix_tokens % s.idx_block == 0 && cst.idx_tail) {
+                cudaMemsetAsync(cst.idx_tail, 0, tail_bytes, cs);
+            }
             const int64_t pooled_rows = prefix_tokens / s.idx_block;
-            if (pooled_rows > 0 && pst.idx_pooled && cst.idx_pooled) {
+            if (pooled_rows > 0 && pst.idx_pooled && cst.idx_pooled && pst.idx_pooled != cst.idx_pooled) {
                 cudaMemcpyAsync(cst.idx_pooled, pst.idx_pooled, (size_t) pooled_rows * s.idx_dim * sizeof(float), cudaMemcpyDeviceToDevice, cs);
                 cudaMemcpyAsync(cst.idx_pooled + (size_t) pooled_rows * s.idx_dim, pst.idx_dead, dead_bytes, cudaMemcpyDeviceToDevice, cs);
             }
