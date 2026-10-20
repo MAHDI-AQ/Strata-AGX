@@ -177,3 +177,93 @@ class TestPrecallChatterGuard(unittest.TestCase):
         content_events = [e for e in events if e.kind == "content"]
         content_text = "".join(e.text for e in content_events)
         self.assertIn("Here is the answer to your query.", content_text)
+
+
+class TestUniversalDialectRecovery(unittest.TestCase):
+    def setUp(self):
+        self.tools = [{
+            "name": "search_files",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer"},
+                    "path": {"type": "string"},
+                    "pattern": {"type": "string"},
+                    "target": {"type": "string"},
+                }
+            }
+        }]
+
+    def test_turn17_double_bracket_and_param_name_recovery(self):
+        # Exact reproduction of greeting-hermes-assistant-20261020.json Turn 17
+        parser = OutputParser(thinking=True, tools=self.tools, stream_tools=True)
+        raw = (
+            "<think>\nNeed to search Obsidian.\n</think>\n"
+            "<<function_calls>\n"
+            "<parameter=limit>\n50\n</parameter>\n"
+            "<parameter=path>\n.\n</parameter>\n"
+            "<parameter=pattern>\n*\n</parameter>\n"
+            "<parameter=target>\nfiles\n</parameter>\n"
+            "<parameter=name>\nsearch_files\n</parameter>"
+        )
+        events = []
+        for i in range(0, len(raw), 7):
+            events.extend(parser.feed(raw[i:i + 7]))
+        events.extend(parser.finish())
+
+        # Must not emit tool calls as content!
+        content_events = [e for e in events if e.kind == "content"]
+        self.assertEqual(len(content_events), 0, f"Expected 0 content events, got: {content_events}")
+
+        # Must emit tool_call with parsed arguments
+        tool_call_events = [e for e in events if e.kind == "tool_call"]
+        self.assertEqual(len(tool_call_events), 1)
+        call = tool_call_events[0].call
+        self.assertEqual(call.name, "search_files")
+        self.assertEqual(call.arguments.get("limit"), 50)
+        self.assertEqual(call.arguments.get("path"), ".")
+        self.assertEqual(call.arguments.get("pattern"), "*")
+        self.assertEqual(call.arguments.get("target"), "files")
+        self.assertNotIn("name", call.arguments)
+
+    def test_plural_function_calls_with_closing_tag(self):
+        parser = OutputParser(thinking=False, tools=self.tools, stream_tools=True)
+        raw = (
+            "<function_calls>\n"
+            "<function=search_files>\n"
+            "<parameter=path>.</parameter>\n"
+            "</function>\n"
+            "</function_calls>"
+        )
+        events = []
+        for i in range(0, len(raw), 4):
+            events.extend(parser.feed(raw[i:i + 4]))
+        events.extend(parser.finish())
+
+        tool_call_events = [e for e in events if e.kind == "tool_call"]
+        self.assertEqual(len(tool_call_events), 1)
+        self.assertEqual(tool_call_events[0].call.name, "search_files")
+        self.assertEqual(tool_call_events[0].call.arguments.get("path"), ".")
+
+    def test_precall_chatter_with_function_calls(self):
+        parser = OutputParser(thinking=True, tools=self.tools, stream_tools=True)
+        raw = (
+            "<think>\nPlanning search.\n</think>\n"
+            "I will search for the markdown files now.\n"
+            "<<function_calls>\n"
+            "<parameter=name>search_files</parameter>\n"
+            "<parameter=path>.</parameter>\n"
+            "</function_calls>"
+        )
+        events = parser.feed(raw)
+        events.extend(parser.finish())
+
+        content_events = [e for e in events if e.kind == "content"]
+        self.assertEqual(len(content_events), 0)
+        reasoning_events = [e for e in events if e.kind == "reasoning"]
+        reasoning_text = "".join(e.text for e in reasoning_events)
+        self.assertIn("I will search for the markdown files now.", reasoning_text)
+
+        tool_calls = [e for e in events if e.kind == "tool_call"]
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0].call.name, "search_files")
