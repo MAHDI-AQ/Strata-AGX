@@ -345,6 +345,12 @@ struct ConcurrentServe::Impl {
             float* R_saved = nullptr;
             int32_t ple_prev_saved[2] = {-1, -1};
             int32_t ple_token_saved = -1;
+            // Phase 4: Dedicated prompt-end snapshot buffers (never overwritten on finish)
+            float* prompt_gdn_saved = nullptr;
+            float* prompt_ple_saved = nullptr;
+            float* prompt_R_saved = nullptr;
+            int32_t prompt_ple_prev_saved[2] = {-1, -1};
+            int32_t prompt_ple_token_saved = -1;
             // Frontier 2: Non-blocking multi-stage KV fork overlapping
             cudaEvent_t fork_event = nullptr;
             bool fork_in_flight = false;
@@ -390,6 +396,8 @@ struct ConcurrentServe::Impl {
         std::atomic<double> prompt_ms{0};
         Clock::time_point decode_start{};
         int64_t saved_prefix = 0;
+        int64_t prompt_saved_prefix = 0;
+        std::vector<int32_t> prompt_saved_consumed;
         int64_t root_at = -1;            // Phase 1: End of system prompt (<|im_start|>user boundary)
         int64_t turn_at = -1;            // Phase 1: Last turn boundary
         std::vector<int64_t> turn_boundaries;
@@ -409,6 +417,9 @@ struct ConcurrentServe::Impl {
                 if (gs.gdn_saved) cudaFree(gs.gdn_saved);
                 if (gs.ple_saved) cudaFree(gs.ple_saved);
                 if (gs.R_saved) cudaFree(gs.R_saved);
+                if (gs.prompt_gdn_saved) cudaFree(gs.prompt_gdn_saved);
+                if (gs.prompt_ple_saved) cudaFree(gs.prompt_ple_saved);
+                if (gs.prompt_R_saved) cudaFree(gs.prompt_R_saved);
                 if (gs.fork_event) cudaEventDestroy(gs.fork_event);
             }
         }
@@ -1301,7 +1312,38 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             if (n < 64 || n > pos) continue;
             if (n != pos && (pos - n) > 6208) continue;
             s.prompt_snap_done = true;
-            save_slot_snapshot(s, n, s.consumed, /*safe_no_evict=*/false);   // S26f7/S26f9
+            s.prompt_saved_prefix = n;
+            s.prompt_saved_consumed.assign(s.consumed.begin(), s.consumed.begin() + n);
+            for (size_t st = 0; st < m.stages.size(); ++st) {
+                auto& ss = s.stages[st];
+                const core::OnDevice on(m.stages[st].device);
+                if (!ss.prompt_gdn_saved && ss.state->gdn_alloc > 0) {
+                    cudaMalloc(&ss.prompt_gdn_saved, (size_t) ss.state->gdn_alloc * core::gdn_state_floats(g) * sizeof(float));
+                }
+                if (ss.prompt_gdn_saved && ss.state->gdn_state) {
+                    cudaMemcpyAsync(ss.prompt_gdn_saved, ss.state->gdn_state,
+                                    (size_t) ss.state->gdn_alloc * core::gdn_state_floats(g) * sizeof(float),
+                                    cudaMemcpyDeviceToDevice, m.stage_rt[st].prompt_stream);
+                }
+                if (!ss.prompt_ple_saved && ss.state->ple_hist) {
+                    cudaMalloc(&ss.prompt_ple_saved, (size_t) core::ple_hist_bytes());
+                }
+                if (ss.prompt_ple_saved && ss.state->ple_hist) {
+                    cudaMemcpyAsync(ss.prompt_ple_saved, ss.state->ple_hist, (size_t) core::ple_hist_bytes(),
+                                    cudaMemcpyDeviceToDevice, m.stage_rt[st].prompt_stream);
+                }
+                if (!ss.prompt_R_saved && ss.state->block.R) {
+                    cudaMalloc(&ss.prompt_R_saved, (size_t) g.hc * g.n_embd * sizeof(float));
+                }
+                if (ss.prompt_R_saved && ss.state->block.R) {
+                    cudaMemcpyAsync(ss.prompt_R_saved, ss.state->block.R, (size_t) g.hc * g.n_embd * sizeof(float),
+                                    cudaMemcpyDeviceToDevice, m.stage_rt[st].prompt_stream);
+                }
+                ss.prompt_ple_prev_saved[0] = ss.state->ple_prev[0];
+                ss.prompt_ple_prev_saved[1] = ss.state->ple_prev[1];
+                ss.prompt_ple_token_saved = ss.state->ple_token;
+            }
+            save_slot_snapshot(s, n, s.consumed, /*safe_no_evict=*/true);   // Permanent system root
         }
     };
     auto finish = [&](Impl::Slot& s, const char* reason) {
@@ -1816,7 +1858,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     // on each stage's device, drafter re-arm), plus the live-retention arm. `reused` = tokens of this
     // request the slot's sessions already hold (0 = fresh: zero every stage, today's path). The caller
     // has moved the request in and holds the pump fence; the pump only sees the slot after pump_resume.
-    auto admit_slot = [&](Impl::Slot& s, int64_t reused, Impl::Slot* parent = nullptr, std::shared_ptr<core::RadixNode> radix_parent = nullptr) -> bool {
+    auto admit_slot = [&](Impl::Slot& s, int64_t reused, Impl::Slot* parent = nullptr, std::shared_ptr<core::RadixNode> radix_parent = nullptr, bool from_prompt_snapshot = false) -> bool {
         if ((int64_t) s.request.tokens.size() > s.max_context) { err = "concurrency: request prompt (" + std::to_string(s.request.tokens.size()) + ") exceeds slot context (" + std::to_string(s.max_context) + ")"; return false; }
         if (m.lazy_slots && !s.brought_up && !bringup_slot(s, err)) return false;
         s.read.store(reused); s.generated = s.offered = s.accepted = 0;
@@ -1838,6 +1880,8 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
         if (reused == 0) {
             s.saved_prefix = 0;
             s.saved_consumed.clear();
+            s.prompt_saved_prefix = 0;
+            s.prompt_saved_consumed.clear();
             if (!s.shared_kv_pages.empty()) {
                 if (auto pool = radix_tree.kv_pool()) {
                     pool->release_pages(s.shared_kv_pages);
@@ -1887,7 +1931,8 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             std::fprintf(stderr, "strata-agx concurrent: radix-tree fork: slot forks %lld tokens from RadixNode #%lld (%s)\n", (long long) reused, (long long) radix_parent->id, s.cache_tier.c_str());
         } else if (parent != nullptr) {
             // SPRINT 1: Cross-slot or self-slot prefix fork from snapshot
-            s.consumed.assign(parent->saved_consumed.begin(), parent->saved_consumed.begin() + reused);
+            const auto& consumed_src = from_prompt_snapshot ? parent->prompt_saved_consumed : parent->saved_consumed;
+            s.consumed.assign(consumed_src.begin(), consumed_src.begin() + reused);
             // Frontier 2: Non-blocking multi-stage KV fork overlapping
             // Dispatch asynchronous snapshot fork concurrently across each stage's prompt stream
             // and record a completion event per stage instead of host-blocking synchronization.
@@ -1895,10 +1940,15 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 const core::OnDevice on(m.stages[st].device);
                 std::string fork_err;
                 const auto& ps = parent->stages[st];
+                const float* r_src = from_prompt_snapshot ? ps.prompt_R_saved : ps.R_saved;
+                const float* gdn_src = from_prompt_snapshot ? ps.prompt_gdn_saved : ps.gdn_saved;
+                const float* ple_src = from_prompt_snapshot ? ps.prompt_ple_saved : ps.ple_saved;
+                const int32_t* ple_prev_src = from_prompt_snapshot ? ps.prompt_ple_prev_saved : ps.ple_prev_saved;
+                const int32_t ple_tok_src = from_prompt_snapshot ? ps.prompt_ple_token_saved : ps.ple_token_saved;
                 if (!core::session_fork(*ps.state, *s.stages[st].state, g, reused,
                                         (void*) m.stage_rt[st].prompt_stream, fork_err,
-                                        ps.R_saved, ps.gdn_saved, ps.ple_saved,
-                                        ps.ple_prev_saved, ps.ple_token_saved)) {
+                                        r_src, gdn_src, ple_src,
+                                        ple_prev_src, ple_tok_src)) {
                     err = "concurrency: snapshot fork failed on stage " + std::to_string(st) + ": " + fork_err;
                     return false;
                 }
@@ -1915,9 +1965,11 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 }
                 s.draft->kv_restore(reused);
             }
-            s.cache_tier = (parent == &s ? "VRAM-Warm" : "VRAM");
-            std::fprintf(stderr, "strata-agx concurrent: snapshot fork: slot forks %lld tokens from %s (saved=%lld)\n",
-                         (long long) reused, (parent == &s ? "self" : "parent"), (long long) parent->saved_prefix);
+            s.cache_tier = (parent == &s ? (from_prompt_snapshot ? "VRAM-Prompt" : "VRAM-Warm") : "VRAM");
+            std::fprintf(stderr, "strata-agx concurrent: snapshot fork: slot forks %lld tokens from %s (%s, saved=%lld)\n",
+                         (long long) reused, (parent == &s ? "self" : "parent"),
+                         (from_prompt_snapshot ? "prompt_snap" : "full_snap"),
+                         (long long) (from_prompt_snapshot ? parent->prompt_saved_prefix : parent->saved_prefix));
         } else {
             // Intra-slot retention: restore verified GDN/PLE/QSA snapshot state to prevent state corruption across turns
             if (s.saved_prefix >= reused && s.stages[0].gdn_saved) {
@@ -2075,6 +2127,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             Impl::Slot* pick = nullptr;
             size_t pick_q = 0;
             int64_t best = 0;
+            bool pick_prompt_snap = false;
             const size_t qn = std::min<size_t>(pending.size(), kAdmissionScanQueue);
             for (size_t q = 0; q < qn; ++q) {
                 const auto& tokens = pending[q].tokens;
@@ -2089,18 +2142,27 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                     if (pending[q].session != 0 && p->session != 0 && p->session != pending[q].session) continue;
 
                     const int64_t saved_len = p->saved_prefix;
-                    if (saved_len < 64 || saved_len > nmax || saved_len <= best) continue;
-                    if (!p->stages[0].gdn_saved) continue;
-
-                    // Exact token prefix match against slot's verified VRAM snapshot
-                    bool exact_match = true;
+                    bool exact_match = (saved_len >= 64 && saved_len <= nmax && saved_len > best && p->stages[0].gdn_saved);
                     for (int64_t i = 0; i < saved_len && exact_match; ++i) {
                         exact_match = (p->saved_consumed[(size_t) i] == (int32_t) tokens[(size_t) i]);
                     }
-                    if (exact_match && saved_len > best) {
+                    if (exact_match) {
                         best = saved_len;
                         pick = p;
                         pick_q = q;
+                        pick_prompt_snap = false;
+                    } else if (p->prompt_saved_prefix >= 64 && p->prompt_saved_prefix <= nmax && p->prompt_saved_prefix > best && p->stages[0].prompt_gdn_saved) {
+                        // Multi-turn resilience: fallback to prompt-end snapshot if generation diverged
+                        bool prompt_match = true;
+                        for (int64_t i = 0; i < p->prompt_saved_prefix && prompt_match; ++i) {
+                            prompt_match = (p->prompt_saved_consumed[(size_t) i] == (int32_t) tokens[(size_t) i]);
+                        }
+                        if (prompt_match) {
+                            best = p->prompt_saved_prefix;
+                            pick = p;
+                            pick_q = q;
+                            pick_prompt_snap = true;
+                        }
                     }
                 }
             }
@@ -2110,7 +2172,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             s.request = std::move(pending[pick_q]);
             pending.erase(pending.begin() + (std::ptrdiff_t) pick_q);
             // Admit slot with parent == &s to trigger instant VRAM snapshot restore!
-            if (!admit_slot(s, best, &s)) return 1;
+            if (!admit_slot(s, best, &s, nullptr, pick_prompt_snap)) return 1;
             admitted_this_round.push_back(&s);
         }
 
@@ -2175,6 +2237,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             Impl::Slot* pick_parent = nullptr;
             size_t pick_q = 0;
             int64_t best = 0;
+            bool pick_prompt_snap = false;
             const size_t qn = std::min<size_t>(pending.size(), kAdmissionScanQueue);
             for (size_t q = 0; q < qn; ++q) {
                 const auto& tokens = pending[q].tokens;
@@ -2185,10 +2248,9 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                 for (auto& p_ptr : m.slots) {
                     auto* p = p_ptr.get();
                     const int64_t valid_len = p->saved_prefix;
-                    if (valid_len < 64 || valid_len > nmax || valid_len <= best) continue;
                     // Enforce session affinity: cross-slot snapshot reuse only permitted for same session
                     if (pending[q].session != 0 && p->session != 0 && p->session != pending[q].session) continue;
-                    bool same = true;
+                    bool same = (valid_len >= 64 && valid_len <= nmax && valid_len > best && p->stages[0].gdn_saved);
                     for (int64_t i = 0; i < valid_len && same; ++i) {
                         same = (p->saved_consumed[(size_t) i] == (int32_t) tokens[(size_t) i]);
                     }
@@ -2196,6 +2258,18 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                         best = valid_len;
                         pick_parent = p;
                         pick_q = q;
+                        pick_prompt_snap = false;
+                    } else if (p->prompt_saved_prefix >= 64 && p->prompt_saved_prefix <= nmax && p->prompt_saved_prefix > best && p->stages[0].prompt_gdn_saved) {
+                        bool prompt_same = true;
+                        for (int64_t i = 0; i < p->prompt_saved_prefix && prompt_same; ++i) {
+                            prompt_same = (p->prompt_saved_consumed[(size_t) i] == (int32_t) tokens[(size_t) i]);
+                        }
+                        if (prompt_same) {
+                            best = p->prompt_saved_prefix;
+                            pick_parent = p;
+                            pick_q = q;
+                            pick_prompt_snap = true;
+                        }
                     }
                 }
             }
@@ -2221,7 +2295,7 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             auto& s = *pick_child;
             s.request = std::move(pending[pick_q]);
             pending.erase(pending.begin() + (std::ptrdiff_t) pick_q);
-            if (!admit_slot(s, best, pick_parent)) return 1;
+            if (!admit_slot(s, best, pick_parent, nullptr, pick_prompt_snap)) return 1;
             admitted_this_round.push_back(&s);
         }
 

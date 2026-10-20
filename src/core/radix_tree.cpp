@@ -1203,7 +1203,7 @@ std::shared_ptr<RadixNode> RadixTree::insert(
             size_t split_pages = (match_edge + (kPageTokens - 1)) / kPageTokens;
             split_node->kv_page_ids = child->slice_page_ids(0, split_pages);
 
-            if (match_edge % 16 == 0) {
+            if (match_edge % kPageTokens == 0) {
                 child->kv_page_ids = child->slice_page_ids(split_pages, child->kv_page_ids.size() > split_pages ? child->kv_page_ids.size() - split_pages : 0);
             } else {
                 std::vector<int32_t> child_pages;
@@ -1333,6 +1333,9 @@ std::shared_ptr<RadixNode> RadixTree::insert(
     }
 
     if (vram_budget_ == 0 || max_cached_snapshots_ == 0) {
+        if (max_host_snapshots_ > 0) {
+            return insert_direct_device_to_host(tokens, n, prefix_len, stage_devices, states, R_ptrs, g, streams, safe_no_evict);
+        }
         return curr;
     }
 
@@ -2271,7 +2274,7 @@ std::shared_ptr<RadixNode> RadixTree::insert_direct_device_to_host(
             size_t split_pages = (match_edge + (kPageTokens - 1)) / kPageTokens;
             split_node->kv_page_ids = child->slice_page_ids(0, split_pages);
 
-            if (match_edge % 16 == 0) {
+            if (match_edge % kPageTokens == 0) {
                 child->kv_page_ids = child->slice_page_ids(split_pages, child->kv_page_ids.size() > split_pages ? child->kv_page_ids.size() - split_pages : 0);
             } else {
                 std::vector<int32_t> child_pages;
