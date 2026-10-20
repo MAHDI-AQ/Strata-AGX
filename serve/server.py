@@ -1966,7 +1966,12 @@ class Service:
             "<|vision_start|>", "<|vision_end|>", "<|video_start|>", "<|video_end|>",
             "<|image_pad|>", "<|video_pad|>",
             "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>",
-            "</think>", "<think>"
+            "</think>", "<think>",
+            "<tool_call>", "</tool_call>",
+            "<function=", "</function>",
+            "<parameter=", "</parameter>",
+            "<tool_response>", "</tool_response>",
+            "<tools>", "</tools>"
         }
         if hasattr(self.tok, "all_special_tokens") and self.tok.all_special_tokens:
             specials_set.update(self.tok.all_special_tokens)

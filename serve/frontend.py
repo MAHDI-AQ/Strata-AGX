@@ -549,26 +549,86 @@ def sanitize_pua(text: str) -> str:
 
 
 
+PARAM_PREFIX_RE = re.compile(
+    r"<\s*(?:parameter|param|arg)(?:\s*=\s*|\s+name\s*=\s*['\"]?|:|\s+name\s*>)",
+    re.IGNORECASE
+)
+
+PARAM_START_RE = re.compile(
+    r"<\s*(?:parameter|param|arg)(?:\s*=\s*|\s+name\s*=\s*['\"]?|:|\s+name\s*>)(?P<name>[a-zA-Z0-9_\.\-]+)['\"]?\s*>",
+    re.IGNORECASE
+)
+
+PARAM_UNIVERSAL_RE = re.compile(
+    r"<\s*(?:parameter|param|arg)"
+    r"(?:\s*=\s*|\s+name\s*=\s*['\"]?|:|\s+name\s*>)"
+    r"(?P<name>[a-zA-Z0-9_\.\-]+)['\"]?\s*>"
+    r"(?P<value>[\s\S]*?)"
+    r"(?:<\s*/\s*(?:parameter|param|arg)\s*>|"
+    r"(?=<\s*(?:parameter|param|arg)(?:=|\s+name|:|\s+name\s*>))|"
+    r"(?=<\s*/\s*(?:function|call)\s*>)|"
+    r"(?=<\s*(?:tool_call|function)))",
+    re.IGNORECASE
+)
+
+PARAM_UNCLOSED_RE = re.compile(
+    r"<\s*(?:parameter|param|arg)(?:=|\s+name\s*=\s*['\"]?|:|\s+name\s*>)"
+    r"(?P<name>[a-zA-Z0-9_\.\-]+)['\"]?\s*>"
+    r"(?P<value>[\s\S]+)$",
+    re.IGNORECASE
+)
+
+FUNC_HEADER_RE = re.compile(
+    r"<\s*(?:function|invoke|call)(?:\s*=\s*|\s+name\s*=\s*['\"]?)(?P<name>[a-zA-Z0-9_\.\-]+)['\"]?\s*>",
+    re.IGNORECASE
+)
+
+
 def param_end(text: str, final: bool = False) -> int:
     """Where a parameter value in `text` ends: the first `</parameter>` followed (after whitespace) by the next
     `<parameter=`, `</function>`, or `</tool_call>` - the same text inside a value (a file that documents the call format, #210) is
-    part of the value.  -1: none yet; -2: a candidate whose follower has not arrived (streaming; `final` accepts it)."""
+    part of the value.  -1: none yet; -2: a candidate whose follower has not arrived (streaming; `final` accepts it).
+    CRIT-INVARIANT: A parameter value MUST NEVER swallow a subsequent <tool_call>, <function=, </function>, </tool_call>,
+    or <|im_start|>. If a hard boundary appears before a valid </parameter>, the parameter ends immediately before that boundary.
+    """
     at = text.find(PARAM_END)
+
+    hard_boundaries = []
+    for tag in (CALL_START, "<function=", FUNC_END, CALL_END, "<|im_start|>", "<|im_end|>"):
+        idx = text.find(tag)
+        if idx >= 0:
+            hard_boundaries.append(idx)
+    m_p = PARAM_PREFIX_RE.search(text)
+    if m_p:
+        hard_boundaries.append(m_p.start())
+
+    first_hb = min(hard_boundaries) if hard_boundaries else -1
+
+    if first_hb >= 0 and (at < 0 or first_hb < at):
+        return first_hb
+
     while at >= 0:
         after = text[at + len(PARAM_END):].lstrip()
-        if after.startswith(("<parameter=", FUNC_END, CALL_END)):
+        if after.startswith(("<parameter=", "<param=", "<arg=", FUNC_END, CALL_END)) or PARAM_PREFIX_RE.match(after):
             return at
         if not after or "<parameter=".startswith(after) or FUNC_END.startswith(after) or CALL_END.startswith(after):
             return at if final else -2
-        at = text.find(PARAM_END, at + 1)
+        next_at = text.find(PARAM_END, at + 1)
+        if first_hb >= 0 and first_hb > at and (next_at < 0 or first_hb < next_at):
+            return first_hb
+        at = next_at
+
+    if final and text:
+        return len(text)
     return -1
 
 
 def extract_call_name(body: str) -> str | None:
     s = body.strip()
-    if s.startswith("<function="):
-        return s[len("<function="):].split(">", 1)[0].strip()
-    if s.startswith("{"):
+    m = FUNC_HEADER_RE.search(s)
+    if m:
+        return m.group("name").strip()
+    if s.startswith("{") or '"name"' in s:
         try:
             d = json.loads(s)
             if isinstance(d, dict) and "name" in d:
@@ -589,105 +649,80 @@ def call_end(text: str) -> int:
     pos = len(text) - len(s)
     if s.startswith("{") and not s.startswith("<function="):
         return text.find(CALL_END)
-    if not s.startswith("<function="):
-        return text.find(CALL_END) if not "<function=".startswith(s) else -1
-    gt = text.find(">", pos)
-    if gt < 0:
-        return -1
-    pos = gt + 1
+    m_fn = FUNC_HEADER_RE.search(text[pos:])
+    if not m_fn or m_fn.start() != 0:
+        return text.find(CALL_END) if not any("<function=".startswith(s[:i]) for i in range(1, len("<function="))) else -1
+    pos += m_fn.end()
     while True:
         rest = text[pos:]
         s = rest.lstrip()
         pos += len(rest) - len(s)
-        if s.startswith("<parameter="):
-            gt = text.find(">", pos)
+        m_p = PARAM_PREFIX_RE.match(s)
+        if m_p:
+            gt = text.find(">", pos + m_p.start())
             if gt < 0:
                 return -1
             end = param_end(text[gt + 1:])
             if end < 0:
                 return -1
-            pos = gt + 1 + end + len(PARAM_END)
+            skip = len(PARAM_END) if text[gt + 1 + end:].startswith(PARAM_END) else 0
+            pos = gt + 1 + end + skip
         elif s.startswith(FUNC_END):
             rest = text[pos + len(FUNC_END):]
             s = rest.lstrip()
             if s.startswith(CALL_END):
                 return pos + len(FUNC_END) + len(rest) - len(s)
             return -1 if CALL_END.startswith(s) else text.find(CALL_END, pos)
-        elif not s or "<parameter=".startswith(s) or FUNC_END.startswith(s):
+        elif not s or any("<parameter=".startswith(s[:i]) for i in range(1, len("<parameter="))) or FUNC_END.startswith(s):
             return -1
         else:
             return text.find(CALL_END, pos)
 
 
-def tool_choice_of(tool_choice) -> tuple[str, str | None]:
-    """A client's `tool_choice` in either API's shape -> ("auto" | "none" | "required" | "named", name).  OpenAI:
-    "auto" / "none" / "required", {"type": "function", "function": {"name": N}} or the flat {"type": "function",
-    "name": N}; Anthropic: {"type": "auto" | "any" | "none"} and {"type": "tool", "name": N}.  A value it does not
-    know is ("unknown", None)."""
-    if tool_choice is None:
-        return "auto", None
-    if isinstance(tool_choice, str):
-        return (tool_choice, None) if tool_choice in ("auto", "none", "required") else ("unknown", None)
-    if isinstance(tool_choice, dict):
-        kind = tool_choice.get("type")
-        if kind in ("auto", "none"):
-            return kind, None
-        if kind in ("any", "required"):
-            return "required", None
-        if kind in ("function", "tool"):
-            fn = tool_choice.get("function")
-            name = (fn.get("name") if isinstance(fn, dict) else None) or tool_choice.get("name")
-            if isinstance(name, str) and name:
-                return "named", name
-    return "unknown", None
-
-
-def forced_call(tool_choice, tools: list[dict] | None) -> str | None:
-    """`tool_choice` -> the text that opens the call the reply must make, or None (the model decides).
-    There is no grammar here: the server writes this opening itself, so the model can only go on with a call.
-    "required" / Anthropic "any": any of the tools; a named function: that one.  A value it cannot honour (an
-    unknown shape, a name that is not one of the tools, "required" with no tools) is logged and acts as "auto",
-    not a 400: a client's odd choice must not stop its request.  "none" is handled by the caller (no tools)."""
-    kind, name = tool_choice_of(tool_choice)
-    names = {t.get("name") for t in tools or [] if isinstance(t, dict)}
-    if kind in ("auto", "none"):
-        return None
-    if kind == "required" and len(names) == 1:     # one tool to call: name it, the model cannot invent another
-        kind, name = "named", next(iter(names))
-    if kind == "required" and names:
-        return CALL_START + "\n<function="
-    if kind == "named" and name in names:
-        return CALL_START + f"\n<function={name}>\n"
-    print(f"[strata] tool_choice {json.dumps(tool_choice)[:200]} is not supported here (or names no tool of the "
-          "request): the model decides, as with \"auto\"", flush=True)
-    return None
-
-
-def fill_missing_tool_arguments(name: str, args: dict, schema: dict | None) -> dict:
+def fill_missing_tool_arguments(name: str, args: dict, schema: dict | None, raw_body: str = "") -> dict:
     """Restricts argument autocompletion strictly to schema properties that explicitly
-    define a 'default' field. Never synthesizes dummy or fabricated values for omitted required fields."""
-    if not isinstance(args, dict) or not schema:
-        return args
-    params = schema.get("parameters") or {}
+    define a 'default' field. Never synthesizes dummy or fabricated values for omitted required fields.
+    Anti-empty-dict guard: If a tool has required arguments and args is empty but raw_body has content,
+    salvages the argument from raw_body."""
+    if not isinstance(args, dict):
+        args = {}
+    params = (schema or {}).get("parameters") or {}
     required = params.get("required") or []
     properties = params.get("properties") or {}
-    if not required:
-        return args
     filled = dict(args)
+
     for req in required:
-        if req in filled and filled[req] is not None:
+        if req in filled and filled[req] is not None and filled[req] != "":
             continue
         prop_def = properties.get(req) or {}
         if "default" in prop_def:
             filled[req] = prop_def["default"]
-        # If no explicit default was provided in the schema, do not synthesize arbitrary dummy values!
-        # The tool call emits with the missing argument so the client/agent harness can validate and retry.
+
+    # Salvage engine: If a required argument is still missing and raw_body has content
+    for req in required:
+        if req not in filled or filled[req] is None or filled[req] == "":
+            clean_body = re.sub(r"</?(?:function|tool_call|parameter)[^>]*>", "", raw_body).strip()
+            if clean_body:
+                kv_m = re.search(rf"(?:{re.escape(req)}|cmd)\s*[=:]\s*([^\n\r]+)", clean_body, re.IGNORECASE)
+                if kv_m:
+                    val = kv_m.group(1).strip("\"' \t")
+                    if val:
+                        filled[req] = val
+                        continue
+                if len(required) == 1 and properties.get(req, {}).get("type") == "string":
+                    val = clean_body.strip("\"' \t")
+                    if val:
+                        filled[req] = val
+
     return filled
 
+
 def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
-    """`<function=NAME>\\n<parameter=P>\\nVALUE\\n</parameter>...</function>` or `{"name": ..., "arguments": ...}` -> ToolCall.
+    """`<function=NAME>\n<parameter=P>\nVALUE\n</parameter>...</function>` or `{"name": ..., "arguments": ...}` -> ToolCall.
     Values are JSON-decoded when the tool's schema says the parameter is not a string."""
     body = body.strip()
+
+    # 1. JSON tool call
     if body.startswith("{"):
         try:
             data = json.loads(body)
@@ -700,59 +735,82 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
                         pass
                 if not isinstance(args, dict):
                     args = {}
-                return ToolCall(name=data["name"], arguments=fill_missing_tool_arguments(data["name"], args, schema))
+                return ToolCall(name=data["name"], arguments=fill_missing_tool_arguments(data["name"], args, schema, body))
         except Exception:
             pass
         m = re.search(r'"name"\s*:\s*"([^"]+)"', body)
         if m:
             name = m.group(1).strip()
             args = {}
-            ma = re.search(r'"arguments"\s*:\s*(\{.*?\})', body, re.DOTALL)
+            ma = re.search(r'"(?:arguments|parameters)"\s*:\s*(\{[\s\S]*\})', body)
             if ma:
                 try:
                     args = json.loads(ma.group(1))
                 except Exception:
                     pass
-            return ToolCall(name=name, arguments=fill_missing_tool_arguments(name, args, schema))
+            return ToolCall(name=name, arguments=fill_missing_tool_arguments(name, args, schema, body))
 
-    if not body.startswith("<function=") or ">" not in body:
+    # 2. XML tool call
+    name = extract_call_name(body)
+    if not name:
         raise ValueError("malformed tool call: " + body[:80])
-    name = body[len("<function="):body.index(">")]
-    rest = body[body.index(">") + 1:]
+
     props = ((schema or {}).get("parameters") or {}).get("properties") or {}
     args = {}
-    while "<parameter=" in rest:
-        rest = rest[rest.index("<parameter=") + len("<parameter="):]
-        if ">" not in rest:
-            break
-        pname = rest[:rest.index(">")].strip()
-        rest = rest[rest.index(">") + 1:]
-        end = param_end(rest, final=True)
-        value = rest[:end] if end >= 0 else rest
-        if end >= 0 and rest[end:].startswith(PARAM_END):
-            rest = rest[end + len(PARAM_END):]
-        elif end >= 0:
-            rest = rest[end:]
-        else:
-            rest = ""
-        if value.startswith("\n"):
-            value = value[1:]
-        if value.endswith("\n"):
-            value = value[:-1]
-        value = sanitize_pua(value)
-        if not re.match(r"^[a-zA-Z0-9_-]+$", pname):
-            continue
-        if props and pname not in props:
+
+    header_m = FUNC_HEADER_RE.search(body)
+    param_body = body[header_m.end():] if header_m else body
+
+    matched = False
+    for m in PARAM_UNIVERSAL_RE.finditer(param_body):
+        matched = True
+        pname = m.group("name").strip()
+        val = m.group("value")
+        if val.startswith("\n"):
+            val = val[1:]
+        if val.endswith("\n"):
+            val = val[:-1]
+        val = sanitize_pua(val)
+        if not re.match(r"^[a-zA-Z0-9_\.\-]+$", pname):
             continue
         declared = (props.get(pname) or {}).get("type")
         if declared == "string":
-            args[pname] = value
+            args[pname] = val
         else:
             try:
-                args[pname] = json.loads(value)
-            except ValueError:
-                args[pname] = value
-    return ToolCall(name=name, arguments=fill_missing_tool_arguments(name, args, schema))
+                args[pname] = json.loads(val)
+            except (ValueError, TypeError):
+                args[pname] = val
+
+    if not matched:
+        unclosed = PARAM_UNCLOSED_RE.search(param_body)
+        if unclosed:
+            pname = unclosed.group("name").strip()
+            val = unclosed.group("value").rstrip()
+            if val.startswith("\n"):
+                val = val[1:]
+            val = sanitize_pua(val)
+            declared = (props.get(pname) or {}).get("type")
+            if declared == "string":
+                args[pname] = val
+            else:
+                try:
+                    args[pname] = json.loads(val)
+                except (ValueError, TypeError):
+                    args[pname] = val
+
+    # Anti-empty-dict fallback
+    if not args and param_body.strip() and not param_body.strip().startswith("</function>"):
+        jm = re.search(r"(\{[\s\S]*\})", param_body)
+        if jm:
+            try:
+                candidate = json.loads(jm.group(1))
+                if isinstance(candidate, dict):
+                    args = candidate
+            except Exception:
+                pass
+
+    return ToolCall(name=name, arguments=fill_missing_tool_arguments(name, args, schema, param_body))
 
 
 RCALL_MAX = 256  # Task 4.1: Cap unclosed CoT tool call buffering to 256 chars        # the most of a `<tool_call>` inside the reasoning that is held while waiting for its end (#804)
@@ -848,32 +906,43 @@ class OutputParser:
         while True:
             rest = self.buf[self.sp:]
             if self.ss == "name":
-                a = rest.find("<function=")
-                b = rest.find(">", a + 10) if a >= 0 else -1
-                if b < 0:
+                m_fn = FUNC_HEADER_RE.search(rest)
+                if not m_fn:
+                    if rest.lstrip().startswith("{"):
+                        name = extract_call_name(rest)
+                        if name:
+                            self.scall = ToolCall(name=name, arguments={})
+                            props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
+                            self.sdeclared = {k: (v or {}).get("type") for k, v in props.items()}
+                            out.append(Event("tool_start", call=self.scall))
+                            args("{")
+                            self.sp += rest.find("{") + 1
+                            self.ss = "between"
+                            continue
                     return out
-                name = rest[a + 10:b]
+                name = m_fn.group("name").strip()
                 self.scall = ToolCall(name=name, arguments={})
                 props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
                 self.sdeclared = {k: (v or {}).get("type") for k, v in props.items()}
                 out.append(Event("tool_start", call=self.scall))
                 args("{")
-                self.sp += b + 1
+                self.sp += rest.find(m_fn.group(0)) + len(m_fn.group(0))
                 self.ss = "between"
             elif self.ss == "between":
                 stripped = rest.lstrip()
                 self.sp += len(rest) - len(stripped)
-                if stripped.startswith("<parameter="):
-                    b = stripped.find(">")
-                    if b < 0:
-                        return out
-                    pname = stripped[11:b].strip()
-                    self.sp += b + 1
+                m_p = PARAM_START_RE.match(stripped)
+                if m_p:
+                    pname = m_p.group("name").strip()
+                    self.sp += m_p.end()
                     props = ((self.schemas.get(self.scall.name if self.scall else "") or {}).get("parameters") or {}).get("properties") or {}
-                    if not re.match(r"^[a-zA-Z0-9_-]+$", pname) or (props and pname not in props):
-                        self.cur_pname = None
-                        self.ss = "skip_param"
-                        continue
+                    if not re.match(r"^[a-zA-Z0-9_\.\-]+$", pname) or (props and pname not in props):
+                        if props and len(props) == 1 and pname in ("cmd", "file", "filename", "arg"):
+                            pname = next(iter(props.keys()))
+                        elif props and pname not in props:
+                            self.cur_pname = None
+                            self.ss = "skip_param"
+                            continue
                     self.cur_pname = pname
                     self.seen_params[pname] = []
                     args(("" if self.sfirst else ",") + json.dumps(pname) + ":")
@@ -888,25 +957,27 @@ class OutputParser:
                     schema = self.schemas.get(name) or {}
                     seen = getattr(self, "seen_params", {})
                     curr_args = {p: "".join(parts) for p, parts in seen.items()} if isinstance(seen, dict) else {p: "" for p in seen}
-                    filled = fill_missing_tool_arguments(name, curr_args, schema)
+                    if self.scall is not None:
+                        self.scall.arguments = dict(curr_args)
+                    filled = fill_missing_tool_arguments(name, curr_args, schema, self.buf)
                     for k, v in filled.items():
                         if k not in curr_args:
                             args(("" if self.sfirst else ",") + json.dumps(k) + ":" + json.dumps(v, ensure_ascii=False))
                             self.sfirst = False
                             if isinstance(seen, dict):
                                 seen[k] = [str(v)]
-                            else:
-                                seen.add(k)
+                            if self.scall is not None:
+                                self.scall.arguments[k] = v
                     args("}")
                     self.sp += len("</function>")
                     self.ss = "done"
                 else:
-                    return out          # a tag still arriving (or trailing text): wait
+                    return out
             elif self.ss == "str":
                 if not self.sval_started:
                     if not rest:
                         return out
-                    if rest[0] == "\n":          # the value's leading newline is not part of it
+                    if rest[0] == "\n":
                         self.sp += 1
                         rest = rest[1:]
                     self.sval_started = True
@@ -917,20 +988,34 @@ class OutputParser:
                         value = value[:-1]
                     if getattr(self, "cur_pname", None) in self.seen_params:
                         self.seen_params[self.cur_pname].append(value)
+                        if self.scall is not None:
+                            self.scall.arguments[self.cur_pname] = "".join(self.seen_params[self.cur_pname])
                     args(json.dumps(value)[1:-1] + '"')
-                    skip_len = len(PARAM_END) if rest[end:].startswith(PARAM_END) else 0
-                    self.sp += end + skip_len
-                    self.ss = "between"
-                    continue
-                # an undecided </parameter> (-2) is held from its start, like a tag still arriving
-                safe = rest.find(PARAM_END) if end == -2 else len(rest) - self._hold(rest, (PARAM_END, FUNC_END, CALL_END, "<parameter="))
-                if safe > 0 and rest[safe - 1] == "\n":   # may be the trailing newline before </parameter>
+                    rest_at_end = rest[end:]
+                    if rest_at_end.startswith(PARAM_END):
+                        self.sp += end + len(PARAM_END)
+                        self.ss = "between"
+                        continue
+                    elif rest_at_end.startswith(("<tool_call>", "</tool_call>", "</function>", "<|im_start|>")):
+                        args("}")
+                        self.sp += end
+                        self.ss = "done"
+                        return out
+                    else:
+                        self.sp += end
+                        self.ss = "between"
+                        continue
+                hold_tags = (PARAM_END, FUNC_END, CALL_END, CALL_START, "<function=", "<parameter=", "<param=", "<arg=", "<|im_start|>", "<|im_end|>")
+                safe = rest.find(PARAM_END) if end == -2 else len(rest) - self._hold(rest, hold_tags)
+                if safe > 0 and rest[safe - 1] == "\n":
                     safe -= 1
-                while safe > 0 and rest[safe - 1] == '\\':   # CRIT-API-03: Hold trailing backslash to avoid double-escaping
+                while safe > 0 and rest[safe - 1] == '\\':
                     safe -= 1
                 if safe > 0:
                     if getattr(self, "cur_pname", None) in self.seen_params:
                         self.seen_params[self.cur_pname].append(rest[:safe])
+                        if self.scall is not None:
+                            self.scall.arguments[self.cur_pname] = "".join(self.seen_params[self.cur_pname])
                     args(json.dumps(rest[:safe])[1:-1])
                     self.sp += safe
                 return out
@@ -949,10 +1034,21 @@ class OutputParser:
                     v = value
                 if getattr(self, "cur_pname", None) in self.seen_params:
                     self.seen_params[self.cur_pname].append(str(v))
+                    if self.scall is not None:
+                        self.scall.arguments[self.cur_pname] = v
                 args(json.dumps(v, ensure_ascii=False))
-                skip_len = len(PARAM_END) if rest[end:].startswith(PARAM_END) else 0
-                self.sp += end + skip_len
-                self.ss = "between"
+                rest_at_end = rest[end:]
+                if rest_at_end.startswith(PARAM_END):
+                    self.sp += end + len(PARAM_END)
+                    self.ss = "between"
+                elif rest_at_end.startswith(("<tool_call>", "</tool_call>", "</function>", "<|im_start|>")):
+                    args("}")
+                    self.sp += end
+                    self.ss = "done"
+                    return out
+                else:
+                    self.sp += end
+                    self.ss = "between"
             elif self.ss == "skip_param":
                 end = param_end(rest)
                 if end < 0:
@@ -984,14 +1080,16 @@ class OutputParser:
         schema = self.schemas.get(name) or {}
         seen = getattr(self, "seen_params", {})
         curr_args = {p: "".join(parts) for p, parts in seen.items()} if isinstance(seen, dict) else {p: "" for p in seen}
-        filled = fill_missing_tool_arguments(name, curr_args, schema)
+        if self.scall is not None:
+            self.scall.arguments = dict(curr_args)
+        filled = fill_missing_tool_arguments(name, curr_args, schema, self.buf)
         for k, v in filled.items():
             if k not in curr_args:
                 tail += ("," if not tail.endswith("{") else "") + json.dumps(k) + ":" + json.dumps(v, ensure_ascii=False)
                 if isinstance(seen, dict):
                     seen[k] = [str(v)]
-                else:
-                    seen.add(k)
+                if self.scall is not None:
+                    self.scall.arguments[k] = v
         tail += "}"
         out.append(Event("tool_args", tail, call=self.scall))
         self.ss = "done"
@@ -1098,7 +1196,7 @@ class OutputParser:
                 if i < 0:
                     # Hold a partial tag AND the newlines before it: if a tool call follows, they are dropped,
                     # so emitting them early would make streamed and whole outputs differ.
-                    j = len(self.buf) - self._hold(self.buf, (CALL_START, THINK_END))
+                    j = len(self.buf) - self._hold(self.buf, (CALL_START, THINK_END, CALL_END))
                     while j > 0 and self.buf[j - 1] == "\n":
                         j -= 1
                     if j > 0:
@@ -1137,6 +1235,18 @@ class OutputParser:
                         self.buf = whole
                     else:
                         out += self._scan()
+                if self.stream_tools and self.ss == "done" and self.scall is not None and i < 0:
+                    stripped_after = self.buf[self.sp:].lstrip()
+                    if stripped_after.startswith((CALL_START, "<|im_start|>")):
+                        body = self.buf[:self.sp]
+                        self.buf = stripped_after
+                        name = self.scall.name
+                        schema = self.schemas.get(name) or {}
+                        self.scall.arguments = fill_missing_tool_arguments(name, self.scall.arguments, schema, body)
+                        out.append(Event("tool_call", call=self.scall))
+                        self._reset_scan()
+                        self.state, self.lead = "content", True
+                        continue
                 if i < 0:
                     return out
                 body = self.buf[:i]
@@ -1155,7 +1265,12 @@ class OutputParser:
         out = []
         if self.state == "call" and self.stream_tools and self.scall is not None:
             out += self._scan()                 # the output ended inside a call that was already announced
-            if self.ss == "done":               # only its </tool_call> is missing: the call itself is whole
+            out += self._close_scan()
+            if self.scall is not None:
+                seen = getattr(self, "seen_params", {})
+                curr_args = {p: "".join(parts) for p, parts in seen.items()} if isinstance(seen, dict) else {p: "" for p in seen}
+                schema = self.schemas.get(self.scall.name) or {}
+                self.scall.arguments = fill_missing_tool_arguments(self.scall.name, curr_args, schema, self.buf)
                 out.append(Event("tool_call", call=self.scall))
             self.buf = ""
             self._reset_scan()
