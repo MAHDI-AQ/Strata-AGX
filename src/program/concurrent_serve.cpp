@@ -1296,54 +1296,58 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
     // identical or longer resend of the same prompt then forks at `position` and runs only the
     // window - the serial path's own first-window shape.  Runs in the same safe-point envelope as
     // flush_pending_snapshots; the one-per-admission flag keeps it single-shot.
+    auto capture_slot_prompt_snapshot = [&](Impl::Slot& s, int64_t n) {
+        if (s.prompt_snap_done || n < 64) return;
+        s.prompt_snap_done = true;
+        s.prompt_saved_prefix = n;
+        s.prompt_saved_consumed.assign(s.consumed.begin(), s.consumed.begin() + n);
+        for (size_t st = 0; st < m.stages.size(); ++st) {
+            auto& ss = s.stages[st];
+            const core::OnDevice on(m.stages[st].device);
+            if (!ss.prompt_gdn_saved && ss.state->gdn_alloc > 0) {
+                cudaMalloc(&ss.prompt_gdn_saved, (size_t) ss.state->gdn_alloc * core::gdn_state_floats(g) * sizeof(float));
+            }
+            if (ss.prompt_gdn_saved && ss.state->gdn_state) {
+                cudaMemcpyAsync(ss.prompt_gdn_saved, ss.state->gdn_state,
+                                (size_t) ss.state->gdn_alloc * core::gdn_state_floats(g) * sizeof(float),
+                                cudaMemcpyDeviceToDevice, m.stage_rt[st].prompt_stream);
+            }
+            if (!ss.prompt_ple_saved && ss.state->ple_hist) {
+                cudaMalloc(&ss.prompt_ple_saved, (size_t) core::ple_hist_bytes());
+            }
+            if (ss.prompt_ple_saved && ss.state->ple_hist) {
+                cudaMemcpyAsync(ss.prompt_ple_saved, ss.state->ple_hist, (size_t) core::ple_hist_bytes(),
+                                cudaMemcpyDeviceToDevice, m.stage_rt[st].prompt_stream);
+            }
+            if (!ss.prompt_R_saved && ss.state->block.R) {
+                cudaMalloc(&ss.prompt_R_saved, (size_t) g.hc * g.n_embd * sizeof(float));
+            }
+            if (ss.prompt_R_saved && ss.state->block.R) {
+                cudaMemcpyAsync(ss.prompt_R_saved, ss.state->block.R, (size_t) g.hc * g.n_embd * sizeof(float),
+                                cudaMemcpyDeviceToDevice, m.stage_rt[st].prompt_stream);
+            }
+            ss.prompt_ple_prev_saved[0] = ss.state->ple_prev[0];
+            ss.prompt_ple_prev_saved[1] = ss.state->ple_prev[1];
+            ss.prompt_ple_token_saved = ss.state->ple_token;
+            cudaStreamSynchronize(m.stage_rt[st].prompt_stream);
+        }
+        save_slot_snapshot(s, n, s.consumed, /*safe_no_evict=*/true);
+        std::fprintf(stderr, "strata-agx concurrent: captured prompt snapshot: slot=%p prefix=%lld tokens\n",
+                     (void*)&s, (long long)n);
+    };
+
     auto capture_prompt_end_snapshots = [&]() {
         for (auto& ptr : m.slots) {
             auto& s = *ptr;
-            if (!s.active.load(std::memory_order_relaxed) || !s.first || s.prompt_snap_done) continue;
+            if (!s.active.load(std::memory_order_relaxed) || s.prompt_snap_done) continue;
             const int64_t pos = s.position.load(std::memory_order_relaxed);
             const int64_t cur_read = s.read.load(std::memory_order_acquire);
             if (cur_read < pos) continue;
 
             const int64_t n = (int64_t) s.consumed.size();
-            // S26f9: end-append prompts re-tokenize at the junction, so a snapshot at the very end
-            // is unusable for the next (appended) turn.  Capture the deepest real state below the
-            // end instead: either exactly at the end (small prompts) or the last pre-end state
-            // (within the final prefill chunk).  The state is copied NOW, so its position is real.
             if (n < 64 || n > pos) continue;
             if (n != pos && (pos - n) > 6208) continue;
-            s.prompt_snap_done = true;
-            s.prompt_saved_prefix = n;
-            s.prompt_saved_consumed.assign(s.consumed.begin(), s.consumed.begin() + n);
-            for (size_t st = 0; st < m.stages.size(); ++st) {
-                auto& ss = s.stages[st];
-                const core::OnDevice on(m.stages[st].device);
-                if (!ss.prompt_gdn_saved && ss.state->gdn_alloc > 0) {
-                    cudaMalloc(&ss.prompt_gdn_saved, (size_t) ss.state->gdn_alloc * core::gdn_state_floats(g) * sizeof(float));
-                }
-                if (ss.prompt_gdn_saved && ss.state->gdn_state) {
-                    cudaMemcpyAsync(ss.prompt_gdn_saved, ss.state->gdn_state,
-                                    (size_t) ss.state->gdn_alloc * core::gdn_state_floats(g) * sizeof(float),
-                                    cudaMemcpyDeviceToDevice, m.stage_rt[st].prompt_stream);
-                }
-                if (!ss.prompt_ple_saved && ss.state->ple_hist) {
-                    cudaMalloc(&ss.prompt_ple_saved, (size_t) core::ple_hist_bytes());
-                }
-                if (ss.prompt_ple_saved && ss.state->ple_hist) {
-                    cudaMemcpyAsync(ss.prompt_ple_saved, ss.state->ple_hist, (size_t) core::ple_hist_bytes(),
-                                    cudaMemcpyDeviceToDevice, m.stage_rt[st].prompt_stream);
-                }
-                if (!ss.prompt_R_saved && ss.state->block.R) {
-                    cudaMalloc(&ss.prompt_R_saved, (size_t) g.hc * g.n_embd * sizeof(float));
-                }
-                if (ss.prompt_R_saved && ss.state->block.R) {
-                    cudaMemcpyAsync(ss.prompt_R_saved, ss.state->block.R, (size_t) g.hc * g.n_embd * sizeof(float),
-                                    cudaMemcpyDeviceToDevice, m.stage_rt[st].prompt_stream);
-                }
-                ss.prompt_ple_prev_saved[0] = ss.state->ple_prev[0];
-                ss.prompt_ple_prev_saved[1] = ss.state->ple_prev[1];
-                ss.prompt_ple_token_saved = ss.state->ple_token;
-            }
-            save_slot_snapshot(s, n, s.consumed, /*safe_no_evict=*/true);   // Permanent system root
+            capture_slot_prompt_snapshot(s, n);
         }
     };
     auto finish = [&](Impl::Slot& s, const char* reason) {
@@ -1923,6 +1927,14 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                     s.stages[st].fork_in_flight = true;
                 }
             }
+            if (s.read.load() >= (int64_t) s.request.tokens.size() - 1) {
+                for (size_t st = 0; st < m.stages.size(); ++st) {
+                    const core::OnDevice on(m.stages[st].device);
+                    cudaStreamSynchronize(m.stage_rt[st].prompt_stream);
+                    s.stages[st].fork_in_flight = false;
+                }
+                capture_slot_prompt_snapshot(s, reused);
+            }
             if (s.draft) s.draft->kv_restore(reused);
             if (s.radix_node && s.radix_node != radix_parent) radix_tree.release(s.radix_node);
             s.radix_node = radix_parent; // Already holds ref_count acquired in match_prefix()
@@ -1964,6 +1976,14 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                     cudaEventRecord(s.stages[st].fork_event, m.stage_rt[st].prompt_stream);
                     s.stages[st].fork_in_flight = true;
                 }
+            }
+            if (s.read.load() >= (int64_t) s.request.tokens.size() - 1) {
+                for (size_t st = 0; st < m.stages.size(); ++st) {
+                    const core::OnDevice on(m.stages[st].device);
+                    cudaStreamSynchronize(m.stage_rt[st].prompt_stream);
+                    s.stages[st].fork_in_flight = false;
+                }
+                capture_slot_prompt_snapshot(s, reused);
             }
             if (s.draft && parent->draft) {
                 std::string draft_err;
@@ -2159,6 +2179,17 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                         pick = p;
                         pick_q = q;
                         pick_prompt_snap = false;
+                    } else if (p->prompt_saved_prefix >= 64 && p->prompt_saved_prefix <= nmax && p->prompt_saved_prefix > best && p->stages[0].prompt_gdn_saved) {
+                        bool prompt_match = true;
+                        for (int64_t i = 0; i < p->prompt_saved_prefix && prompt_match; ++i) {
+                            prompt_match = (p->prompt_saved_consumed[(size_t) i] == (int32_t) tokens[(size_t) i]);
+                        }
+                        if (prompt_match) {
+                            best = p->prompt_saved_prefix;
+                            pick = p;
+                            pick_q = q;
+                            pick_prompt_snap = true;
+                        }
                     }
                 }
             }
@@ -2255,6 +2286,17 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
                         pick_parent = p;
                         pick_q = q;
                         pick_prompt_snap = false;
+                    } else if (p->prompt_saved_prefix >= 64 && p->prompt_saved_prefix <= nmax && p->prompt_saved_prefix > best && p->stages[0].prompt_gdn_saved) {
+                        bool prompt_same = true;
+                        for (int64_t i = 0; i < p->prompt_saved_prefix && prompt_same; ++i) {
+                            prompt_same = (p->prompt_saved_consumed[(size_t) i] == (int32_t) tokens[(size_t) i]);
+                        }
+                        if (prompt_same) {
+                            best = p->prompt_saved_prefix;
+                            pick_parent = p;
+                            pick_q = q;
+                            pick_prompt_snap = true;
+                        }
                     }
                 }
             }

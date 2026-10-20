@@ -1393,15 +1393,13 @@ std::shared_ptr<RadixNode> RadixTree::insert(
                 if (qst.kv_q4) {
                     slice.k_bytes = qsa_rows * strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
                     slice.v_bytes = slice.k_bytes;
-                    if (kv_pool_ == nullptr) {
-                        if (qst.k_q4) {
-                            cudaMalloc(&slice.k_q, slice.k_bytes);
-                            cudaMemcpyAsync(slice.k_q, qst.k_q4, slice.k_bytes, cudaMemcpyDeviceToDevice, cs);
-                        }
-                        if (qst.v_q4) {
-                            cudaMalloc(&slice.v_q4, slice.v_bytes);
-                            cudaMemcpyAsync(slice.v_q4, qst.v_q4, slice.v_bytes, cudaMemcpyDeviceToDevice, cs);
-                        }
+                    if (qst.k_q4) {
+                        cudaMalloc(&slice.k_q, slice.k_bytes);
+                        cudaMemcpyAsync(slice.k_q, qst.k_q4, slice.k_bytes, cudaMemcpyDeviceToDevice, cs);
+                    }
+                    if (qst.v_q4) {
+                        cudaMalloc(&slice.v_q4, slice.v_bytes);
+                        cudaMemcpyAsync(slice.v_q4, qst.v_q4, slice.v_bytes, cudaMemcpyDeviceToDevice, cs);
                     }
                 } else if (qst.kv_hybrid) {
                     slice.k_bytes = qsa_rows * qs.head_dim;
@@ -1687,10 +1685,10 @@ bool RadixTree::fork_to_session(
 
                 if (cst.kv_q4) {
                     const size_t bytes = qsa_rows * strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
-                    if (block_table.empty() && slice.k_q && cst.k_q4 && cst.k_q4 != slice.k_q) {
+                    if (slice.k_q && cst.k_q4 && cst.k_q4 != slice.k_q) {
                         cudaMemcpyAsync(cst.k_q4, slice.k_q, bytes, cudaMemcpyDeviceToDevice, cs);
                     }
-                    if (block_table.empty() && slice.v_q4 && cst.v_q4 && cst.v_q4 != slice.v_q4) {
+                    if (slice.v_q4 && cst.v_q4 && cst.v_q4 != slice.v_q4) {
                         cudaMemcpyAsync(cst.v_q4, slice.v_q4, bytes, cudaMemcpyDeviceToDevice, cs);
                     }
                 } else if (cst.kv_hybrid) {
@@ -1722,9 +1720,12 @@ bool RadixTree::fork_to_session(
                 if (pooled_rows > 0 && slice.idx_pooled && cst.idx_pooled) {
                     cudaMemcpyAsync(cst.idx_pooled, slice.idx_pooled, slice.idx_pooled_bytes, cudaMemcpyDeviceToDevice, cs);
                 }
-                if (cst.page_table && !block_table.empty() && cst.n_pages > 0) {
-                    size_t copy_pages = std::min((size_t) cst.n_pages, std::min(block_table.size(), (size_t) pages));
-                    cudaMemcpyAsync(cst.page_table, block_table.data(), copy_pages * sizeof(int32_t), cudaMemcpyHostToDevice, cs);
+                if (cst.idx_pooled && cst.idx_pooled_rows > pooled_rows) {
+                    const size_t dirty_bytes = (size_t) (cst.idx_pooled_rows - pooled_rows) * qs.idx_dim * sizeof(float);
+                    cudaMemsetAsync(cst.idx_pooled + (size_t) pooled_rows * qs.idx_dim, 0, dirty_bytes, cs);
+                }
+                if (cst.page_table && cst.n_pages > 0 && cst.kv_mode == 0) {
+                    strata::kernels::kv_ring_table(cst.page_table, cst.n_pages, cst.n_pages, cs);
                 }
             }
         }
@@ -1787,9 +1788,12 @@ bool RadixTree::fork_to_session(
                 if (pooled_rows > 0 && !slice.idx_pooled.empty() && cst.idx_pooled) {
                     cudaMemcpyAsync(cst.idx_pooled, slice.idx_pooled.data(), slice.idx_pooled.size(), cudaMemcpyHostToDevice, cs);
                 }
-                if (cst.page_table && !block_table.empty() && cst.n_pages > 0) {
-                    size_t copy_pages = std::min((size_t) cst.n_pages, std::min(block_table.size(), (size_t) pages));
-                    cudaMemcpyAsync(cst.page_table, block_table.data(), copy_pages * sizeof(int32_t), cudaMemcpyHostToDevice, cs);
+                if (cst.idx_pooled && cst.idx_pooled_rows > pooled_rows) {
+                    const size_t dirty_bytes = (size_t) (cst.idx_pooled_rows - pooled_rows) * qs.idx_dim * sizeof(float);
+                    cudaMemsetAsync(cst.idx_pooled + (size_t) pooled_rows * qs.idx_dim, 0, dirty_bytes, cs);
+                }
+                if (cst.page_table && cst.n_pages > 0 && cst.kv_mode == 0) {
+                    strata::kernels::kv_ring_table(cst.page_table, cst.n_pages, cst.n_pages, cs);
                 }
             }
         }

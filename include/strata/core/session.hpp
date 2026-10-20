@@ -445,4 +445,10 @@ bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, Se
                        PoolFn pool, void* user, float* y_miss_host, void* stream, std::string& err);
 void token_graph_free(TokenGraph& tg);
 
+/// StateBarrier: fail-closed state hygiene and isolation contract for multi-turn serving.
+struct StateBarrier {
+    /// Resets a session state to a mathematically pure initial condition.
+    static bool sanitize_fresh(SessionState& s, const ModelGeometry& g, void* stream);
+};
+
 }  // namespace strata::core

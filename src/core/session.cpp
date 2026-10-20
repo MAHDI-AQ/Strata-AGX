@@ -268,10 +268,8 @@ bool session_fork(const SessionState& parent, SessionState& child, const ModelGe
             }
             if (pst.idx_dead && cst.idx_dead && pst.idx_dead != cst.idx_dead) {
                 cudaMemcpyAsync(cst.idx_dead, pst.idx_dead, dead_bytes, cudaMemcpyDeviceToDevice, cs);
-            } else if (cst.idx_dead) {
-                // Clear dead-cell buffer on prompt snapshot rollback / self-fork
-                cudaMemsetAsync(cst.idx_dead, 0, dead_bytes, cs);
             }
+            // CRIT-DEAD-KEY: Never clear idx_dead on self-fork! idx_dead is computed at token 0 and is constant for the sequence.
             if (cst.idx_block_pos) {
                 const int32_t expected_pos = (int32_t) (prefix_tokens / s.idx_block);
                 cudaMemcpyAsync(cst.idx_block_pos, &expected_pos, sizeof(int32_t), cudaMemcpyHostToDevice, cs);
@@ -1142,6 +1140,12 @@ bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, Se
 void token_graph_free(TokenGraph& tg) {
     if (tg.exec) cudaGraphExecDestroy(tg.exec);
     tg = TokenGraph{};
+}
+
+bool StateBarrier::sanitize_fresh(SessionState& s, const ModelGeometry& g, void* stream) {
+    cudaStream_t cs = (cudaStream_t) stream;
+    session_zero(s, g, nullptr, cs);
+    return cudaGetLastError() == cudaSuccess;
 }
 
 }  // namespace strata::core
