@@ -1,3 +1,4 @@
+#include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
 // src/core/session.cpp - one token through all 48 layers.  See the header for why the graphs are per-layer.
@@ -243,22 +244,51 @@ bool session_fork(const SessionState& parent, SessionState& child, const ModelGe
                 if (pst.k_pool && cst.k_pool) cudaMemcpyAsync(cst.k_pool, pst.k_pool, bytes, cudaMemcpyDeviceToDevice, cs);
                 if (pst.v_pool && cst.v_pool) cudaMemcpyAsync(cst.v_pool, pst.v_pool, bytes, cudaMemcpyDeviceToDevice, cs);
             }
+            // Page table: copy valid pages and rewind post-prompt decode pages
+            if (cst.page_table) {
+                if (pst.page_table && pst.page_table != cst.page_table && pages > 0) {
+                    cudaMemcpyAsync(cst.page_table, pst.page_table, (size_t) pages * sizeof(int32_t), cudaMemcpyDeviceToDevice, cs);
+                }
+                if (cst.n_pages > pages) {
+                    if (cst.kv_mode == 0) {
+                        strata::kernels::kv_ring_table(cst.page_table + pages, cst.n_pages - pages, cst.n_pages, cs);
+                    } else {
+                        cudaMemsetAsync(cst.page_table + pages, 0xFF, (size_t) (cst.n_pages - pages) * sizeof(int32_t), cs);
+                    }
+                }
+            }
             // Indexer tail and dead states
             const size_t tail_bytes = (size_t) (s.idx_block - 1) * s.idx_dim * sizeof(float);
             const size_t dead_bytes = (size_t) s.idx_dim * sizeof(float);
-            if (pst.idx_tail && cst.idx_tail && pst.idx_tail != cst.idx_tail) cudaMemcpyAsync(cst.idx_tail, pst.idx_tail, tail_bytes, cudaMemcpyDeviceToDevice, cs);
-            if (pst.idx_dead && cst.idx_dead && pst.idx_dead != cst.idx_dead) cudaMemcpyAsync(cst.idx_dead, pst.idx_dead, dead_bytes, cudaMemcpyDeviceToDevice, cs);
+            if (pst.idx_tail && cst.idx_tail && pst.idx_tail != cst.idx_tail) {
+                cudaMemcpyAsync(cst.idx_tail, pst.idx_tail, tail_bytes, cudaMemcpyDeviceToDevice, cs);
+            } else if (cst.idx_tail) {
+                // Clear decode tail on prompt snapshot rollback / self-fork
+                cudaMemsetAsync(cst.idx_tail, 0, tail_bytes, cs);
+            }
+            if (pst.idx_dead && cst.idx_dead && pst.idx_dead != cst.idx_dead) {
+                cudaMemcpyAsync(cst.idx_dead, pst.idx_dead, dead_bytes, cudaMemcpyDeviceToDevice, cs);
+            } else if (cst.idx_dead) {
+                // Clear dead-cell buffer on prompt snapshot rollback / self-fork
+                cudaMemsetAsync(cst.idx_dead, 0, dead_bytes, cs);
+            }
             if (cst.idx_block_pos) {
-                const int32_t expected_pos = (int32_t) (prefix_tokens % s.idx_block);
-                cudaMemcpy(cst.idx_block_pos, &expected_pos, sizeof(int32_t), cudaMemcpyHostToDevice);
+                const int32_t expected_pos = (int32_t) (prefix_tokens / s.idx_block);
+                cudaMemcpyAsync(cst.idx_block_pos, &expected_pos, sizeof(int32_t), cudaMemcpyHostToDevice, cs);
             }
             if (prefix_tokens % s.idx_block == 0 && cst.idx_tail) {
                 cudaMemsetAsync(cst.idx_tail, 0, tail_bytes, cs);
             }
             const int64_t pooled_rows = prefix_tokens / s.idx_block;
-            if (pooled_rows > 0 && pst.idx_pooled && cst.idx_pooled && pst.idx_pooled != cst.idx_pooled) {
-                cudaMemcpyAsync(cst.idx_pooled, pst.idx_pooled, (size_t) pooled_rows * s.idx_dim * sizeof(float), cudaMemcpyDeviceToDevice, cs);
-                cudaMemcpyAsync(cst.idx_pooled + (size_t) pooled_rows * s.idx_dim, pst.idx_dead, dead_bytes, cudaMemcpyDeviceToDevice, cs);
+            if (pst.idx_pooled && cst.idx_pooled) {
+                if (pst.idx_pooled != cst.idx_pooled && pooled_rows > 0) {
+                    cudaMemcpyAsync(cst.idx_pooled, pst.idx_pooled, (size_t) pooled_rows * s.idx_dim * sizeof(float), cudaMemcpyDeviceToDevice, cs);
+                    cudaMemcpyAsync(cst.idx_pooled + (size_t) pooled_rows * s.idx_dim, pst.idx_dead, dead_bytes, cudaMemcpyDeviceToDevice, cs);
+                }
+                if (cst.idx_pooled_rows > pooled_rows) {
+                    const size_t dirty_rows = (size_t) (cst.idx_pooled_rows - pooled_rows);
+                    cudaMemsetAsync(cst.idx_pooled + (size_t) pooled_rows * s.idx_dim, 0, dirty_rows * s.idx_dim * sizeof(float), cs);
+                }
             }
         }
     }

@@ -1933,6 +1933,14 @@ int ConcurrentServe::run(const std::vector<ServeStage>& stages, core::ExpertSour
             // SPRINT 1: Cross-slot or self-slot prefix fork from snapshot
             const auto& consumed_src = from_prompt_snapshot ? parent->prompt_saved_consumed : parent->saved_consumed;
             s.consumed.assign(consumed_src.begin(), consumed_src.begin() + reused);
+            const size_t prompt_pages = (size_t) ((reused + core::kPageTokens - 1) / core::kPageTokens);
+            if (!s.shared_kv_pages.empty() && prompt_pages < s.shared_kv_pages.size()) {
+                if (auto pool = radix_tree.kv_pool()) {
+                    std::vector<int32_t> post_pages(s.shared_kv_pages.begin() + prompt_pages, s.shared_kv_pages.end());
+                    pool->release_pages(post_pages);
+                }
+                s.shared_kv_pages.resize(prompt_pages);
+            }
             // Frontier 2: Non-blocking multi-stage KV fork overlapping
             // Dispatch asynchronous snapshot fork concurrently across each stage's prompt stream
             // and record a completion event per stage instead of host-blocking synchronization.
