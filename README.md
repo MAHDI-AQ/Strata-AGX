@@ -1,3 +1,30 @@
+# ⚠️ ARCHIVED & RETIRED — DEVELOPMENT OFFICIALLY STOPPED (2026-10-21)
+
+> [!CAUTION]
+> **STATUS: RETIRED / HISTORICAL ARTIFACT ONLY — DO NOT USE FOR PRODUCTION SERVING**
+> 
+> After 51 consecutive days of intense downstream fork engineering, hundreds of commits, custom POSIX shared-memory IPC, continuous dual-slot asymmetric scheduling, 3-tier NVMe RadixTree caching, and dozens of complex synchronization layers, **the verdict is in: the Strata-AGX fork became lobotomized beyond fixing.**
+>
+> In real multi-turn agentic workloads, the layered mutations accumulated subtle timing races, kernel `state: D` uninterruptible deadlocks on deep-context verify windows, MTP draft syntax corruption, and autoregressive self-hypnosis loops.
+>
+> On October 21, 2026, we compiled clean, vanilla upstream [**Niko1221/Strata**](https://github.com/Niko1221/Strata) (`v0.2.2` / engine `0.1.47`, commit `011c9e600a93`) on our dual RTX 4090 host (`ai-server`) and ran side-by-side empirical evaluations.
+>
+> **The results were immediate and conclusive:**
+> - **Stock Strata `v0.2.2`:** 160.0 tok/s decode on IQ3_XXS (132.5 tok/s on IQ3_S), 89–93% MTP draft acceptance rate, 24-second cold boot, 12,092 resident experts in VRAM, flawless OpenAI tool calling, and zero kernel stalls.
+> - **Strata-AGX Fork:** 40–50 tok/s decode, scheduler starvation, fragile tool-call parsing, and 122-second kernel blocking deadlocks at 104k tokens.
+>
+> We have officially decommissioned Strata-AGX and returned 100% of our production serving to clean upstream **Niko1221/Strata**.
+>
+> This repository is preserved purely as a **historical record and cautionary monument** of everything we attempted:
+> - 3-Tier Hierarchical RadixTree KV Storage (VRAM -> Host DDR4 -> NVMe DirectStorage)
+> - Asymmetric Dual-Slot Continuous Scheduler
+> - Low-latency POSIX Shared Memory IPC (`/strata_ipc_8096`)
+> - Fused Expert Offloading and PLE Streaming experiments
+>
+> If you are looking for a fast, rock-solid serving engine for 125B MoE models, **use upstream [Niko1221/Strata](https://github.com/Niko1221/Strata). Do not use this fork.**
+
+---
+
 <h1 align="center">Strata AGX</h1>
 
 <p align="center"><b>Multi-Agent Concurrency & Speculative Serving Fork for 125B MoE Models</b><br>
