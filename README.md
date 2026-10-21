@@ -3,7 +3,7 @@
 > [!CAUTION]
 > **STATUS: RETIRED / HISTORICAL ARTIFACT ONLY — DO NOT USE FOR PRODUCTION SERVING**
 > 
-> 51 days after acquiring the dual RTX 4090 GPUs—spending weeks lost in the engine-hacking rabbit hole of custom POSIX shared-memory IPC, continuous dual-slot asymmetric scheduling, 3-tier NVMe RadixTree caching, and dozens of complex synchronization layers instead of actually using the GPUs to ship meaningful features in our game server projects (`cok_java`)—**the verdict is in: the Strata-AGX fork became lobotomized beyond fixing.**
+> Following downstream experimentation with custom POSIX shared-memory IPC, continuous dual-slot asymmetric scheduling, 3-tier NVMe RadixTree caching, and complex synchronization layers, **the verdict is in: the Strata-AGX fork became lobotomized beyond fixing.**
 >
 > In real multi-turn agentic workloads, the layered mutations accumulated subtle timing races, kernel `state: D` uninterruptible deadlocks on deep-context verify windows, MTP draft syntax corruption, and autoregressive self-hypnosis loops.
 >
