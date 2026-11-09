@@ -90,9 +90,10 @@ From 1,140,000 empirical serving steps conducted on Route 19 (`Qwen3.8-Flash-Nex
 
 | Metric | Measured Value | Operational Context |
 |---|---|---|
-| **Speculative Draft Acceptance** | **77.4% – 86.7%** | MTP linear drafting across 4 concurrent slots |
-| **Effective Decode Velocity** | **>615 tokens/sec** | Net effective generation under 4-slot batching |
-| **Single-Slot Autoregressive Decode** | **169.6 tokens/sec** | Pure linear MTP decoding on stock Q3_S |
+| **Single-Stream Physical Decode** | **144.0 – 169.6 tokens/sec** | Physical step time 6.94 ms – 7.15 ms per token |
+| **Concurrent 4-Slot Aggregate Decode** | **249.5 – 280.5 tokens/sec** | Aggregate cluster throughput across 4 parallel client streams |
+| **Speculative MTP Yield Multiplier** | **2.02× – 2.36× tokens/step** | 63.6% – 77.4% draft acceptance (2.02 - 2.36 tokens per forward pass) |
+| **MoE Memory Streaming Bottleneck** | **<0.4 ms / stage** | 2.40 GB active parameters split across 4 cards (0.38 GB on RTX 3090) |
 | **Prefill Throughput** | **1,125.5 tokens/sec** | Sustained 1,522-token prompt reading |
 | **Warm TTFT (Time-to-First-Token)** | **417 – 446 ms** | Pre-flight cached prompt activation |
 | **Direct NVMe Streaming Rate** | **7.36 GB/s** | Aligned snapshot save/restore over PCIe 4.0 |
