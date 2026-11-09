@@ -865,6 +865,7 @@ struct Options {
     bool batch_groups_set = false;    ///< --batch-groups was given (a number or auto): no default then
     bool batch_groups_auto = false;   ///< --batch-groups auto (#417 stage 1): one group per stage of a layer split, if it divides --batch
     bool batch_mtp = false;      ///< --batch-mtp / STRATA_BATCH_MTP=1 (opt-in): one MTP proposal per batch slot
+    bool distributed_mtp = false; ///< --distributed-mtp / STRATA_DISTRIBUTED_MTP=1: round-robin MTP drafters across stages
     std::string spec_oracle;
     int spec_corrupt = 0;
     /// Benchmarks and A/B checks (eddoursul's fork, F19): the run emits this continuation (token ids) instead of
@@ -3590,6 +3591,7 @@ int main(int argc, char** argv) {
             else o.batch_groups = std::atoi(bgv);
         }
         else if (a == "--batch-mtp") o.batch_mtp = true;
+        else if (a == "--distributed-mtp") o.distributed_mtp = true;
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
         else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
         else if (a == "--spec-follow") o.spec_follow = next("--spec-follow");
@@ -7271,33 +7273,71 @@ int main(int argc, char** argv) {
         }
 #endif
         if (batch_mtp && !batch_df2_wanted) {
-            // Slot b's drafter lives where the solo drafter does (the guard above: the last stage's GPU), carved from the
-            // LAST stage's slot-b session (bslot_ss.back(): stage 0's on one GPU): it borrows that session's context
-            // length and RoPE table, which are on that device.  Its PLE history is the first stage's slot session: PLE
-            // runs on the first stage, as for the solo drafter (`mtp.set_ple_session(&ss)` above).
+            const int num_stages = 1 + (int) stages.size();
+            const char* dist_env = std::getenv("STRATA_DISTRIBUTED_MTP");
+            const bool dist_mtp = o.distributed_mtp || (dist_env != nullptr && dist_env[0] != '\0' && dist_env[0] != '0');
+            const bool do_dist = dist_mtp && (num_stages > 1);
+
+            // Per-stage template drafters to share weights across slots on the same stage/GPU
+            std::vector<strata::core::MtpDrafter*> stage_templates((size_t) num_stages, nullptr);
+
             for (int b = 0; b < o.batch; ++b) {
                 auto d = std::make_unique<strata::core::MtpDrafter>();
                 // STRATA_PIPED_MTP: the slot's proposal is drafted as an asynchronous chain (chain_launch), so the
                 // pipeline goes on while it runs: the chain graphs carry the forcing kernel (a no-op here)
                 if (piped_mtp) d->set_force_capture(true);
-                // (mtp_first: the solo drafter is on the first stage's card, so slot b's is carved from its first-stage session)
-                strata::core::SessionState& slot_s = mtp_first ? *bslot_ss[0][(size_t) b] : *bslot_ss.back()[(size_t) b];
-                if (!d->load(o.mtp, draft_geometry, slot_s, o.spec, err, o.mtp_window, &mtp)) {
-                    std::fprintf(stderr, "strata generate: batch MTP slot %d: %s%s\n", b, err.c_str(),
+
+                // Round-robin across stages if distributed MTP, else on the last stage (or stage 0 if mtp_first)
+                const int st_idx = do_dist ? (b % num_stages) : (mtp_first ? 0 : (num_stages - 1));
+                const int dev_b = (st_idx == 0) ? 0 : stages[(size_t) st_idx - 1]->dev;
+                const strata::core::OnDevice on_b(dev_b);
+
+                strata::core::SessionState& slot_s = *bslot_ss[(size_t) st_idx][(size_t) b];
+
+                strata::core::MtpDrafter* share_from = nullptr;
+                if (!do_dist) {
+                    share_from = &mtp;
+                } else {
+                    if (dev_b == mtp.device()) {
+                        share_from = &mtp;
+                    } else if (stage_templates[(size_t) st_idx] != nullptr) {
+                        share_from = stage_templates[(size_t) st_idx];
+                    }
+                }
+
+                if (!d->load(o.mtp, draft_geometry, slot_s, o.spec, err, o.mtp_window, share_from)) {
+                    std::fprintf(stderr, "strata generate: batch MTP slot %d (CUDA%d): %s%s\n", b, dev_b, err.c_str(),
                                  vram_free_note().c_str());
                     return 1;
                 }
                 d->set_max_drafts(piped_mtp ? pm_drafts : 1);   // the serial windows verify one proposal per slot
                 d->set_ple_session(bslot_ss[0][(size_t) b].get());
+
+                if (do_dist && stage_templates[(size_t) st_idx] == nullptr) {
+                    stage_templates[(size_t) st_idx] = d.get();
+                }
                 slot_mtp.push_back(std::move(d));
             }
             if (!slot_mtp.empty()) {
-                size_t fb = 0, tb = 0;
-                cudaMemGetInfo(&fb, &tb);
-                std::fprintf(stderr, "strata generate: --batch-mtp: %d slot drafters on CUDA%d (%.0f MiB of private K/V "
-                                     "state and buffers each, sharing the solo drafter's weights); %.2f GiB free there\n",
-                             (int) slot_mtp.size(), mtp.device(), (double) slot_mtp.front()->vram_bytes() / 1048576.0,
-                             (double) fb / 1073741824.0);
+                if (do_dist) {
+                    std::fprintf(stderr, "strata generate: --batch-mtp (distributed): %d slot drafters distributed across %d stages\n",
+                                 (int) slot_mtp.size(), num_stages);
+                    for (int b = 0; b < (int) slot_mtp.size(); ++b) {
+                        const int d_dev = slot_mtp[(size_t) b]->device();
+                        const strata::core::OnDevice on_d(d_dev);
+                        size_t fb = 0, tb = 0;
+                        cudaMemGetInfo(&fb, &tb);
+                        std::fprintf(stderr, "strata generate:   slot %d on CUDA%d (%.0f MiB private buffers); %.2f GiB free\n",
+                                     b, d_dev, (double) slot_mtp[(size_t) b]->vram_bytes() / 1048576.0, (double) fb / 1073741824.0);
+                    }
+                } else {
+                    size_t fb = 0, tb = 0;
+                    cudaMemGetInfo(&fb, &tb);
+                    std::fprintf(stderr, "strata generate: --batch-mtp: %d slot drafters on CUDA%d (%.0f MiB of private K/V "
+                                         "state and buffers each, sharing the solo drafter's weights); %.2f GiB free there\n",
+                                 (int) slot_mtp.size(), mtp.device(), (double) slot_mtp.front()->vram_bytes() / 1048576.0,
+                                 (double) fb / 1073741824.0);
+                }
             }
         }
     }
@@ -11810,19 +11850,34 @@ int main(int argc, char** argv) {
         std::vector<std::unique_ptr<float, decltype(free_slot_mtp_rows)>> slot_mtp_rows;
         if (batch_mtp && !batch_df2) {
             // like the solo drafter's `bind` above: the last stage's weights (embedding) and head, and the residual
-            // buffers on the drafter's device (the last stage's GPU with a layer split)
-            const strata::core::OnDevice on_slot_mtp(mtp.device());
+            // buffers on each drafter's device
             for (int b = 0; b < o.batch; ++b) {
+                const int dev_b = slot_mtp[(size_t) b]->device();
+                const strata::core::OnDevice on_slot_mtp(dev_b);
                 float* r = nullptr;
                 const size_t bytes = (size_t) o.spec * (size_t) g.hc * (size_t) g.n_embd * sizeof(float);
                 if (cudaMalloc((void**) &r, bytes) != cudaSuccess) {
-                    std::fprintf(stderr, "strata serve: batch MTP slot %d residual buffer does not fit%s\n",
-                                 b, vram_free_note().c_str());
+                    std::fprintf(stderr, "strata serve: batch MTP slot %d residual buffer does not fit (CUDA%d)%s\n",
+                                 b, dev_b, vram_free_note().c_str());
                     return 1;
                 }
                 slot_mtp_rows.emplace_back(r, free_slot_mtp_rows);
+
+                // Share draft head with mtp (if on same device) or with a previous drafter on the same device
+                strata::core::MtpDrafter* share_bind = nullptr;
+                if (dev_b == mtp.device()) {
+                    share_bind = &mtp;
+                } else {
+                    for (int prev = 0; prev < b; ++prev) {
+                        if (slot_mtp[(size_t) prev]->device() == dev_b) {
+                            share_bind = slot_mtp[(size_t) prev].get();
+                            break;
+                        }
+                    }
+                }
+
                 if (!slot_mtp[(size_t) b]->bind(last_st && !mtp_first ? last_st->wt : wt, last_st ? &last_st->head : &native_head, r, err,
-                                                &mtp) ||
+                                                share_bind) ||
                     (piped_mtp && !slot_mtp[(size_t) b]->prepare_chain(err))) {   // STRATA_PIPED_MTP: the chain graphs
                     std::fprintf(stderr, "strata serve: batch MTP slot %d: %s%s\n", b, err.c_str(),
                                  vram_free_note().c_str());
@@ -14369,7 +14424,7 @@ int main(int argc, char** argv) {
             const char* v = std::getenv("STRATA_SLOT_COPY_DIRECT");
             return v != nullptr && v[0] != '\0' && v[0] != '0';
         }();
-        auto direct_slot_copy = [&](bool into_slot, int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
+        auto direct_slot_copy = [&](bool into_slot, int b, const std::vector<int32_t>& ids, std::string& e, int64_t from_token = 0) -> bool {
             const int64_t upto = (int64_t) ids.size();
             auto sync_all = [&]() {
                 bool ok = true;
@@ -14394,20 +14449,20 @@ int main(int argc, char** argv) {
                 if (!strata::core::conversation_checkpoint_copy(from, to, ids, g, e, queued)) return failed();
                 for (int64_t j = 0; j < from.qsa_alloc; ++j)
                     if (!strata::core::conversation_kv_copy(from.qsa_states[from.qsa_ord0 + j],
-                                                            to.qsa_states[to.qsa_ord0 + j], g, upto, true, e, queued))
+                                                            to.qsa_states[to.qsa_ord0 + j], g, upto, true, e, queued, from_token))
                         return failed();
             }
             if (!sync_all()) { e = "batch slot copy: device sync failed"; return false; }
             return true;
         };
-        auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
+        auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e, int64_t from_token = 0) -> bool {
             const int64_t upto = (int64_t) ids.size();
 #if defined(STRATA_GPU_METAL)
             // the running state and the K/V of the Metal window, not the session's device buffers
             return strata::metal_engine::window_slot_copy_main(true, b, upto, false, e);
 #endif
             if (slot_copy_direct) {
-                if (!direct_slot_copy(true, b, ids, e)) return false;
+                if (!direct_slot_copy(true, b, ids, e, from_token)) return false;
             } else
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 strata::core::SessionState& from = k == 0 ? ss : stages[k - 1]->ss;
@@ -14436,17 +14491,23 @@ int main(int argc, char** argv) {
 #endif
             } else
             if (batch_mtp) {
-                // Admission first builds the solo draft KV; copy it into the slot before drafting.  Both drafters' K/V
-                // are on the drafter's device (the last stage's GPU with a layer split): the copy's ring refill is a
-                // kernel launch there.
-                const strata::core::OnDevice on_mtp(mtp.device());
-                strata::core::ConversationKv image;
-                if (!mtp.idle(e) || !slot_mtp[(size_t) b]->idle(e) ||
-                    !strata::core::conversation_kv_save(image, mtp.kv_state(), draft_geometry, upto, false, e) ||
-                    !strata::core::conversation_kv_restore(image, slot_mtp[(size_t) b]->kv_state(),
-                                                           draft_geometry, upto, false, e) ||
-                    cudaDeviceSynchronize() != cudaSuccess)
-                    return false;
+                const int dev_b = slot_mtp[(size_t) b]->device();
+                const strata::core::OnDevice on_mtp(dev_b);
+                if (slot_copy_direct && dev_b == mtp.device()) {
+                    if (!mtp.idle(e) || !slot_mtp[(size_t) b]->idle(e) ||
+                        !strata::core::conversation_kv_copy(mtp.kv_state(), slot_mtp[(size_t) b]->kv_state(),
+                                                            draft_geometry, upto, false, e, slot_copy_batchsync_env(), from_token) ||
+                        cudaDeviceSynchronize() != cudaSuccess)
+                        return false;
+                } else {
+                    strata::core::ConversationKv image;
+                    if (!mtp.idle(e) || !slot_mtp[(size_t) b]->idle(e) ||
+                        !strata::core::conversation_kv_save(image, mtp.kv_state(), draft_geometry, upto, false, e) ||
+                        !strata::core::conversation_kv_restore(image, slot_mtp[(size_t) b]->kv_state(),
+                                                               draft_geometry, upto, false, e) ||
+                        cudaDeviceSynchronize() != cudaSuccess)
+                        return false;
+                }
                 slot_mtp[(size_t) b]->set_prompt_len(upto);
             }
             return true;
@@ -14498,14 +14559,23 @@ int main(int argc, char** argv) {
             } else
             if (batch_mtp) {
                 // A returning solo request resumes from its slot's draft KV (on the drafter's device, as above).
-                const strata::core::OnDevice on_mtp(mtp.device());
-                strata::core::ConversationKv image;
-                if (!slot_mtp[(size_t) b]->idle(e) || !mtp.idle(e) ||
-                    !strata::core::conversation_kv_save(image, slot_mtp[(size_t) b]->kv_state(),
-                                                        draft_geometry, upto, false, e) ||
-                    !strata::core::conversation_kv_restore(image, mtp.kv_state(), draft_geometry, upto, false, e) ||
-                    cudaDeviceSynchronize() != cudaSuccess)
-                    return false;
+                const int dev_b = slot_mtp[(size_t) b]->device();
+                const strata::core::OnDevice on_mtp(dev_b);
+                if (slot_copy_direct && dev_b == mtp.device()) {
+                    if (!slot_mtp[(size_t) b]->idle(e) || !mtp.idle(e) ||
+                        !strata::core::conversation_kv_copy(slot_mtp[(size_t) b]->kv_state(), mtp.kv_state(),
+                                                            draft_geometry, upto, false, e, slot_copy_batchsync_env()) ||
+                        cudaDeviceSynchronize() != cudaSuccess)
+                        return false;
+                } else {
+                    strata::core::ConversationKv image;
+                    if (!slot_mtp[(size_t) b]->idle(e) || !mtp.idle(e) ||
+                        !strata::core::conversation_kv_save(image, slot_mtp[(size_t) b]->kv_state(),
+                                                            draft_geometry, upto, false, e) ||
+                        !strata::core::conversation_kv_restore(image, mtp.kv_state(), draft_geometry, upto, false, e) ||
+                        cudaDeviceSynchronize() != cudaSuccess)
+                        return false;
+                }
                 mtp.set_prompt_len(upto);
             }
             return true;
@@ -16243,13 +16313,18 @@ int main(int argc, char** argv) {
                     const bool active_source = sl.active && !sl.tainted && slot_ckpt_move_env() &&
                                                (!use_mtp || batch_mtp || admit_slot >= 0);
                     if (sl.cvec != want_cvec || !(idle_source || active_source)) continue;
-                    if (idle_source && (int64_t) sl.ids.size() > std::max(resume, slot_tokens) && starts_with(sl.ids, {})) {
+                    const bool is_admit = (b == admit_slot);
+                    if (idle_source && (is_admit ? (int64_t) sl.ids.size() >= std::max(resume, slot_tokens)
+                                                 : (int64_t) sl.ids.size() > std::max(resume, slot_tokens)) &&
+                        starts_with(sl.ids, {})) {
                         slot_source = b;
                         slot_tokens = (int64_t) sl.ids.size();
                         slot_ck = nullptr;
                     }
                     for (const ConvCheckpoint& c : sl.checks)
-                        if ((int64_t) c.ids.size() > std::max(resume, slot_tokens) && starts_with(c.ids, c.imgs)) {
+                        if ((is_admit ? (int64_t) c.ids.size() >= std::max(resume, slot_tokens)
+                                      : (int64_t) c.ids.size() > std::max(resume, slot_tokens)) &&
+                            starts_with(c.ids, c.imgs)) {
                             slot_source = b;
                             slot_tokens = (int64_t) c.ids.size();
                             slot_ck = &c;
@@ -19685,8 +19760,10 @@ int main(int argc, char** argv) {
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                             (int64_t) live.size() == p;
                 const auto tc0 = Clock::now();
-                if (cont) park_slot(admit_slot);   // the conversation the slot holds, before this one overwrites it
-                if (cont && !copy_to_slot(admit_slot, live, err)) {
+                const bool continuing_own_slot = (admit_slot == slot_source && resume > 0);
+                if (cont && !continuing_own_slot) park_slot(admit_slot);   // bypass parking when slot continues own session
+                const int64_t delta_from = continuing_own_slot ? resume : 0;
+                if (cont && !copy_to_slot(admit_slot, live, err, delta_from)) {
                     std::fprintf(stderr, "strata serve: batch admission failed: %s\n", err.c_str());
                     bs[(size_t) admit_slot].cached = false;   // its sessions may be half written
                     cont = false;
@@ -19783,8 +19860,14 @@ int main(int argc, char** argv) {
                         }
                     }
                     const auto tc4 = Clock::now();
-                    std::fprintf(stderr, "strata batch: slot %d takes %lld tokens (copied in %.1f ms)\n", admit_slot,
-                                 (long long) live.size(), std::chrono::duration<double, std::milli>(tc4 - tc0).count());
+                    if (continuing_own_slot) {
+                        std::fprintf(stderr, "strata batch: slot %d continuing session (in-place delta %lld..%lld tokens, park bypassed, copied in %.1f ms)\n",
+                                     admit_slot, (long long) resume, (long long) live.size(),
+                                     std::chrono::duration<double, std::milli>(tc4 - tc0).count());
+                    } else {
+                        std::fprintf(stderr, "strata batch: slot %d takes %lld tokens (copied in %.1f ms)\n", admit_slot,
+                                     (long long) live.size(), std::chrono::duration<double, std::milli>(tc4 - tc0).count());
+                    }
                     pc.admission((long long) live.size(), prompt_ms);
                     if (trace) {   // STRATA_TRACE: the admission's phases (ms), from the drain before BGEN to this copy
                         auto span = [](Clock::time_point a, Clock::time_point b) {

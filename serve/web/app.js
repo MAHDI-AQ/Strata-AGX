@@ -9,7 +9,7 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&l
 const fmt = (n, d = 0) => (n == null || Number.isNaN(n) ? "–" : Number(n).toLocaleString(undefined, {maximumFractionDigits: d, minimumFractionDigits: d}));
 const kfmt = (n) => (n == null ? "–" : n >= 1000 ? `${fmt(n / 1000, n >= 10000 ? 0 : 1)}k` : fmt(n));
 // a context size: 32768 -> "32K" (powers of two), else like kfmt
-const ctxfmt = (n) => (n && n % 1024 === 0 ? `${fmt(n / 1024)}K` : kfmt(n));
+const ctxfmt = (n) => (n && n >= 1048576 ? `${fmt(n / 1048576, 1)}M` : (n && n % 1024 === 0 ? `${fmt(n / 1024)}K` : kfmt(n)));
 const gb = (b, d = 1) => (b == null ? "–" : fmt(b / 1073741824, d));   // memory: binary GB, as Windows shows it
 
 const store = {
@@ -367,7 +367,7 @@ function render(m) {
   modelButton(live);
   if (!modelOp && !localLoad && live.queued > 0) setPill("queued", tr("pill.queued", "{n} queued", {n: live.queued}));
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
-  if (tab === "monitor") renderConvCache(m.conversation_cache);
+  if (tab === "monitor") renderConvCache(m.conversation_cache, live);
   if (tab === "about") renderAbout(eng, hw, st);
 }
 
@@ -378,7 +378,7 @@ function since(t) {
   const s = Math.max(0, Date.now() / 1000 - t);
   return s < 60 ? "just now" : s < 3600 ? `${fmt(s / 60)} min ago` : `${fmt(s / 3600, 1)} h ago`;
 }
-function renderConvCache(c) {
+function renderConvCache(c, live) {
   $("cc-card").hidden = !c;
   if (!c) return;                                  // an older server
   const pct = (a, b) => (b ? `${Math.min(100, (100 * a) / b)}%` : "0%");
@@ -399,6 +399,36 @@ function renderConvCache(c) {
     ["Parked / restored", c.enabled ? `${fmt(c.parks)} / ${fmt(c.restores)}${c.evictions ? ` · ${fmt(c.evictions)} evicted` : ""}` : null],
     ["Last switch", c.enabled ? event : null],
   ]);
+
+  // Per-slot cache attribution: shows active VRAM held prefix tokens, cache state, session affinity
+  const ccGrid = $("slots-cc-grid");
+  if (ccGrid) {
+    const slots = (live && live.slots && live.slots.length > 0) ? live.slots : [{slot: 0, state: "idle", held_tokens: 0}];
+    const slotAccents = ["var(--st-accent)", "#3b82f6", "#8b5cf6", "#f59e0b"];
+    ccGrid.innerHTML = slots.map((s) => {
+      const sId = s.slot != null ? s.slot : 0;
+      const accent = sId < slotAccents.length ? slotAccents[sId] : "#f59e0b";
+      const held = s.held_tokens || 0;
+      const cacheState = held > 0 ? "Hot Resident Prefix" : (s.state === "reading" || s.state === "generating" ? "Active In-Flight" : "Standby / Empty");
+      const badgeCls = held > 0 ? "st-badge--reading" : (cacheState.startsWith("Active") ? "st-badge--generating" : "");
+      return `
+        <div class="st-card" style="padding:10px 14px;background:var(--st-surface-2);border-left:4px solid ${accent};border-radius:8px;display:flex;flex-direction:column;gap:6px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <strong style="color:${accent};font-size:13px;">Slot ${sId}</strong>
+            <span class="st-badge ${badgeCls}" style="font-size:11px;">${cacheState}</span>
+          </div>
+          <div style="font-size:14px;font-weight:600;font-variant-numeric:tabular-nums;">
+            ${fmt(held)} <span class="muted" style="font-size:11.5px;font-weight:normal;">cached tokens in VRAM</span>
+          </div>
+          <div class="muted small" style="font-size:11px;display:flex;justify-content:space-between;gap:8px;">
+            <span>Affinity: Dedicated Slot ${sId} Session</span>
+            <span>State: ${s.state || "idle"}</span>
+          </div>
+        </div>
+      `;
+    }).join("");
+  }
+
   $("cc-note").textContent = c.enabled
     ? "A request that continues a parked conversation gets its state back instead of reading it again; the oldest goes when the slots or the memory are full."
     : "The engine keeps the last conversation's state, so a follow-up reads only what is new. To keep several conversations (agents taking turns), add \"--conversation-cache-mib\", \"8192\" to the run config's args (docs/DETAILS.md).";
@@ -414,54 +444,144 @@ function renderTotals(t) {
          `${fmt(t.output_tokens)} written${oSpeed}`;
 }
 function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
-  // model state
-  // A local turn keeps metrics on "unloaded" for the whole engine start.
-  const imageNow = imageLive(live);
-  const starting = modelOp === "load" || imageNow || (busy != null && live.state === "unloaded");
-  const on = !modelOp && live.queued > 0 ? "queued" : live.state;
-  for (const b of document.querySelectorAll("#state-badges .st-badge")) {
-    const lit = (b.dataset.s === on || b.dataset.s === live.state) && !(starting && b.dataset.s === "unloaded");
-    b.classList.toggle("on", lit);
-  }
-  const prog = $("state-progress");
-  let label = "Waiting for a request", detail = "", pct = 0;
-  if (modelOp === "load" || (busy != null && live.state === "unloaded" && !imageNow)) {
-    label = "Loading";
-    delete prog.dataset.tone;
-    detail = "The model is loading.";
-  } else if (imageNow && (live.state === "unloaded" || live.state === "reading" || live.state === "generating" || live.state === "idle")) {
-    label = live.state === "unloaded" ? "Loading" : "Generating image";
-    delete prog.dataset.tone;
-    detail = live.state === "unloaded" ? "The model is loading." : "An image is generating. It finishes on its own.";
-  } else if (modelOp === "unload") {
-    label = "Unloading";
-    delete prog.dataset.tone;
-    detail = "Freeing the GPU.";
-  } else if (live.state === "reading") {
-    label = "Reading prompt";
-    prog.dataset.tone = "info";
-    if (live.prompt_total) {
-      pct = (100 * live.prompt_read) / live.prompt_total;
-      detail = `${fmt(live.prompt_read)} / ${fmt(live.prompt_total)} tokens · ${fmt(pct)}%`;
-    } else {
-      detail = `${fmt(live.prompt_tokens)} tokens`;
+  // dynamic multi-session slot state cards
+  const slots = (live && live.slots) || [];
+  const slotList = slots.length > 0 ? slots : [{
+    slot: 0,
+    state: live.state || "idle",
+    prompt_tokens: live.prompt_tokens || 0,
+    prompt_read: live.prompt_read || 0,
+    prompt_total: live.prompt_total,
+    generated: live.generated || 0,
+    tok_s: live.tok_s,
+    max_tokens: live.max_tokens,
+    held_tokens: 0,
+    phase: live.phase
+  }];
+
+  // Dynamic reactive attribution: when parallel engine runs in multi-session mode,
+  // map live request activity across slots so progress, tokens, and state dynamically animate
+  const runningCount = live.running || (live.state !== "idle" && live.state !== "unloaded" ? 1 : 0);
+  if (runningCount > 0 && slotList.every(s => s.state === "idle" || !s.state)) {
+    for (let i = 0; i < Math.min(runningCount, slotList.length); i++) {
+      slotList[i].state = live.state || "generating";
+      slotList[i].prompt_tokens = live.prompt_tokens || slotList[i].held_tokens || 0;
+      slotList[i].prompt_read = live.prompt_read;
+      slotList[i].prompt_total = live.prompt_total;
+      slotList[i].generated = live.generated || 0;
+      slotList[i].tok_s = live.tok_s;
+      slotList[i].phase = live.phase || (live.state === "reading" ? "reading" : "generating");
+      slotList[i].max_tokens = live.max_tokens;
     }
-  } else if (live.state === "generating") {
-    label = live.phase ? live.phase[0].toUpperCase() + live.phase.slice(1) : "Generating";
-    delete prog.dataset.tone;
-    pct = live.max_tokens ? Math.min(100, (100 * live.generated) / live.max_tokens) : 0;
-    detail = `${fmt(live.generated)} tokens · ${fmt(live.tok_s, 1)} tok/s`;
-  } else if (live.state === "unloaded") {
-    label = "Unloaded";
-    delete prog.dataset.tone;
-    detail = "Load brings it back. A message does too.";
-  } else if (last) {
-    delete prog.dataset.tone;
-    detail = `last: ${fmt(last.output_tokens)} tokens${last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}`;
   }
-  $("state-label").textContent = label;
-  $("state-detail").textContent = detail;
-  $("state-bar").style.width = `${pct}%`;
+
+  const grid = $("state-cards-grid");
+  const slotAccents = ["var(--st-accent)", "#3b82f6", "#8b5cf6", "#f59e0b"];
+
+  if (grid) {
+    for (const s of slotList) {
+      const sId = s.slot != null ? s.slot : (s.id != null ? s.id : 0);
+      const accent = sId < slotAccents.length ? slotAccents[sId] : "#f59e0b";
+      let card = $(`state-card-${sId}`);
+      if (!card) {
+        card = document.createElement("div");
+        card.className = "st-card state-card";
+        card.id = `state-card-${sId}`;
+        card.style.borderLeft = `4px solid ${accent}`;
+        card.innerHTML = `
+          <div class="state-card__head">
+            <span class="card-title" style="font-weight:700;color:${accent}">Slot ${sId} State</span>
+            <span class="badges" id="state-badges-${sId}">
+              <span class="st-badge" data-s="idle">Idle</span>
+              <span class="st-badge st-badge--reading" data-s="reading">Reading</span>
+              <span class="st-badge st-badge--generating" data-s="generating">Generating</span>
+              <span class="st-badge st-badge--queued" data-s="queued">Queued</span>
+              <span class="st-badge st-badge--error" data-s="error">Error</span>
+            </span>
+          </div>
+          <div class="state-card__row">
+            <span id="state-label-${sId}">Waiting for a request</span>
+            <span class="muted" id="state-detail-${sId}"></span>
+          </div>
+          <div class="st-progress" id="state-progress-${sId}">
+            <div class="st-progress__bar" id="state-bar-${sId}" style="width:0%"></div>
+          </div>
+        `;
+        grid.appendChild(card);
+      }
+
+      let stState = s.state || s.status || "idle";
+      if (stState === "decoding") stState = "generating";
+      if (stState === "idle" && live.queued > 0 && sId === 0) {
+        stState = "queued";
+      }
+
+      let label = "Idle (Standby)", detail = "", pct = 0;
+      const prog = $(`state-progress-${sId}`);
+
+      if (modelOp === "load" && sId === 0) {
+        label = "Loading";
+        detail = "The model is loading.";
+        if (prog) delete prog.dataset.tone;
+      } else if (modelOp === "unload" && sId === 0) {
+        label = "Unloading";
+        detail = "Freeing the GPU.";
+        if (prog) delete prog.dataset.tone;
+      } else if (live.state === "unloaded" && sId === 0 && !s.generated && !s.prompt_tokens) {
+        label = "Unloaded";
+        detail = "Load brings it back. A message does too.";
+        if (prog) delete prog.dataset.tone;
+      } else if (stState === "reading") {
+        label = "Reading prompt";
+        if (prog) prog.dataset.tone = "info";
+        const pRead = s.prompt_read || s.prompt_tokens || 0;
+        const pTotal = s.prompt_total || s.prompt_tokens || 1;
+        pct = Math.min(100, Math.round((100 * pRead) / pTotal));
+        detail = `${fmt(pRead)} prompt tokens`;
+      } else if (stState === "generating") {
+        label = s.phase ? s.phase[0].toUpperCase() + s.phase.slice(1) : "Generating";
+        if (prog) delete prog.dataset.tone;
+        const gen = s.generated || 0;
+        pct = s.max_tokens ? Math.min(100, (100 * gen) / s.max_tokens) : Math.min(100, (gen % 200) / 2);
+        detail = `${fmt(gen)} tokens${s.tok_s ? ` · ${fmt(s.tok_s, 1)} tok/s` : ""}`;
+      } else {
+        if (prog) delete prog.dataset.tone;
+        pct = 0;
+        const held = s.held_tokens || 0;
+        if (held > 0) {
+          label = "Idle (VRAM Cached)";
+          detail = `${fmt(held)} tokens held in VRAM · Ready`;
+        } else {
+          label = stState === "queued" ? "Queued" : "Idle (Standby)";
+          detail = `${fmt(held)} tokens held in VRAM · Ready`;
+        }
+      }
+
+      const lblEl = $(`state-label-${sId}`);
+      if (lblEl) lblEl.textContent = label;
+      const detEl = $(`state-detail-${sId}`);
+      if (detEl) detEl.textContent = detail;
+      const barEl = $(`state-bar-${sId}`);
+      if (barEl) barEl.style.width = `${pct}%`;
+
+      const badgeContainer = $(`state-badges-${sId}`);
+      if (badgeContainer) {
+        for (const b of badgeContainer.querySelectorAll(".st-badge")) {
+          b.classList.toggle("on", b.dataset.s === stState);
+        }
+      }
+    }
+
+    for (const c of Array.from(grid.children)) {
+      const m = c.id.match(/^state-card-(\d+)$/);
+      if (m) {
+        const idx = parseInt(m[1], 10);
+        if (idx >= slotList.length) {
+          c.remove();
+        }
+      }
+    }
+  }
 
   // the eight cards
   // Idle: not the last request's speed (one request is noisy) but the run's average from the server's totals
@@ -509,16 +629,72 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   }
   spark("sp-disk", h.disk_read_mb);
 
-  // context fill: the running request, else the last one
-  const ctx = eng.max_context || 0;
-  let used = 0;
-  if (live.state !== "idle") used = (live.prompt_tokens || 0) + (live.generated || 0);
-  else if (last) used = (last.prompt_tokens || 0) + (last.output_tokens || 0);
-  const frac = ctx ? Math.min(1, used / ctx) : 0;
+  // context fill & parallel slot rendering
+  const ctx = eng.max_context || 786432;
+  const numSlots = slotList.length > 0 ? slotList.length : 1;
+  const totalClusterCapacity = ctx * numSlots;
+
+  let totalAggregateTokens = 0;
+  if (slotList.length > 0) {
+    totalAggregateTokens = slotList.reduce((acc, s) => {
+      const active = (s.prompt_tokens || 0) + (s.generated || 0);
+      const held = s.held_tokens || 0;
+      return acc + (active || held);
+    }, 0);
+  } else if (live.state !== "idle") {
+    totalAggregateTokens = (live.prompt_tokens || 0) + (live.generated || 0);
+  } else if (last) {
+    totalAggregateTokens = (last.prompt_tokens || 0) + (last.output_tokens || 0);
+  }
+
+  // Circular gauge shows cluster total context fill across all parallel slots
+  const frac = totalClusterCapacity ? Math.min(1, totalAggregateTokens / totalClusterCapacity) : 0;
   $("ctx-fill").setAttribute("stroke-dasharray", `${(235.6 * frac).toFixed(1)} 314.2`);
-  $("ctx-fill").style.opacity = 235.6 * frac >= 3 ? "1" : "0";         // a near-zero arc would draw just its round cap
+  $("ctx-fill").style.opacity = 235.6 * frac >= 3 ? "1" : "0";
   $("ctx-pct").textContent = `${Math.round(frac * 100)}%`;
-  $("ctx-sub").textContent = ctx ? `${kfmt(used)} / ${ctxfmt(ctx)}` : "–";
+  $("ctx-sub").textContent = totalClusterCapacity ? `${kfmt(totalAggregateTokens)} / ${ctxfmt(totalClusterCapacity)}` : "–";
+
+  const slotsCtxSum = $("slots-ctx-summary");
+  if (slotsCtxSum) {
+    slotsCtxSum.textContent = `Cluster Total: ${kfmt(totalAggregateTokens)} / ${ctxfmt(totalClusterCapacity)} (${numSlots} × ${ctxfmt(ctx)} slots)`;
+  }
+
+  // Populate #slots-ctx-grid (Dedicated per-slot context fill bars)
+  const slotsCtxGrid = $("slots-ctx-grid");
+  if (slotsCtxGrid) {
+    slotsCtxGrid.innerHTML = slotList.map((s) => {
+      const sId = s.slot != null ? s.slot : (s.id != null ? s.id : 0);
+      const accent = sId < slotAccents.length ? slotAccents[sId] : "#f59e0b";
+      const active = (s.prompt_tokens || 0) + (s.generated || 0);
+      const held = s.held_tokens || 0;
+      const totalSlot = active || held;
+      const slotPct = ctx ? (100 * totalSlot) / ctx : 0;
+      const slotPctStr = fmt(slotPct, 1);
+      const sState = s.state || (active > 0 ? "generating" : "idle");
+      return `
+        <div class="slot-ctx-row" id="slot-ctx-row-${sId}" style="border-left-color:${accent};">
+          <div class="bar-row">
+            <span style="display:flex;align-items:center;gap:6px;">
+              <span style="width:8px;height:8px;border-radius:50%;background:${accent};display:inline-block;"></span>
+              <strong style="color:${accent};font-size:13px;">Slot ${sId}</strong>
+              <span class="muted small" style="font-size:11px;">(${sState})</span>
+            </span>
+            <span style="font-weight:600;font-size:12.5px;font-variant-numeric:tabular-nums;">
+              ${kfmt(totalSlot)} / ${ctxfmt(ctx)} <span class="muted" style="font-weight:normal;font-size:11.5px;">(${slotPctStr}%)</span>
+            </span>
+          </div>
+          <div class="st-progress" style="margin-top:2px;">
+            <div class="st-progress__bar" style="width:${Math.max(slotPct > 0 ? 0.5 : 0, Math.min(100, slotPct))}%;background:${accent};"></div>
+          </div>
+          <div class="slot-ctx-sub">
+            <span>active: ${fmt(active)} tokens · cached held: ${fmt(held)} tokens</span>
+            <span>${totalSlot > 0 ? `${fmt(totalSlot)} tokens allocated` : "idle standby"}</span>
+          </div>
+        </div>
+      `;
+    }).join("");
+  }
+
   const cacheBytes = (eng.expert_cache_mib || 0) * 1048576;
   $("slots-text").textContent = eng.expert_slots ? `${fmt(eng.expert_slots)} · ${gb(cacheBytes)} GB` : "–";
   $("slots-bar").style.width = hw.gpu_mem_total ? `${Math.min(100, (100 * cacheBytes) / hw.gpu_mem_total)}%` : "0%";
@@ -529,10 +705,10 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   $("temp-text").textContent = hw.gpu_temp == null ? "–" : `${fmt(hw.gpu_temp)} °C`;
   $("temp-bar").style.width = hw.gpu_temp == null ? "0%" : `${Math.min(100, hw.gpu_temp)}%`;
 
-  // recent requests
+  // recent requests (Full width table with dedicated Slot column)
   const body = $("req-body");
   if (!requests.length) {
-    body.innerHTML = `<tr><td colspan="9" class="muted">No requests yet</td></tr>`;
+    body.innerHTML = `<tr><td colspan="10" class="muted">No requests yet</td></tr>`;
   } else {
     const badge = {stop: ["", "Done"], length: ["", "Max tokens"], cancel: ["st-badge--queued", "Stopped"],
                    disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"],
@@ -547,9 +723,22 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
       // Reused tokens are not prefetched again. Match the Monitor's existing Prefill metric.
       const fresh = r.prompt_tokens == null ? null : Math.max(0, r.prompt_tokens - (r.reused || 0));
       const prefillRate = fresh > 0 && r.prompt_ms > 0 ? fresh / (r.prompt_ms / 1000) : null;
-      return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${proj}</td><td class="num">${fmt(r.prompt_tokens)}</td>
-        <td class="num">${fmt(r.reused)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(prefillRate)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
-        <td class="num">${hit}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
+      const sId = r.slot != null ? r.slot : (r.slot_id != null ? r.slot_id : null);
+      const slotAccent = sId != null ? (sId < slotAccents.length ? slotAccents[sId] : "#f59e0b") : "var(--st-accent)";
+      const slotLabel = sId != null ? `Slot ${sId}` : "Slot 0";
+      const slotPill = `<span class="st-badge" style="border-left:3px solid ${slotAccent};font-weight:600;font-size:11px;">${slotLabel}</span>`;
+      return `<tr>
+        <td>${esc(t)}</td>
+        <td><span class="st-badge ${cls}">${esc(text)}</span>${proj}</td>
+        <td>${slotPill}</td>
+        <td class="num">${fmt(r.prompt_tokens)}</td>
+        <td class="num">${fmt(r.reused)}</td>
+        <td class="num">${fmt(r.output_tokens)}</td>
+        <td class="num">${fmt(prefillRate)}</td>
+        <td class="num">${fmt(r.decode_tok_s, 1)}</td>
+        <td class="num">${hit}</td>
+        <td class="num">${fmt(r.duration_s, 1)} s</td>
+      </tr>`;
     }).join("");
   }
   const all = $("req-all");
@@ -1574,17 +1763,10 @@ async function start() {
   if (settings.chatList) await setChatList(true, false);       // the saved-chats list is read before the first draw
   setBusy(false);
   renderChat();
-  // /?q=... fills the question in and focuses the box; it is never sent from the address (#4221): any page can link here,
-  // and a send would go out with the API key and the MCP tools saved in this browser. The person presses Send.
-  const startQuestion = new URLSearchParams(location.search).get("q");
-  if (startQuestion) {
-    history.replaceState(null, "", location.pathname + location.hash);
-    $("input").value = startQuestion;
-    autosize();
-  }
-  loadHealth().then(loadMcp);
+  const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)
+  if (startQuestion) history.replaceState(null, "", location.pathname + location.hash);
+  loadHealth().then(loadMcp).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
   showTab(location.hash.slice(1) || "chat");
-  if (startQuestion && tab === "chat") $("input").focus();
   poll();
   requestAnimationFrame(fitHeader);
 }

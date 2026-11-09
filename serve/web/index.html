@@ -7,7 +7,7 @@
 <link rel="icon" href="web/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="web/tokens.css">
 <link rel="stylesheet" href="web/components.css">
-<link rel="stylesheet" href="web/app.css">
+<link rel="stylesheet" href="web/app.css?v=20261107-11">
 <script>
   // the theme before the first paint: the saved choice, else the system's
   try {
@@ -116,72 +116,96 @@
   <!-- ============================ Monitor ============================ -->
   <section class="view view--monitor" id="view-monitor" role="tabpanel" aria-labelledby="tab-btn-monitor" hidden>
     <div class="monitor">
-      <div class="st-card state-card">
-        <div class="state-card__head">
-          <span class="card-title">Model state</span>
-          <span class="badges" id="state-badges">
-            <span class="st-badge" data-s="idle">Idle</span>
-            <span class="st-badge" data-s="unloaded">Unloaded</span>
-            <span class="st-badge st-badge--reading" data-s="reading">Reading</span>
-            <span class="st-badge st-badge--generating" data-s="generating">Generating</span>
-            <span class="st-badge st-badge--queued" data-s="queued">Queued</span>
-            <span class="st-badge st-badge--error" data-s="error">Error</span>
-          </span>
-        </div>
-        <div class="state-card__row"><span id="state-label">Waiting for a request</span><span class="muted" id="state-detail"></span></div>
-        <div class="st-progress" id="state-progress"><div class="st-progress__bar" id="state-bar" style="width:0%"></div></div>
+      <div class="state-cards-grid" id="state-cards-grid" style="display:grid;grid-template-columns:repeat(auto-fit, minmax(320px, 1fr));gap:14px;margin-bottom:16px;width:100%;">
+        <!-- Dynamically populated and scaled per slot by app.js -->
       </div>
 
       <div class="metrics" id="metrics">
         <!-- filled by app.js: Speed, GPU load, VRAM, GPU temp, Power, PCIe, CPU, Disk read -->
       </div>
 
-      <div class="monitor-row">
-        <div class="st-card ctx-card">
-          <span class="card-title">Context fill</span>
-          <div class="ctx-gauge">
-            <svg class="st-gauge" viewBox="0 0 120 120" aria-hidden="true">
-              <circle class="st-gauge__track" cx="60" cy="60" r="50" fill="none" stroke-width="10" stroke-linecap="round"
-                      stroke-dasharray="235.6 314.2" transform="rotate(135 60 60)"/>
-              <circle class="st-gauge__fill" id="ctx-fill" cx="60" cy="60" r="50" fill="none" stroke-width="10"
-                      stroke-linecap="round" stroke-dasharray="0 314.2" transform="rotate(135 60 60)"/>
-            </svg>
-            <div class="ctx-gauge__label"><span class="ctx-gauge__pct" id="ctx-pct">0%</span><span class="muted" id="ctx-sub">&ndash;</span></div>
-          </div>
-          <div class="bar-row"><span>Experts in VRAM</span><span class="muted" id="slots-text">&ndash;</span></div>
-          <div class="st-progress"><div class="st-progress__bar" id="slots-bar" style="width:0%"></div></div>
-          <div class="bar-row"><span>System RAM</span><span class="muted" id="ram-text">&ndash;</span></div>
-          <div class="st-progress" id="ram-progress"><div class="st-progress__bar" id="ram-bar" style="width:0%"></div></div>
-          <div class="bar-row"><span>GPU temperature</span><span class="muted" id="temp-text">&ndash;</span></div>
-          <div class="st-progress" data-tone="warn"><div class="st-progress__bar" id="temp-bar" style="width:0%"></div></div>
+            <!-- Row 3: Context Fill (Dedicated Full Row) -->
+      <div class="st-card ctx-card" id="ctx-card">
+        <div class="req-head">
+          <span class="card-title">Context Fill &amp; KV Cache Footprint</span>
+          <span class="muted small" id="ctx-summary-note">Active generation &amp; cached held tokens across parallel slots</span>
         </div>
-        <div class="st-card req-card">
-          <div class="req-head"><span class="card-title">Recent requests</span>
-            <button class="st-btn st-btn--secondary" id="req-all" hidden>Show all</button></div>
-          <div class="table-wrap" id="req-wrap">
-            <table class="st-table">
-              <thead><tr><th>Time</th><th>Status</th><th class="num">Prompt</th><th class="num">Reused</th><th class="num">Output</th>
-                <th class="num" title="New prompt tokens per second, excluding reused cache tokens (engine prompt time)">Prefill t/s</th><th class="num">Decode t/s</th><th class="num" title="While writing the answer: the share of the experts looked up that were already in VRAM. Experts the GPU read over PCIe (--pcie-frac) are not counted in it; their share of all routed experts is shown after it (+N% PCIe)">VRAM hit rate</th><th class="num">Duration</th></tr></thead>
-              <tbody id="req-body"><tr><td colspan="9" class="muted">No requests yet</td></tr></tbody>
-            </table>
+        <div class="ctx-split-layout">
+          <!-- Left column: Circular Gauge + System Resource bars -->
+          <div class="ctx-col-left">
+            <div class="ctx-gauge">
+              <svg class="st-gauge" viewBox="0 0 120 120" aria-hidden="true">
+                <circle class="st-gauge__track" cx="60" cy="60" r="50" fill="none" stroke-width="10" stroke-linecap="round"
+                        stroke-dasharray="235.6 314.2" transform="rotate(135 60 60)"/>
+                <circle class="st-gauge__fill" id="ctx-fill" cx="60" cy="60" r="50" fill="none" stroke-width="10"
+                        stroke-linecap="round" stroke-dasharray="0 314.2" transform="rotate(135 60 60)"/>
+              </svg>
+              <div class="ctx-gauge__label"><span class="ctx-gauge__pct" id="ctx-pct">0%</span><span class="muted" id="ctx-sub">&ndash;</span></div>
+            </div>
+            <div class="bar-row"><span>Experts in VRAM</span><span class="muted" id="slots-text">&ndash;</span></div>
+            <div class="st-progress"><div class="st-progress__bar" id="slots-bar" style="width:0%"></div></div>
+            <div class="bar-row"><span>System RAM</span><span class="muted" id="ram-text">&ndash;</span></div>
+            <div class="st-progress" id="ram-progress"><div class="st-progress__bar" id="ram-bar" style="width:0%"></div></div>
+            <div class="bar-row"><span>GPU temperature</span><span class="muted" id="temp-text">&ndash;</span></div>
+            <div class="st-progress" data-tone="warn"><div class="st-progress__bar" id="temp-bar" style="width:0%"></div></div>
           </div>
-          <p class="muted req-totals" id="req-totals"></p>
+          <!-- Right column: Dedicated per-slot context fill bars -->
+          <div class="ctx-col-right">
+            <div class="slots-ctx-header" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+              <span style="font-weight:600;font-size:13px;color:var(--st-ink-soft);">Per-Slot Context Allocation</span>
+              <span class="muted small" id="slots-ctx-summary" style="font-size:11.5px;">Max Context: 786,432 tokens</span>
+            </div>
+            <div class="slots-ctx-grid" id="slots-ctx-grid">
+              <!-- Dynamically populated per slot (Slot 0, Slot 1, Slot 2) by app.js -->
+            </div>
+          </div>
         </div>
       </div>
 
+      <!-- Row 4: Conversation Cache (Dedicated Full Row) -->
       <div class="st-card cc-card" id="cc-card">
-        <div class="req-head"><span class="card-title">Conversation cache</span><span class="muted small" id="cc-sum"></span></div>
+        <div class="req-head"><span class="card-title">Conversation Cache</span><span class="muted small" id="cc-sum"></span></div>
         <div class="cc-bars" id="cc-bars" hidden>
           <div><div class="bar-row"><span>Parked conversations</span><span class="muted" id="cc-slots-text">&ndash;</span></div>
             <div class="st-progress"><div class="st-progress__bar" id="cc-slots-bar" style="width:0%"></div></div></div>
           <div><div class="bar-row"><span>Their memory (RAM)</span><span class="muted" id="cc-mem-text">&ndash;</span></div>
             <div class="st-progress"><div class="st-progress__bar" id="cc-mem-bar" style="width:0%"></div></div></div>
         </div>
-        <dl class="facts" id="cc-facts"></dl>
+        <div class="slots-cc-section" style="margin-top:12px;">
+          <div style="font-size:12.5px;font-weight:600;margin-bottom:8px;color:var(--st-ink-soft);">Per-Slot Cache Attribution &amp; Prefix Holding</div>
+          <div class="slots-cc-grid" id="slots-cc-grid" style="display:grid;grid-template-columns:repeat(auto-fit, minmax(260px, 1fr));gap:12px;">
+            <!-- Dynamically populated by app.js -->
+          </div>
+        </div>
+        <dl class="facts" id="cc-facts" style="margin-top:12px;"></dl>
         <p class="muted small cc-note" id="cc-note"></p>
       </div>
 
-      <div class="st-card mcp-card" id="mcp-card" hidden>
+      <!-- Row 5: Recent Requests (Dedicated Full Row at the End Down) -->
+      <div class="st-card req-card" id="req-card">
+        <div class="req-head"><span class="card-title">Recent requests</span>
+          <button class="st-btn st-btn--secondary" id="req-all" hidden>Show all</button></div>
+        <div class="table-wrap" id="req-wrap" style="max-height:300px;overflow-y:auto;">
+          <table class="st-table" style="width:100%;">
+            <thead><tr>
+              <th>Time</th>
+              <th>Status</th>
+              <th>Slot</th>
+              <th class="num">Prompt</th>
+              <th class="num">Reused</th>
+              <th class="num">Output</th>
+              <th class="num" title="New prompt tokens per second, excluding reused cache tokens (engine prompt time)">Prefill t/s</th>
+              <th class="num">Decode t/s</th>
+              <th class="num" title="While writing the answer: the share of the experts looked up that were already in VRAM. Experts the GPU read over PCIe (--pcie-frac) are not counted in it; their share of all routed experts is shown after it (+N% PCIe)">VRAM hit rate</th>
+              <th class="num">Duration</th>
+            </tr></thead>
+            <tbody id="req-body"><tr><td colspan="10" class="muted">No requests yet</td></tr></tbody>
+          </table>
+        </div>
+        <p class="muted req-totals" id="req-totals"></p>
+      </div>
+
+<div class="st-card mcp-card" id="mcp-card" hidden>
         <div class="req-head"><span class="card-title">MCP servers</span><span class="muted small" id="mcp-sum"></span></div>
         <div class="mcp-list" id="mcp-list"></div>
         <p class="muted small mcp-note">Their tools run on this PC with your rights, when the model decides to call them
@@ -316,6 +340,6 @@
 <script src="web/history.js"></script>
 <script src="web/chatstore.js"></script>
 <script src="web/chats-ui.js"></script>
-<script src="web/app.js"></script>
+<script src="web/app.js?v=20261107-11"></script>
 </body>
 </html>
