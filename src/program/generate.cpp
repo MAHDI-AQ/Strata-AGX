@@ -17823,11 +17823,23 @@ int main(int argc, char** argv) {
                     const char* v = std::getenv("STRATA_PIPED_DECODE_MIN_MS");
                     return v != nullptr ? std::max(0.0, std::atof(v)) : 0.0;
                 }();
-                const bool pr_on = piped && pr_piece > 0;
-                auto piece_now = [&]() -> int64_t {
-                    return pr_on ? strata::program::piped_read_piece(pr_piece, C)
-                                 : strata::program::batch_read_piece(o.batch > 0, piped, !stages.empty(), batch_on(), C,
-                                                                     yield_chunks);
+                static const bool dynamic_prefill = [] {
+                    const char* v = std::getenv("STRATA_DYNAMIC_PREFILL");
+                    return v == nullptr || (v[0] != '0' && v[0] != '\0');
+                }();
+                auto active_decode_count = [&]() -> int {
+                    int c = 0;
+                    for (const BSlot& b : bs) if (b.active) ++c;
+                    return c;
+                };
+                const bool pr_on = piped && (pr_piece > 0 || dynamic_prefill);
+                auto piece_now = [&](int64_t remaining_tokens) -> int64_t {
+                    if (dynamic_prefill && piped) {
+                        return strata::program::dynamic_piped_read_piece(pr_piece, C, active_decode_count(), remaining_tokens);
+                    }
+                    return (piped && pr_piece > 0) ? strata::program::piped_read_piece(pr_piece, C)
+                                                   : strata::program::batch_read_piece(o.batch > 0, piped, !stages.empty(), batch_on(), C,
+                                                                                       yield_chunks);
                 };
                 // the slots decode through the pipeline for budget_ms, drained before the next read
                 auto piped_decode = [&](double budget_ms, std::string& err) -> bool {
@@ -17870,10 +17882,11 @@ int main(int argc, char** argv) {
                                      std::chrono::duration<double, std::milli>(Clock::now() - tl).count());
                     }
                 }
-                int64_t piece = piece_now();
+                int64_t piece = piece_now(b0 - a0);
                 if (piece <= 0) return run(a0, b0);
                 for (int64_t q = a0; q < b0;) {
-                    const int64_t r = std::min(b0, q + piece);
+                    const int64_t cur_piece = piece_now(b0 - q);
+                    const int64_t r = (cur_piece <= 0) ? b0 : std::min(b0, q + cur_piece);
                     const auto tq = Clock::now();
                     if (!run_conc(q, r)) return false;
                     const double piece_ms = std::chrono::duration<double, std::milli>(Clock::now() - tq).count();

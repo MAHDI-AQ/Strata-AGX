@@ -1175,13 +1175,18 @@ def extract_session_id(headers, req: dict | None = None, messages: list[dict] | 
     """Extract session identifier from HTTP headers, request body, or prompt prefix fallback hash."""
     sid = ""
     if headers is not None:
-        sid = (headers.get("X-Session-ID") or 
+        sid = (headers.get("X-Project-ID") or
+               headers.get("X-Project-Id") or
+               headers.get("X-Project") or
+               headers.get("X-Workspace-Root") or
+               headers.get("X-Workspace") or
+               headers.get("X-Session-ID") or 
                headers.get("X-Session-Id") or 
                headers.get("X-Opencode-Session-Id") or 
                headers.get("X-Session-Affinity") or 
                headers.get("session-id") or "").strip()
     if not sid and isinstance(req, dict):
-        sid = str(req.get("session_id") or req.get("user") or "").strip()
+        sid = str(req.get("project_id") or req.get("project") or req.get("session_id") or req.get("user") or "").strip()
     if not sid and messages:
         try:
             lead = ""
@@ -1222,7 +1227,13 @@ def maybe_acquire_session_lease(svc, session_id: str, cancel: threading.Event, f
     if held_tokens == 0:
         held_tokens = getattr(cancel, "_strata_held_count", 0)
 
-    ttl = 180.0
+    # 24-hour persistent lease for project sessions; 180s for ephemeral
+    is_project = bool(session_id and (
+        any(k in session_id.lower() for k in ("proj", "p1", "p2", "p3", "p4", "slot-")) or
+        session_id in ("1", "2", "3", "4") or
+        getattr(cancel, "_strata_is_project", False)
+    ))
+    ttl = 86400.0 if is_project else 180.0
     lease = svc.session_leases.acquire(session_id=session_id, slot=slot, ttl=ttl, held_count=held_tokens)
     return lease
 
@@ -2632,6 +2643,28 @@ class StrataEngine:
 
         free = [b for b in self.slot_order if not self.slot_busy[b]]
         if not free:
+            return None
+
+        # 0. Dedicated project slot pinning (Pillar 1):
+        # Project 1 -> Slot 0, Project 2 -> Slot 1, Project 3 -> Slot 2, Project 4 -> Slot 3
+        project_slot = None
+        if session_id:
+            s_lower = session_id.lower()
+            if s_lower in ("1", "p1", "proj-1", "project-1", "project1", "slot-0"):
+                project_slot = 0
+            elif s_lower in ("2", "p2", "proj-2", "project-2", "project2", "slot-1"):
+                project_slot = 1
+            elif s_lower in ("3", "p3", "proj-3", "project-3", "project3", "slot-2"):
+                project_slot = 2
+            elif s_lower in ("4", "p4", "proj-4", "project-4", "project4", "slot-3"):
+                project_slot = 3
+
+        if project_slot is not None and project_slot < self.batch:
+            if not self.slot_busy[project_slot]:
+                logger.info(f"Project dedicated slot assigned: session={session_id} slot={project_slot}")
+                print(f"[strata project-pin] Dedicated slot {project_slot} claimed for session={session_id}", flush=True)
+                return project_slot
+            # If project slot is busy, wait for it! (Do not steal another project's slot)
             return None
 
         # 1. Direct session lease affinity: if session_id has an active lease on slot b and slot b is free, claim it immediately!

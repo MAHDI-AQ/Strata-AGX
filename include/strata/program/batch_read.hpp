@@ -66,6 +66,21 @@ inline int64_t piped_read_piece(int64_t piece_tokens, int64_t chunk) {
     return std::clamp<int64_t>(piece_tokens / chunk, 1, kPipedMaxChunks) * chunk;
 }
 
+/// Dynamic piped read piece (#Phase 1 / QoL):
+/// Scales prefill chunk size dynamically based on real-time active decode concurrency:
+/// - prompt_tokens <= 2048: return 0 (tool return micro-prefill, single burst)
+/// - active_decodes <= 0: return 0 (all slots idle, one run at full 4,000+ tok/s; no chunk slicing)
+/// - active_decodes == 1: 2048 tokens (high prefill throughput, smooth decode interleave)
+/// - active_decodes >= 2: 1024 tokens (interleaved smoothly with decode pump to eliminate frame-drops)
+inline int64_t dynamic_piped_read_piece(int64_t piece_tokens, int64_t chunk, int active_decodes, int64_t prompt_tokens) {
+    if (prompt_tokens <= 2048) return 0;
+    if (active_decodes <= 0) return 0;
+    chunk = std::max<int64_t>(chunk, 1);
+    int64_t target = (active_decodes == 1) ? 2048 : 1024;
+    if (piece_tokens > 0) target = std::min(target, piece_tokens);
+    return std::clamp<int64_t>(target / chunk, 1, kPipedMaxChunks) * chunk;
+}
+
 /// The slots' decode time between two pieces: share x the piece's time (STRATA_BATCH_DECODE_SHARE, the rule the
 /// one-GPU path uses between chunks), at most cap_ms (STRATA_PIPED_DECODE_MAX_MS; <= 0: no cap), at least floor_ms
 /// (STRATA_PIPED_DECODE_MIN_MS).

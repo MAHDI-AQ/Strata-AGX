@@ -11,6 +11,7 @@ using strata::program::ConcurrentReadSetup;
 using strata::program::piped_decode_budget_ms;
 using strata::program::piped_read_lead_in;
 using strata::program::piped_read_piece;
+using strata::program::dynamic_piped_read_piece;
 
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { std::printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
@@ -80,6 +81,15 @@ int main() {
     CHECK(!piped_read_lead_in(true, true, -1.0, 400.0));
     CHECK(!piped_read_lead_in(false, true, 0.0, 400.0));
     CHECK(!piped_read_lead_in(true, false, 0.0, 400.0));
+        // dynamic_piped_read_piece verification
+    CHECK(dynamic_piped_read_piece(4096, 512, 0, 1000) == 0);
+    CHECK(dynamic_piped_read_piece(4096, 512, 1, 1000) == 0);
+    CHECK(dynamic_piped_read_piece(4096, 512, 2, 2048) == 0);
+    CHECK(dynamic_piped_read_piece(4096, 512, 0, 10000) == 0);
+    CHECK(dynamic_piped_read_piece(4096, 512, 1, 10000) == 2048);
+    CHECK(dynamic_piped_read_piece(4096, 512, 2, 10000) == 1024);
+    CHECK(dynamic_piped_read_piece(4096, 512, 3, 10000) == 1024);
+    CHECK(dynamic_piped_read_piece(1024, 512, 1, 10000) == 1024);
     if (fails == 0) std::printf("batch_read_test: ok\n");
     return fails == 0 ? 0 : 1;
 }
