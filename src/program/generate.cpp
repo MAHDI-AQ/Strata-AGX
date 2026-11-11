@@ -78,6 +78,8 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/core/native_head.hpp"
+#include "strata/core/native_fp8.hpp"
+#include "strata/pipeline/pipeline_dma.hpp"
 #include "strata/core/spill_gate.hpp"
 #include "strata/core/pcie_share_rule.hpp"
 #include "strata/core/verify.hpp"
@@ -195,6 +197,8 @@ bool draft_vocab_whole_head();       // STRATA_METAL_DRAFT_VOCAB=full
 #include <set>
 #include <unordered_map>
 #include <vector>
+
+static std::vector<std::unique_ptr<strata::pipeline::TripleBufferedDMAPipeline>> g_dma_pipes;
 
 // STRATA_DF2_TAP_DUMP=FILE (research, off by default): every prompt tap batch the DFlash2 context takes is appended to FILE as
 // int64 pos0, int64 rows, then rows x floats_per_row float32 (the tap rows [rows][taps][n_embd]), for the layer-major / chunk-major
@@ -788,6 +792,9 @@ struct Options {
     bool stats = false;
     bool shared_late = false;          ///< plan v0.3 P3 A/B: shared expert inside post[l] (old order)
     bool keep_canonical = false;       ///< plan v0.3 P1 A/B: load canonical copies of natively served tensors
+    bool native_head_fp8 = false;      ///< --native-head-fp8: FP8 E4M3 head with fused online softmax
+    bool native_embed_fp8 = false;     ///< --native-embed-fp8: FP8 E4M3 token embeddings with Root RMSNorm
+    bool pipeline_dma = false;         ///< --pipeline-dma: 3-slot lockless ring-buffer PCIe DMA pipeline
     bool no_token_graph = false;       ///< plan v0.3 P3 A/B: two graphs per layer instead of one per token
     bool no_fused_gr = false;          ///< plan v0.3 P3 A/B: the six-kernel native gr_read + separate gr_write
     bool no_fast_attn = false;         ///< plan v0.3 P3 A/B: gather + one-block-per-head QSA attention
@@ -3477,6 +3484,9 @@ int main(int argc, char** argv) {
         else if (a == "--cpu-oracle-q8-0") o.cpu_oracle_q8_0 = true;
         else if (a == "--native") o.native_preset = next("--native");
         else if (a == "--native-head-gguf") o.native_head_gguf = next("--native-head-gguf");
+        else if (a == "--native-head-fp8") o.native_head_fp8 = true;
+        else if (a == "--native-embed-fp8") o.native_embed_fp8 = true;
+        else if (a == "--pipeline-dma") o.pipeline_dma = true;
         else if (a == "--embd-gguf") o.embd_gguf = next("--embd-gguf");
         else if (a == "--native-dense-gguf") o.native_dense_gguf.push_back(next("--native-dense-gguf"));
         else if (a == "--no-capture") o.no_capture = true;
@@ -4416,6 +4426,18 @@ int main(int argc, char** argv) {
         o.native_ple_key = o.native_moe_combine = o.native_gdn = o.native_router = true;
         o.native_qsa = o.native_qsa_indexer = o.native_rope = o.native_ple_postops = true;
         if (o.native_head_gguf.empty()) o.native_head_gguf = o.native_preset;
+    if (o.native_head_fp8 || (std::getenv("STRATA_NATIVE_HEAD_FP8") != nullptr && std::getenv("STRATA_NATIVE_HEAD_FP8")[0] != '0')) {
+        strata::core::set_native_head_fp8_enabled(true);
+        std::fprintf(stderr, "strata: native FP8 LM head enabled (--native-head-fp8)\n");
+    }
+    if (o.native_embed_fp8 || (std::getenv("STRATA_NATIVE_EMBED_FP8") != nullptr && std::getenv("STRATA_NATIVE_EMBED_FP8")[0] != '0')) {
+        strata::core::set_native_embed_fp8_enabled(true);
+        std::fprintf(stderr, "strata: native FP8 token embedding enabled (--native-embed-fp8)\n");
+    }
+    if (o.pipeline_dma || (std::getenv("STRATA_PIPELINE_DMA") != nullptr && std::getenv("STRATA_PIPELINE_DMA")[0] != '0')) {
+        strata::core::set_pipeline_dma_enabled(true);
+        std::fprintf(stderr, "strata: triple-buffered PCIe DMA pipeline enabled (--pipeline-dma)\n");
+    }
         if (o.native_dense_gguf.empty()) {
             // every shard of the model (<name>-0000N-of-0000M.gguf beside --native), then the PLE shard: a split
             // may put any layer in any shard (Swift's GGUFs: layers 13-47 in shard 2, the PLE table in shard 1)
@@ -11558,6 +11580,24 @@ int main(int argc, char** argv) {
                 }
                 std::memset(hh, 0, hb);
             }
+            if (o.pipeline_dma || strata::core::pipeline_dma_enabled() ||
+                (std::getenv("STRATA_PIPELINE_DMA") != nullptr && std::getenv("STRATA_PIPELINE_DMA")[0] != '0')) {
+                std::vector<int> all_devs;
+                all_devs.push_back(0); // primary device
+                for (const auto& s : stages) all_devs.push_back(s->dev);
+                for (size_t st = 0; st + 1 < all_devs.size(); ++st) {
+                    int src_dev = all_devs[st];
+                    int dst_dev = all_devs[st + 1];
+                    try {
+                        g_dma_pipes.push_back(std::make_unique<strata::pipeline::TripleBufferedDMAPipeline>(src_dev, dst_dev, hb));
+                        std::fprintf(stderr, "strata pipeline: initialized 3-slot lockless ring-buffer PCIe DMA pipeline between CUDA%d -> CUDA%d (%llu KiB)\n",
+                                     src_dev, dst_dev, (unsigned long long)(hb >> 10));
+                    } catch (const std::exception& e) {
+                        std::fprintf(stderr, "strata pipeline warning: failed to initialize DMA pipeline between CUDA%d -> CUDA%d: %s\n",
+                                     src_dev, dst_dev, e.what());
+                    }
+                }
+            }
             // STRATA_SPLIT_OVERLAP=1 (opt-in; measured on 2x RX 7900 XTX only): a ready word per hand-off, raised by the
             // writing stage's GPU, so the next stage's window is launched early and the host never syncs between
             // stages (Verifier::set_handoff_flags).  Not for --split-device 0 (both stages on one GPU).
@@ -16726,6 +16766,7 @@ int main(int argc, char** argv) {
             }
             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
             if (resume == 0) {
+                const strata::core::OnDevice on_main(0);
                 strata::core::session_zero(ss, g, nullptr, main_cs);
                 cudaStreamSynchronize(main_stream);
                 for (auto& st : stages) {
@@ -16750,6 +16791,7 @@ int main(int argc, char** argv) {
                     // that saved it read them in, when that request started at 0.  With the VRAM expert set fixed
                     // (--adapt-swaps 0) the answer must match the restored one token for token; anything the
                     // checkpoint missed shows up as a difference.
+                    const strata::core::OnDevice on_main_reread(0);
                     strata::core::session_zero(ss, g, nullptr, main_cs);
                     cudaStreamSynchronize(main_stream);
                     for (auto& st : stages) {

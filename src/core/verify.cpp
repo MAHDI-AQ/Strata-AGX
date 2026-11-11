@@ -1444,8 +1444,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         copy_from_mapped(bo_, hin + (size_t) T * HC * N, (int64_t) T * N, cs);
         copy_from_mapped(inj2_, hin + (size_t) T * (HC + 1) * N, (int64_t) T * HC, cs);
     } else if (const NativeEmbed* ne = native_embed()) {       // plan v0.3 P6: the GGUF-form table
-        ne->gather_dev(tok_, T, emb_, cs);
-        broadcast_streams(emb_, R_, N, (int) HC, T, cs);
+        if (ne->is_fp8()) {
+            std::string nerr;
+            ne->run_fused_hc(tok_, T, emb_, R_, R_, cs, nerr);
+        } else {
+            ne->gather_dev(tok_, T, emb_, cs);
+            broadcast_streams(emb_, R_, N, (int) HC, T, cs);
+        }
     } else {
         const WeightRef* w = wt.find("token_embd.weight");
         if (w == nullptr || w->codebook_iq4nl || (w->code_bits != 2 && w->code_bits != 4 && w->code_bits != 8)) {
@@ -2612,13 +2617,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (head_ != nullptr && head_->loaded()) {
             try {
                 float* const hl = head_logits_ + (size_t) h0 * (size_t) n_vocab_;
-                if (!q8_head) native_quantize_q8_1(head_mixed_ + (size_t) h0 * N, xq_, (int) N, HT, cs);   // (else the fused read wrote this chunk's image at xq_)
-                if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) HT, (int) n_vocab_)) {
-                    if (HT >= 2) strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, (int) HT, cs);
-                    strata::kernels::native_mmvq_il(head_->type(), head_->weights(), xq_, xil_, hl, (int) N,
-                                                    (int) n_vocab_, (int) HT, cs);
-                } else
-                native_mmvq(head_->type(), head_->weights(), xq_, hl, (int) N, (int) n_vocab_, HT, cs);
+                if (head_->is_fp8()) {
+                    std::string herr;
+                    head_->run_fp8(head_mixed_ + (size_t) h0 * N, hl, m_out_ + h0, HT, cs, herr);
+                } else {
+                    if (!q8_head) native_quantize_q8_1(head_mixed_ + (size_t) h0 * N, xq_, (int) N, HT, cs);   // (else the fused read wrote this chunk's image at xq_)
+                    if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) HT, (int) n_vocab_)) {
+                        if (HT >= 2) strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, (int) HT, cs);
+                        strata::kernels::native_mmvq_il(head_->type(), head_->weights(), xq_, xil_, hl, (int) N,
+                                                        (int) n_vocab_, (int) HT, cs);
+                    } else
+                        native_mmvq(head_->type(), head_->weights(), xq_, hl, (int) N, (int) n_vocab_, HT, cs);
+                }
             } catch (const std::exception& e) {
                 err = std::string("verify head: ") + e.what();
                 return false;
@@ -2628,7 +2638,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // Greedy, the default, is recorded here as before (no extra launch or sync per window). A request that
         // samples or penalizes is sampled again host-side after the replay (run()) with its own parameters and a
         // fresh draw counter: a captured sampler would bake them in and replay the same draws forever.
-        if (argmax_rows_wanted()) {   // sm_80 to sm_89 (sm_7x opt-in): the pick over many blocks a row (bitwise the one-block kernel's)
+        if (head_ != nullptr && head_->is_fp8()) {
+            // argmax already populated directly in m_out_ by fused online softmax!
+        } else if (argmax_rows_wanted()) {   // sm_80 to sm_89 (sm_7x opt-in): the pick over many blocks a row (bitwise the one-block kernel's)
             argmax_rows(head_logits_, T, (int) n_vocab_, arg_scratch_, m_out_, cs);
         } else {
             SamplerParams sp;

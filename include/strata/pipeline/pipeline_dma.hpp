@@ -53,6 +53,9 @@ public:
     TripleBufferedDMAPipeline(int src_gpu, int dst_gpu, size_t activation_bytes)
         : dev_src(src_gpu), dev_dst(dst_gpu), act_bytes(activation_bytes) {
         
+        int prev_dev = 0;
+        cudaGetDevice(&prev_dev);
+
         // 1. Allocate 3 pinned host staging buffers with portable mapping
         for (int i = 0; i < SLOTS; ++i) {
             STRATA_CUDA_CHECK(cudaHostAlloc(&h_staging[i], act_bytes, cudaHostAllocPortable | cudaHostAllocMapped));
@@ -77,9 +80,14 @@ public:
             STRATA_CUDA_CHECK(cudaEventCreateWithFlags(&ev_dst_h2d_done[i], cudaEventDisableTiming));
             STRATA_CUDA_CHECK(cudaEventCreateWithFlags(&ev_dst_compute_done[i], cudaEventDisableTiming));
         }
+
+        cudaSetDevice(prev_dev);
     }
 
     ~TripleBufferedDMAPipeline() {
+        int prev_dev = 0;
+        cudaGetDevice(&prev_dev);
+
         cudaSetDevice(dev_src);
         cudaDeviceSynchronize();
         cudaSetDevice(dev_dst);
@@ -111,6 +119,8 @@ public:
         cudaSetDevice(dev_dst);
         cudaStreamDestroy(stream_dst_dma_rx);
         cudaStreamDestroy(stream_dst_compute);
+
+        cudaSetDevice(prev_dev);
     }
 
     /**
@@ -118,6 +128,9 @@ public:
      * Hardware Copy Engines and SMs are coordinated via hardware event triggers.
      */
     void enqueue_stage_transfer(int microbatch_idx) {
+        int prev_dev = 0;
+        cudaGetDevice(&prev_dev);
+
         const int s = microbatch_idx % SLOTS; // Ring-buffer slot: 0, 1, or 2
 
         // -----------------------------------------------------------------
@@ -168,6 +181,8 @@ public:
 
         // Consumer SM compute stream waits for H2D DMA to finish before launching kernel
         STRATA_CUDA_CHECK(cudaStreamWaitEvent(stream_dst_compute, ev_dst_h2d_done[s], 0));
+
+        cudaSetDevice(prev_dev);
     }
 };
 

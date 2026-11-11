@@ -20,6 +20,7 @@ NativeHead::~NativeHead() {
 }
 
 void NativeHead::unload() {
+    free_native_head_fp8(fp8_);
     if (weights_) strata::kernels::native_q6_k_unpack(weights_);
     if (weights_) strata::kernels::native_q8_0_sm60_release(weights_);
     if (scratch_) cudaFree(scratch_);
@@ -117,6 +118,15 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
                                     (type_ == 14 && strata::kernels::native_q6_k_packed_enabled() ? ", repacked (STRATA_Q6_PACKED)" : "") +
                                     (type_ == 8 && std::getenv("STRATA_Q8_SM60") != nullptr ? ", repacked (STRATA_Q8_SM60)" : ""));
         }
+        const bool ask_fp8 = native_head_fp8_enabled() ||
+            (std::getenv("STRATA_NATIVE_HEAD_FP8") != nullptr && std::getenv("STRATA_NATIVE_HEAD_FP8")[0] != '0');
+        if (ask_fp8) {
+            std::string fp8_err;
+            if (!init_native_head_fp8(fp8_, gguf.tensor_data(*tensor), (int) tensor->type, (int) n_in, (int) n_out, device_, fp8_err)) {
+                std::fprintf(stderr, "strata head: FP8 acceleration initialization warning: %s (falling back to native MMVQ)\n", fp8_err.c_str());
+            }
+        }
+
         return true;
     } catch (const std::exception& error) {
         err = std::string("native head: ") + error.what();
@@ -147,6 +157,9 @@ bool NativeHead::to_host(std::string& err) {
 }
 
 bool NativeHead::run(const float* mixed, float* logits, void* stream, std::string& err) const {
+    if (fp8_.enabled) {
+        return run_native_head_fp8(fp8_, mixed, logits, nullptr, 1, stream, err);
+    }
     if (!loaded() || !mixed || !logits || !stream) {
         err = "native head requires loaded weights, device buffers and an explicit stream";
         return false;
@@ -170,6 +183,14 @@ bool NativeHead::run(const float* mixed, float* logits, void* stream, std::strin
     return true;
 }
 
+bool NativeHead::run_fp8(const float* mixed, float* logits, int32_t* out_tokens, int T, void* stream, std::string& err) const {
+    if (!fp8_.enabled) {
+        err = "NativeHead::run_fp8: FP8 head is not enabled";
+        return false;
+    }
+    return run_native_head_fp8(fp8_, mixed, logits, out_tokens, T, stream, err);
+}
+
 // ================================ plan v0.3 P6: THE NATIVE EMBEDDING ================================
 
 namespace {
@@ -179,6 +200,7 @@ void set_native_embed(const NativeEmbed* e) { g_embed = e; }
 const NativeEmbed* native_embed() { return g_embed; }
 
 NativeEmbed::~NativeEmbed() {
+    free_native_embed_fp8(fp8_);
     if (host_) cudaFreeHost(host_);
     else if (dev_) cudaFree(const_cast<void*>(dev_));   // the VRAM fallback below
 }
@@ -289,6 +311,18 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
         type_ = (int) t->type;
         n_embd_ = n_embd;
         n_vocab_ = n_vocab;
+
+        const bool ask_fp8 = native_embed_fp8_enabled() ||
+            (std::getenv("STRATA_NATIVE_EMBED_FP8") != nullptr && std::getenv("STRATA_NATIVE_EMBED_FP8")[0] != '0');
+        if (ask_fp8) {
+            std::string fp8_err;
+            int cur_dev = 0;
+            cudaGetDevice(&cur_dev);
+            if (!init_native_embed_fp8(fp8_, gguf.tensor_data(*t), (int) t->type, (int) n_embd, (int) n_vocab, nullptr, cur_dev, fp8_err)) {
+                std::fprintf(stderr, "strata embed: FP8 acceleration initialization warning: %s (falling back to native IQ)\n", fp8_err.c_str());
+            }
+        }
+
         return true;
     } catch (const std::exception& e) {
         err = std::string("native embedding: ") + e.what();
@@ -302,6 +336,14 @@ void NativeEmbed::gather_dev(const int32_t* tokens, int64_t n_tok, float* out, v
 
 void NativeEmbed::gather_one(int64_t token, float* out, void* stream) const {
     strata::kernels::iq_dequant_f32(type_, (const uint8_t*) dev_ + (size_t) token * row_, n_embd_, out, stream);
+}
+
+bool NativeEmbed::run_fused_hc(const int32_t* tokens, int32_t num_tokens, void* out_main, void* out_res, void* out_hc, void* stream, std::string& err) const {
+    if (!fp8_.enabled) {
+        err = "NativeEmbed::run_fused_hc: FP8 embedding is not enabled";
+        return false;
+    }
+    return run_native_embed_fp8(fp8_, tokens, num_tokens, out_main, out_res, out_hc, stream, err);
 }
 
 }  // namespace strata::core

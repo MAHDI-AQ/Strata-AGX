@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include "strata/core/native_fp8.hpp"
 
 namespace strata::core {
 
@@ -26,8 +27,10 @@ public:
     bool to_host(std::string& err);
     bool on_host() const { return host_ != nullptr; }
     bool run(const float* mixed, float* logits, void* stream, std::string& err) const;
+    bool is_fp8() const { return fp8_.enabled; }
+    bool run_fp8(const float* mixed, float* logits, int32_t* out_tokens, int T, void* stream, std::string& err) const;
     uint64_t weight_bytes() const { return bytes_; }
-    bool loaded() const { return weights_ != nullptr; }
+    bool loaded() const { return weights_ != nullptr || fp8_.enabled; }
     /// Plan v0.3 P6: the GGUF blocks, for the verify window's multi-column head.
     const void* weights() const { return weights_; }
     int type() const { return type_; }
@@ -44,6 +47,7 @@ private:
     int n_in_ = 0, n_out_ = 0;
     int type_ = -1;
     int device_ = -1;
+    NativeHeadFp8State fp8_;
 };
 
 /// Plan v0.3 P6: `token_embd.weight` in its GGUF form (the IQ model files), in mapped pinned host memory: a row
@@ -61,10 +65,12 @@ public:
     void gather_dev(const int32_t* tokens, int64_t n_tok, float* out, void* stream) const;
     /// One row for a host token id.
     void gather_one(int64_t token, float* out, void* stream) const;
+    bool is_fp8() const { return fp8_.enabled; }
+    bool run_fused_hc(const int32_t* tokens, int32_t num_tokens, void* out_main, void* out_res, void* out_hc, void* stream, std::string& err) const;
     uint64_t bytes() const { return bytes_; }
     int type() const { return type_; }
     /// The table was placed in VRAM (STRATA_EMBED_VRAM=1, or the pinned / alias fallbacks) rather than mapped.
-    bool in_vram() const { return dev_ != nullptr && host_ == nullptr; }
+    bool in_vram() const { return (dev_ != nullptr && host_ == nullptr) || fp8_.enabled; }
 
 private:
     void* host_ = nullptr;
@@ -73,6 +79,7 @@ private:
     size_t row_ = 0;
     int64_t n_embd_ = 0, n_vocab_ = 0;
     int type_ = -1;
+    NativeEmbedFp8State fp8_;
 };
 void set_native_embed(const NativeEmbed* e);
 const NativeEmbed* native_embed();
