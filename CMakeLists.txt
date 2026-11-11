@@ -564,19 +564,19 @@ if(STRATA_ENABLE_CUDA AND STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_
   target_link_libraries(hit_cpu_order_parity PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
 endif()
 
-# Experimental Stage 0/3 Ada Lovelace (SM 89) FP8 Tax Optimization Kernels & Parity Tests
-option(STRATA_ENABLE_FP8_EXPERIMENTAL "Build experimental FP8 tax optimization kernels and tests" OFF)
-if(STRATA_ENABLE_FP8_EXPERIMENTAL)
+# Native Ada Lovelace (SM 89) FP8 Kernels & Parity Tests
+option(STRATA_ENABLE_ADA_FP8 "Build native Ada Lovelace SM89 FP8 kernels and parity tests" OFF)
+if(STRATA_ENABLE_ADA_FP8)
   if(STRATA_ENABLE_CUDA)
-    add_executable(test_fp8_tax_kernels tests/test_fp8_tax_kernels.cu)
-    target_include_directories(test_fp8_tax_kernels PRIVATE include ${_strata_gpu_include_directories})
-    target_link_libraries(test_fp8_tax_kernels PRIVATE ${_strata_gpu_runtime_target})
-    set_target_properties(test_fp8_tax_kernels PROPERTIES
+    add_executable(ada_fp8_parity_test tests/ada_fp8_parity_test.cu)
+    target_include_directories(ada_fp8_parity_test PRIVATE include ${_strata_gpu_include_directories})
+    target_link_libraries(ada_fp8_parity_test PRIVATE ${_strata_gpu_runtime_target})
+    set_target_properties(ada_fp8_parity_test PROPERTIES
       CUDA_ARCHITECTURES "89"
       CUDA_STANDARD 17
     )
     if(STRATA_BUILD_TESTS)
-      add_test(NAME test_fp8_tax_kernels COMMAND test_fp8_tax_kernels)
+      add_test(NAME ada_fp8_parity_test COMMAND ada_fp8_parity_test)
     endif()
   endif()
 endif()

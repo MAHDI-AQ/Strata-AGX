@@ -8,9 +8,9 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
-#include "strata/kernels/fused_embedding_rmsnorm_hc.cuh"
-#include "strata/kernels/fused_lm_head_gemv_softmax.cuh"
-#include "strata/pipeline/triple_buffered_dma.hpp"
+#include "strata/kernels/native_embed_norm.cuh"
+#include "strata/kernels/native_head_gemv.cuh"
+#include "strata/pipeline/pipeline_dma.hpp"
 
 #define TEST_ASSERT(cond, msg) \
     do { \
@@ -341,7 +341,7 @@ int test_fp8_gemv_parity() {
 // ============================================================================
 int main() {
     std::cout << "========================================================" << std::endl;
-    std::cout << " Strata SM 89 FP8 Tax Optimization Kernel Verification" << std::endl;
+    std::cout << " Strata Ada SM89 FP8 Native Kernel Parity Verification" << std::endl;
     std::cout << "========================================================" << std::endl;
 
     int device_count = 0;
