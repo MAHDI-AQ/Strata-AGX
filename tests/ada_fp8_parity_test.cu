@@ -264,8 +264,10 @@ int test_fp8_gemv_parity() {
 
     int32_t* d_out_tokens = nullptr;
     float* d_out_norms = nullptr;
+    float* d_out_logits = nullptr;
     cudaMalloc(&d_out_tokens, T_batch * sizeof(int32_t));
     cudaMalloc(&d_out_norms, T_batch * sizeof(float));
+    cudaMalloc(&d_out_logits, T_batch * V * sizeof(float));
 
     int total_tokens_tested = 0;
     int argmax_matches = 0;
@@ -281,9 +283,9 @@ int test_fp8_gemv_parity() {
         }
         cudaMemcpy(d_X_act, h_X_act.data(), h_X_act.size() * sizeof(uint8_t), cudaMemcpyHostToDevice);
 
-        // Run GPU kernel
+        // Run GPU kernel with full logit materialization
         cudaError_t err = strata::kernels::launch_fused_lm_head_gemv_softmax(
-            d_W_head, d_X_act, d_scratch, d_out_tokens, d_out_norms,
+            d_W_head, d_X_act, d_scratch, d_out_tokens, d_out_norms, d_out_logits,
             T_batch, V, K, 1.0f, 1.0f, 1.0f
         );
         cudaDeviceSynchronize();
@@ -291,6 +293,8 @@ int test_fp8_gemv_parity() {
 
         std::vector<int32_t> gpu_tokens(T_batch);
         cudaMemcpy(gpu_tokens.data(), d_out_tokens, T_batch * sizeof(int32_t), cudaMemcpyDeviceToHost);
+        std::vector<float> gpu_logits(T_batch * V);
+        cudaMemcpy(gpu_logits.data(), d_out_logits, gpu_logits.size() * sizeof(float), cudaMemcpyDeviceToHost);
 
         // Compute Golden CPU reference for each token in batch
         for (int t = 0; t < T_batch; ++t) {
@@ -302,6 +306,10 @@ int test_fp8_gemv_parity() {
                 for (int k = 0; k < K; ++k) {
                     dot += h_X_float[t * K + k] * h_W_float[v * K + k];
                 }
+                float g_logit = gpu_logits[t * V + v];
+                float ldiff = std::abs(g_logit - dot);
+                float rel_diff = ldiff / std::max(1.0f, std::abs(dot));
+                TEST_ASSERT(ldiff < 0.5f || rel_diff < 0.02f, "Logit mismatch at t=" + std::to_string(t) + " v=" + std::to_string(v) + " GPU=" + std::to_string(g_logit) + " CPU=" + std::to_string(dot));
                 if (dot > cpu_max_logit) {
                     cpu_max_logit = dot;
                     cpu_argmax = v;
@@ -331,6 +339,7 @@ int test_fp8_gemv_parity() {
     cudaFree(d_scratch);
     cudaFree(d_out_tokens);
     cudaFree(d_out_norms);
+    cudaFree(d_out_logits);
 
     std::cout << ">>> Test 4 PASSED: FP8 Tensor Core GEMV parity verified across 100 tokens." << std::endl;
     return 0;

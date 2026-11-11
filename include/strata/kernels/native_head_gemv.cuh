@@ -111,6 +111,7 @@ __global__ void __launch_bounds__(128, 4) fused_lm_head_gemv_online_softmax_kern
     const uint8_t* __restrict__ W_head,
     const uint8_t* __restrict__ X_act,
     SoftmaxArgmaxTuple* __restrict__ L2_scratchpad,
+    float* __restrict__ out_logits,
     const int32_t T,
     const int32_t V,
     const int32_t K,
@@ -233,11 +234,12 @@ __global__ void __launch_bounds__(128, 4) fused_lm_head_gemv_online_softmax_kern
         smem_buf = next_buf;
     }
 
-    // Step 2: In-Register Online Softmax
-    const float eff_scale = (scale_w * scale_x) / (temperature > 0.0f ? temperature : 1.0f);
+    // Step 2: In-Register Online Softmax & Logit Materialization
+    const float raw_scale = scale_w * scale_x;
+    const float temp_scale = (temperature > 0.0f) ? (1.0f / temperature) : 1.0f;
 
     #pragma unroll
-    for (int t = 0; t < 8; ++t) {
+    for (int t = 0; t < 16; ++t) {
         if (t >= T) break;
 
         SoftmaxArgmaxTuple local_tuple;
@@ -249,6 +251,7 @@ __global__ void __launch_bounds__(128, 4) fused_lm_head_gemv_online_softmax_kern
         if (group == (t % 8)) {
             int d_idx0 = (t < 8) ? 0 : 2;
             int d_idx1 = (t < 8) ? 1 : 3;
+            size_t row_offset = static_cast<size_t>(t) * V;
 
             #pragma unroll
             for (int n_sub = 0; n_sub < 4; ++n_sub) {
@@ -256,7 +259,11 @@ __global__ void __launch_bounds__(128, 4) fused_lm_head_gemv_online_softmax_kern
                 int col1 = col0 + 1;
 
                 if (col0 < V) {
-                    float logit0 = accum[n_sub][d_idx0] * eff_scale;
+                    float raw_logit0 = accum[n_sub][d_idx0] * raw_scale;
+                    if (out_logits != nullptr) {
+                        out_logits[row_offset + col0] = raw_logit0;
+                    }
+                    float logit0 = raw_logit0 * temp_scale;
                     if (logit0 > local_tuple.max_val) {
                         local_tuple.sum_exp = local_tuple.sum_exp * __expf(local_tuple.max_val - logit0) + 1.0f;
                         local_tuple.max_val = logit0;
@@ -270,7 +277,11 @@ __global__ void __launch_bounds__(128, 4) fused_lm_head_gemv_online_softmax_kern
                 }
 
                 if (col1 < V) {
-                    float logit1 = accum[n_sub][d_idx1] * eff_scale;
+                    float raw_logit1 = accum[n_sub][d_idx1] * raw_scale;
+                    if (out_logits != nullptr) {
+                        out_logits[row_offset + col1] = raw_logit1;
+                    }
+                    float logit1 = raw_logit1 * temp_scale;
                     if (logit1 > local_tuple.max_val) {
                         local_tuple.sum_exp = local_tuple.sum_exp * __expf(local_tuple.max_val - logit1) + 1.0f;
                         local_tuple.max_val = logit1;
@@ -360,6 +371,7 @@ inline cudaError_t launch_fused_lm_head_gemv_softmax(
     SoftmaxArgmaxTuple* L2_scratchpad,
     int32_t* d_out_tokens,
     float* d_out_normalizers,
+    float* out_logits,
     int32_t T,
     int32_t V,
     int32_t K,
@@ -372,7 +384,7 @@ inline cudaError_t launch_fused_lm_head_gemv_softmax(
     const int num_blocks = (V + 127) / 128;
 
     fused_lm_head_gemv_online_softmax_kernel<<<num_blocks, 128, 0, stream>>>(
-        W_head, X_act, L2_scratchpad, T, V, K, temperature, scale_w, scale_x
+        W_head, X_act, L2_scratchpad, out_logits, T, V, K, temperature, scale_w, scale_x
     );
 
     cudaError_t err = cudaGetLastError();
@@ -383,6 +395,26 @@ inline cudaError_t launch_fused_lm_head_gemv_softmax(
     );
 
     return cudaGetLastError();
+}
+
+inline cudaError_t launch_fused_lm_head_gemv_softmax(
+    const uint8_t* W_head,
+    const uint8_t* X_act,
+    SoftmaxArgmaxTuple* L2_scratchpad,
+    int32_t* d_out_tokens,
+    float* d_out_normalizers,
+    int32_t T,
+    int32_t V,
+    int32_t K,
+    float temperature,
+    float scale_w,
+    float scale_x,
+    cudaStream_t stream = nullptr
+) {
+    return launch_fused_lm_head_gemv_softmax(
+        W_head, X_act, L2_scratchpad, d_out_tokens, d_out_normalizers, nullptr,
+        T, V, K, temperature, scale_w, scale_x, stream
+    );
 }
 
 } // namespace kernels

@@ -122,15 +122,6 @@ __global__ void quantize_f32_to_fp8_act_kernel(const float* __restrict__ in, uin
     }
 }
 
-__global__ void populate_argmax_logits_kernel(float* logits, const int32_t* out_tokens, int T, int V) {
-    int t = blockIdx.x;
-    if (t < T) {
-        int tok = out_tokens[t];
-        if (tok >= 0 && tok < V) {
-            logits[static_cast<size_t>(t) * V + tok] = 100.0f;
-        }
-    }
-}
 
 } // namespace
 
@@ -240,8 +231,9 @@ bool run_native_head_fp8(const NativeHeadFp8State& state, const float* mixed, fl
         static_cast<strata::kernels::SoftmaxArgmaxTuple*>(state.d_scratchpad),
         state.d_out_tokens,
         state.d_out_norms,
+        logits,
         T, state.V, state.K,
-        1.0f, 1.0f, 1.0f,
+        0.0f, 1.0f, 1.0f,
         cs
     );
 
@@ -252,11 +244,6 @@ bool run_native_head_fp8(const NativeHeadFp8State& state, const float* mixed, fl
 
     if (out_tokens != nullptr) {
         cudaMemcpyAsync(out_tokens, state.d_out_tokens, T * sizeof(int32_t), cudaMemcpyDeviceToDevice, cs);
-    }
-
-    if (logits != nullptr) {
-        cudaMemsetAsync(logits, 0, static_cast<size_t>(T) * state.V * sizeof(float), cs);
-        populate_argmax_logits_kernel<<<T, 1, 0, cs>>>(logits, state.d_out_tokens, T, state.V);
     }
 
     return true;
