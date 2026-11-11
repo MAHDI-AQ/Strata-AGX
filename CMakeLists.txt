@@ -564,6 +564,23 @@ if(STRATA_ENABLE_CUDA AND STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_
   target_link_libraries(hit_cpu_order_parity PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
 endif()
 
+# Experimental Stage 0/3 Ada Lovelace (SM 89) FP8 Tax Optimization Kernels & Parity Tests
+option(STRATA_ENABLE_FP8_EXPERIMENTAL "Build experimental FP8 tax optimization kernels and tests" OFF)
+if(STRATA_ENABLE_FP8_EXPERIMENTAL)
+  if(STRATA_ENABLE_CUDA)
+    add_executable(test_fp8_tax_kernels tests/test_fp8_tax_kernels.cu)
+    target_include_directories(test_fp8_tax_kernels PRIVATE include ${_strata_gpu_include_directories})
+    target_link_libraries(test_fp8_tax_kernels PRIVATE ${_strata_gpu_runtime_target})
+    set_target_properties(test_fp8_tax_kernels PROPERTIES
+      CUDA_ARCHITECTURES "89"
+      CUDA_STANDARD 17
+    )
+    if(STRATA_BUILD_TESTS)
+      add_test(NAME test_fp8_tax_kernels COMMAND test_fp8_tax_kernels)
+    endif()
+  endif()
+endif()
+
 strata_cpu_tests()
 
 # CUDA release kernels must not spill or keep a per-thread array in local memory: every access there is a round trip
