@@ -285,14 +285,11 @@ bool init_native_embed_fp8(NativeEmbedFp8State& state, const void* src_weights, 
 
     cudaError_t st = cudaMalloc(&state.d_embed_table, total_fp8_bytes);
     if (st == cudaSuccess) st = cudaMemcpy(state.d_embed_table, h_fp8.data(), total_fp8_bytes, cudaMemcpyHostToDevice);
-    if (st == cudaSuccess) st = cudaMalloc(&state.d_gamma, K * sizeof(half));
-
-    if (st == cudaSuccess) {
-        if (gamma_weights != nullptr) {
+    state.d_gamma = nullptr;
+    if (st == cudaSuccess && gamma_weights != nullptr) {
+        st = cudaMalloc(&state.d_gamma, K * sizeof(half));
+        if (st == cudaSuccess) {
             st = cudaMemcpy(state.d_gamma, gamma_weights, K * sizeof(half), cudaMemcpyHostToDevice);
-        } else {
-            std::vector<half> ones(K, __float2half(1.0f));
-            st = cudaMemcpy(state.d_gamma, ones.data(), K * sizeof(half), cudaMemcpyHostToDevice);
         }
     }
 
@@ -329,7 +326,7 @@ void free_native_embed_fp8(NativeEmbedFp8State& state) {
 }
 
 bool run_native_embed_fp8(const NativeEmbedFp8State& state, const int32_t* tokens, int32_t num_tokens, void* out_main, void* out_res, void* out_hc, void* stream, std::string& err) {
-    if (!state.enabled || !state.d_embed_table || !state.d_gamma || !tokens) {
+    if (!state.enabled || !state.d_embed_table || !tokens) {
         err = "run_native_embed_fp8: not initialized or null tokens";
         return false;
     }
@@ -339,9 +336,9 @@ bool run_native_embed_fp8(const NativeEmbedFp8State& state, const int32_t* token
         static_cast<const uint4*>(state.d_embed_table),
         tokens,
         static_cast<const half*>(state.d_gamma),
-        static_cast<half*>(out_main),
-        static_cast<half*>(out_res),
-        static_cast<half*>(out_hc),
+        static_cast<float*>(out_main),
+        static_cast<float*>(out_res),
+        static_cast<float*>(out_hc),
         1e-6f,
         state.V,
         state.K,

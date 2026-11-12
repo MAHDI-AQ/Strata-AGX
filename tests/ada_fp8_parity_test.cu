@@ -345,6 +345,92 @@ int test_fp8_gemv_parity() {
     return 0;
 }
 
+
+// ============================================================================
+// Test 5: FP8 Gather + HC Broadcast to FP32 Outputs (gamma == nullptr) Parity
+// ============================================================================
+int test_fused_embed_fp32_parity() {
+    std::cout << ">>> Running Test 5: FP8 Gather + HC Broadcast to FP32 (gamma == nullptr)..." << std::endl;
+    const int32_t V = 1024;
+    const int32_t D = 3584;
+    const int32_t num_vectors_per_tok = D / 16; // 224
+
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-10.0f, 10.0f);
+
+    std::vector<uint4> h_table(V * num_vectors_per_tok);
+    std::vector<float> h_table_floats(V * D);
+
+    for (int v = 0; v < V; ++v) {
+        for (int i = 0; i < num_vectors_per_tok; ++i) {
+            uint8_t raw_bytes[16];
+            for (int k = 0; k < 16; ++k) {
+                float val = dist(rng);
+                raw_bytes[k] = float_to_fp8_e4m3(val);
+                h_table_floats[v * D + i * 16 + k] = fp8_e4m3_to_float(raw_bytes[k]);
+            }
+            uint4 u4;
+            std::memcpy(&u4, raw_bytes, 16);
+            h_table[v * num_vectors_per_tok + i] = u4;
+        }
+    }
+
+    uint4* d_table = nullptr;
+    cudaMalloc(&d_table, h_table.size() * sizeof(uint4));
+    cudaMemcpy(d_table, h_table.data(), h_table.size() * sizeof(uint4), cudaMemcpyHostToDevice);
+
+    std::vector<int32_t> h_tokens = {0, 1, 42, 100, 512, 1023, -5, 2000};
+    int32_t T = h_tokens.size();
+
+    int32_t* d_tokens = nullptr;
+    cudaMalloc(&d_tokens, T * sizeof(int32_t));
+    cudaMemcpy(d_tokens, h_tokens.data(), T * sizeof(int32_t), cudaMemcpyHostToDevice);
+
+    float* d_out_main = nullptr;
+    float* d_out_res = nullptr;
+    float* d_out_hc = nullptr;
+    cudaMalloc(&d_out_main, T * D * sizeof(float));
+    cudaMalloc(&d_out_res, T * D * sizeof(float));
+    cudaMalloc(&d_out_hc, T * 4 * D * sizeof(float));
+
+    cudaError_t err = strata::kernels::launch_fused_embedding_rmsnorm_hc(
+        d_table, d_tokens, nullptr, d_out_main, d_out_res, d_out_hc,
+        1e-6f, V, D, T
+    );
+    cudaDeviceSynchronize();
+    TEST_ASSERT(err == cudaSuccess, "Kernel launch failed: " + std::string(cudaGetErrorString(err)));
+
+    std::vector<float> h_out_main(T * D);
+    std::vector<float> h_out_hc(T * 4 * D);
+    cudaMemcpy(h_out_main.data(), d_out_main, h_out_main.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_out_hc.data(), d_out_hc, h_out_hc.size() * sizeof(float), cudaMemcpyDeviceToHost);
+
+    for (int t = 0; t < T; ++t) {
+        int32_t raw_tok = h_tokens[t];
+        int32_t expected_tok = std::min(std::max(0, raw_tok), V - 1);
+
+        for (int d = 0; d < D; ++d) {
+            float exp_val = h_table_floats[expected_tok * D + d];
+            float main_val = h_out_main[t * D + d];
+            TEST_ASSERT(std::abs(main_val - exp_val) < 1e-5f, "Mismatch in out_main at t=" + std::to_string(t) + " d=" + std::to_string(d));
+
+            for (int s = 0; s < 4; ++s) {
+                float hc_val = h_out_hc[(t * 4 + s) * D + d];
+                TEST_ASSERT(std::abs(hc_val - exp_val) < 1e-5f, "Mismatch in out_hc at t=" + std::to_string(t) + " s=" + std::to_string(s) + " d=" + std::to_string(d));
+            }
+        }
+    }
+
+    cudaFree(d_table);
+    cudaFree(d_tokens);
+    cudaFree(d_out_main);
+    cudaFree(d_out_res);
+    cudaFree(d_out_hc);
+
+    std::cout << ">>> Test 5 PASSED: FP8 gather + FP32 broadcast parity verified across " << T * D * 5 << " elements." << std::endl;
+    return 0;
+}
+
 // ============================================================================
 // Main Execution Gate
 // ============================================================================
@@ -369,6 +455,7 @@ int main() {
     if (test_all_zero_rmsnorm() != 0) return 1;
     if (test_identical_logits_tie_breaking() != 0) return 1;
     if (test_fp8_gemv_parity() != 0) return 1;
+    if (test_fused_embed_fp32_parity() != 0) return 1;
 
     std::cout << "========================================================" << std::endl;
     std::cout << " ALL VERIFICATION GATES PASSED! Total Assertions: " << num_assertions << std::endl;

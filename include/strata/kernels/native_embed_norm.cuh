@@ -5,6 +5,7 @@
 #include <cuda_fp8.h>
 #include <stdint.h>
 #include <algorithm>
+#include <type_traits>
 
 namespace strata {
 namespace kernels {
@@ -47,27 +48,20 @@ __device__ __forceinline__ void unpack_16_fp8_to_float(
 }
 
 /**
- * Fused Embedding Gather + Root RMSNorm + Hyper-Connection Stream Broadcast
+ * Fused Embedding Gather + Optional Root RMSNorm + Hyper-Connection Stream Broadcast
  * Validated on SM 89 (RTX 4090)
  *
- * Parameters:
- *  - embed_table: [V, D/16] uint4 in FP8 E4M3 (e.g. 151,936 x 3,584 bytes = 224 uint4 per token)
- *  - tokens:      [T] int32 token IDs
- *  - gamma:       [D] FP16 RMSNorm weight vector (3,584 elements)
- *  - out_main:    [T, D] FP16 Primary Layer 0 input
- *  - out_residual:[T, D] FP16 Residual skip connection (can be nullptr)
- *  - out_hc:      [T, HC, D] FP16 Multi-stream broadcast (HC=4, can be nullptr)
- *  - eps:         RMSNorm epsilon (e.g. 1e-6f)
- *  - V:           Vocabulary size (e.g. 151,936)
- *  - D:           Hidden dimension (e.g. 3,584)
+ * Supports both FP16 (half) and FP32 (float) destination buffers.
+ * When gamma == nullptr, Root RMSNorm is bypassed for raw gather + broadcast parity.
  */
+template <typename TOut>
 __global__ void __launch_bounds__(256, 6) fused_embedding_rmsnorm_hc_broadcast_kernel(
     const uint4* __restrict__ embed_table,
     const int32_t* __restrict__ tokens,
     const half* __restrict__ gamma,
-    half* __restrict__ out_main,
-    half* __restrict__ out_residual,
-    half* __restrict__ out_hc,
+    TOut* __restrict__ out_main,
+    TOut* __restrict__ out_residual,
+    TOut* __restrict__ out_hc,
     const float eps,
     const int32_t V,
     const int32_t D
@@ -96,9 +90,11 @@ __global__ void __launch_bounds__(256, 6) fused_embedding_rmsnorm_hc_broadcast_k
     if (tid < num_vectors) {
         raw_vec = tok_embed_row[tid];
         unpack_16_fp8_to_float(raw_vec, vals);
-        #pragma unroll
-        for (int i = 0; i < 16; ++i) {
-            local_sumsq += vals[i] * vals[i];
+        if (gamma != nullptr) {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                local_sumsq += vals[i] * vals[i];
+            }
         }
     } else {
         #pragma unroll
@@ -107,78 +103,118 @@ __global__ void __launch_bounds__(256, 6) fused_embedding_rmsnorm_hc_broadcast_k
         }
     }
 
-    // Step 1: Intra-warp reduction
-    float warp_sum = warp_reduce_sum(local_sumsq);
+    float r_rms = 1.0f;
+    if (gamma != nullptr) {
+        // Step 1: Intra-warp reduction
+        float warp_sum = warp_reduce_sum(local_sumsq);
 
-    // Step 2: Bank-conflict-free shared memory staging (only 8 writes)
-    if (lane_id == 0) {
-        smem_warp_sums[warp_id] = warp_sum;
-    }
-    __syncthreads();
-
-    // Step 3: Warp 0 computes block sum and Root RMS reciprocal
-    if (warp_id == 0) {
-        float b_sum = (lane_id < 8) ? smem_warp_sums[lane_id] : 0.0f;
-        b_sum = warp_reduce_sum(b_sum);
+        // Step 2: Bank-conflict-free shared memory staging (only 8 writes)
         if (lane_id == 0) {
-            float mean_square = b_sum * (1.0f / static_cast<float>(D));
-            // Defensive mandate: clamp mean_sq to 1e-12f to prevent NaN/Inf under all-zero inputs
-            mean_square = fmaxf(mean_square, 1e-12f);
-            smem_r_rms = rsqrtf(mean_square + eps);
+            smem_warp_sums[warp_id] = warp_sum;
         }
+        __syncthreads();
+
+        // Step 3: Warp 0 computes block sum and Root RMS reciprocal
+        if (warp_id == 0) {
+            float b_sum = (lane_id < 8) ? smem_warp_sums[lane_id] : 0.0f;
+            b_sum = warp_reduce_sum(b_sum);
+            if (lane_id == 0) {
+                float mean_square = b_sum * (1.0f / static_cast<float>(D));
+                mean_square = fmaxf(mean_square, 1e-12f);
+                smem_r_rms = rsqrtf(mean_square + eps);
+            }
+        }
+        __syncthreads();
+        r_rms = smem_r_rms;
     }
-    __syncthreads();
 
-    const float r_rms = smem_r_rms;
-
-    // Step 4: Normalization + Gamma scaling + 128-bit Vectorized Broadcast
+    // Step 4: Normalization (if gamma) + 128-bit Vectorized Broadcast
     if (tid < num_vectors) {
-        // Load gamma weights (FP16) using 128-bit loads (8 halves = 16 bytes each)
-        const uint4* gamma_u4 = reinterpret_cast<const uint4*>(gamma);
-        uint4 g0_raw = gamma_u4[tid * 2];
-        uint4 g1_raw = gamma_u4[tid * 2 + 1];
+        if (gamma != nullptr) {
+            const uint4* gamma_u4 = reinterpret_cast<const uint4*>(gamma);
+            uint4 g0_raw = gamma_u4[tid * 2];
+            uint4 g1_raw = gamma_u4[tid * 2 + 1];
 
-        const half* g0 = reinterpret_cast<const half*>(&g0_raw);
-        const half* g1 = reinterpret_cast<const half*>(&g1_raw);
+            const half* g0 = reinterpret_cast<const half*>(&g0_raw);
+            const half* g1 = reinterpret_cast<const half*>(&g1_raw);
 
-        uint4 out_v0, out_v1;
-        half* h_out0 = reinterpret_cast<half*>(&out_v0);
-        half* h_out1 = reinterpret_cast<half*>(&out_v1);
-
-        #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            float norm0 = vals[i] * r_rms;
-            h_out0[i] = __float2half(norm0 * __half2float(g0[i]));
-
-            float norm1 = vals[i + 8] * r_rms;
-            h_out1[i] = __float2half(norm1 * __half2float(g1[i]));
-        }
-
-        const size_t out_vectors_per_tok = static_cast<size_t>(D / 8); // 3584 / 8 = 448
-        const size_t tok_out_offset_u4 = static_cast<size_t>(token_idx) * out_vectors_per_tok + tid * 2;
-
-        // 1. Primary Transformer Layer 0 Stream
-        if (out_main != nullptr) {
-            uint4* main_u4 = reinterpret_cast<uint4*>(out_main);
-            main_u4[tok_out_offset_u4]     = out_v0;
-            main_u4[tok_out_offset_u4 + 1] = out_v1;
-        }
-
-        // 2. Direct Residual Skip Stream
-        if (out_residual != nullptr) {
-            uint4* res_u4 = reinterpret_cast<uint4*>(out_residual);
-            res_u4[tok_out_offset_u4]     = out_v0;
-            res_u4[tok_out_offset_u4 + 1] = out_v1;
-        }
-
-        // 3. Hyper-Connection 4-Stream Broadcast
-        if (out_hc != nullptr) {
             #pragma unroll
-            for (int s = 0; s < 4; ++s) {
-                const size_t hc_offset_u4 = (static_cast<size_t>(token_idx) * 4 + s) * out_vectors_per_tok + tid * 2;
-                uint4* hc_u4 = reinterpret_cast<uint4*>(out_hc);
-                hc_u4[hc_offset_u4]     = out_v0;
-                hc_u4[hc_offset_u4 + 1] = out_v1;
+            for (int i = 0; i < 8; ++i) {
+                vals[i]     = vals[i] * r_rms * __half2float(g0[i]);
+                vals[i + 8] = vals[i + 8] * r_rms * __half2float(g1[i]);
+            }
+        }
+
+        if constexpr (std::is_same<TOut, float>::value) {
+            float4 f4_0 = make_float4(vals[0],  vals[1],  vals[2],  vals[3]);
+            float4 f4_1 = make_float4(vals[4],  vals[5],  vals[6],  vals[7]);
+            float4 f4_2 = make_float4(vals[8],  vals[9],  vals[10], vals[11]);
+            float4 f4_3 = make_float4(vals[12], vals[13], vals[14], vals[15]);
+
+            const size_t out_f4_per_tok = static_cast<size_t>(D / 4); // 3584 / 4 = 896
+            const size_t tok_f4_offset = static_cast<size_t>(token_idx) * out_f4_per_tok + tid * 4;
+
+            if (out_main != nullptr) {
+                float4* p = reinterpret_cast<float4*>(out_main);
+                p[tok_f4_offset + 0] = f4_0;
+                p[tok_f4_offset + 1] = f4_1;
+                p[tok_f4_offset + 2] = f4_2;
+                p[tok_f4_offset + 3] = f4_3;
+            }
+
+            if (out_residual != nullptr) {
+                float4* p = reinterpret_cast<float4*>(out_residual);
+                p[tok_f4_offset + 0] = f4_0;
+                p[tok_f4_offset + 1] = f4_1;
+                p[tok_f4_offset + 2] = f4_2;
+                p[tok_f4_offset + 3] = f4_3;
+            }
+
+            if (out_hc != nullptr) {
+                #pragma unroll
+                for (int s = 0; s < 4; ++s) {
+                    const size_t hc_offset_f4 = (static_cast<size_t>(token_idx) * 4 + s) * out_f4_per_tok + tid * 4;
+                    float4* p = reinterpret_cast<float4*>(out_hc);
+                    p[hc_offset_f4 + 0] = f4_0;
+                    p[hc_offset_f4 + 1] = f4_1;
+                    p[hc_offset_f4 + 2] = f4_2;
+                    p[hc_offset_f4 + 3] = f4_3;
+                }
+            }
+        } else {
+            uint4 out_v0, out_v1;
+            half* h_out0 = reinterpret_cast<half*>(&out_v0);
+            half* h_out1 = reinterpret_cast<half*>(&out_v1);
+
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                h_out0[i] = __float2half(vals[i]);
+                h_out1[i] = __float2half(vals[i + 8]);
+            }
+
+            const size_t out_vectors_per_tok = static_cast<size_t>(D / 8); // 3584 / 8 = 448
+            const size_t tok_out_offset_u4 = static_cast<size_t>(token_idx) * out_vectors_per_tok + tid * 2;
+
+            if (out_main != nullptr) {
+                uint4* main_u4 = reinterpret_cast<uint4*>(out_main);
+                main_u4[tok_out_offset_u4]     = out_v0;
+                main_u4[tok_out_offset_u4 + 1] = out_v1;
+            }
+
+            if (out_residual != nullptr) {
+                uint4* res_u4 = reinterpret_cast<uint4*>(out_residual);
+                res_u4[tok_out_offset_u4]     = out_v0;
+                res_u4[tok_out_offset_u4 + 1] = out_v1;
+            }
+
+            if (out_hc != nullptr) {
+                #pragma unroll
+                for (int s = 0; s < 4; ++s) {
+                    const size_t hc_offset_u4 = (static_cast<size_t>(token_idx) * 4 + s) * out_vectors_per_tok + tid * 2;
+                    uint4* hc_u4 = reinterpret_cast<uint4*>(out_hc);
+                    hc_u4[hc_offset_u4]     = out_v0;
+                    hc_u4[hc_offset_u4 + 1] = out_v1;
+                }
             }
         }
     }
@@ -200,7 +236,29 @@ inline cudaError_t launch_fused_embedding_rmsnorm_hc(
     if (num_tokens <= 0) return cudaSuccess;
     dim3 grid(num_tokens);
     dim3 block(256);
-    fused_embedding_rmsnorm_hc_broadcast_kernel<<<grid, block, 0, stream>>>(
+    fused_embedding_rmsnorm_hc_broadcast_kernel<half><<<grid, block, 0, stream>>>(
+        embed_table, tokens, gamma, out_main, out_residual, out_hc, eps, V, D
+    );
+    return cudaGetLastError();
+}
+
+inline cudaError_t launch_fused_embedding_rmsnorm_hc(
+    const uint4* embed_table,
+    const int32_t* tokens,
+    const half* gamma,
+    float* out_main,
+    float* out_residual,
+    float* out_hc,
+    float eps,
+    int32_t V,
+    int32_t D,
+    int32_t num_tokens,
+    cudaStream_t stream = nullptr
+) {
+    if (num_tokens <= 0) return cudaSuccess;
+    dim3 grid(num_tokens);
+    dim3 block(256);
+    fused_embedding_rmsnorm_hc_broadcast_kernel<float><<<grid, block, 0, stream>>>(
         embed_table, tokens, gamma, out_main, out_residual, out_hc, eps, V, D
     );
     return cudaGetLastError();
