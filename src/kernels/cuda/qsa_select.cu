@@ -2537,6 +2537,20 @@ static bool topk_active_turing_device() {
     }
     return turing;
 }
+
+static bool topk_active_sm89_device() {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    static thread_local int cached_device = -1;
+    static thread_local bool sm89 = false;
+    if (dev != cached_device) {
+        cudaDeviceProp prop{};
+        if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return false;
+        sm89 = prop.major == 8 && prop.minor == 9;
+        cached_device = dev;
+    }
+    return sm89;
+}
 #endif
 
 bool qsa_block_topk_cluster(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
@@ -3106,8 +3120,9 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
     // STRATA_TOPK_ACTIVE_ANY=1 (tests): the Turing dispatch on any CUDA card, so qsa_topk_active_parity checks it
     // on whatever card runs the tests (the kernels are the same on every architecture)
     static const bool any_card = [] { const char* v = std::getenv("STRATA_TOPK_ACTIVE_ANY"); return v && v[0] == '1'; }();
+    static const bool active_sm89 = [] { const char* v = std::getenv("STRATA_TOPK_ACTIVE_SM89"); return v && v[0] == '1'; }();
     const bool counted = !capacity_guard && active_blocks > 0 && active_blocks <= max_blocks &&
-                         (any_card || topk_active_turing_device());
+                         (any_card || topk_active_turing_device() || (active_sm89 && topk_active_sm89_device()));
 #endif
     const int64_t reach = counted && active_blocks < max_blocks ? active_blocks : max_blocks;
     const int64_t fit = (int64_t) TK_T * (counted ? TK_PER_MAX : TK_PER);

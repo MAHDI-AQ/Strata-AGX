@@ -304,7 +304,11 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
     }
     resolve_kernel<<<1, RT, 0, (cudaStream_t) stream>>>(m, ids, steps, (int) n_q, (int) cap, (int) s.page_size);
     check("resolve");
-    copy_kernel<<<96, 128, 0, (cudaStream_t) stream>>>(m, runs_of(slots, host, fmt, s));
+    static const bool wide = [] {
+        const char* v = std::getenv("STRATA_KV_STREAM_WIDE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    copy_kernel<<<96, wide ? 256 : 128, 0, (cudaStream_t) stream>>>(m, runs_of(slots, host, fmt, s));
     check("copy");
 }
 

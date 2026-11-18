@@ -518,6 +518,11 @@ private:
     std::vector<std::vector<int32_t>> slot_tail_;        ///< per slot: its reply tail for the penalty window (set_slot_history)
     int32_t* slot_hist_d_ = nullptr;                     ///< the penalty-history rows of the current batch window (device)
     size_t slot_hist_cap_ = 0;
+    int32_t* h_slot_hist_ = nullptr;
+    size_t h_slot_hist_cap_ = 0;
+    uint64_t* h_counters_ = nullptr;
+    uint64_t* d_counters_ = nullptr;
+    size_t counters_cap_ = 0;
     bool sample_rows(int S, std::string& err);
     int slot_row_draw(int S, int t, strata::kernels::SamplerParams& sp, const int32_t*& hist, int& hlen, std::vector<int32_t>& hrows, std::string& err);   ///< the sampled slots' rows of the last batch window
     int32_t* h_commitb_ = nullptr; int32_t* m_commitb_ = nullptr;   // per slot [1, 0, pos, -1 ..], stride 2 + max_t

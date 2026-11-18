@@ -482,7 +482,8 @@ __device__ __forceinline__ void warp_first(float& bv, int& bi) {
 template <bool kProb = false>
 __device__ void sampled_tail_warp(const int* sel_ids, const float* sel_logit, int k, const SamplerParams& p, int t,
                                   int* __restrict__ out, float* prob_out = nullptr,
-                                  const int32_t* __restrict__ sub_to_id = nullptr) {
+                                  const int32_t* __restrict__ sub_to_id = nullptr,
+                                  const uint64_t* __restrict__ counters_d = nullptr) {
     const int lane = (int) (threadIdx.x & 31);
     const float inv_t = p.temperature > 0.01f ? (1.0f / p.temperature) : 100.0f;
 
@@ -597,11 +598,12 @@ __device__ void sampled_tail_warp(const int* sel_ids, const float* sel_logit, in
         sp1 = se1 * s_inv;
     }
 
+    const uint64_t ctr = counters_d != nullptr ? counters_d[t] : p.counter + (uint64_t) t;
     if (p.gumbel) {
         const int id_t0 = (sub_to_id != nullptr && lane < n_keep) ? sub_to_id[id0] : id0;
         const int id_t1 = (sub_to_id != nullptr && lane + 32 < n_keep) ? sub_to_id[id1] : id1;
-        const float r0 = (lane < n_keep) ? (sp0 / gumbel_exp(p.seed, p.counter + (uint64_t) t, (uint32_t) id_t0)) : -1.0f;
-        const float r1 = (lane + 32 < n_keep) ? (sp1 / gumbel_exp(p.seed, p.counter + (uint64_t) t, (uint32_t) id_t1)) : -1.0f;
+        const float r0 = (lane < n_keep) ? (sp0 / gumbel_exp(p.seed, ctr, (uint32_t) id_t0)) : -1.0f;
+        const float r1 = (lane + 32 < n_keep) ? (sp1 / gumbel_exp(p.seed, ctr, (uint32_t) id_t1)) : -1.0f;
         float best_r = fmaxf(r0, r1);
         #pragma unroll
         for (int mask = 16; mask > 0; mask >>= 1) {
@@ -639,7 +641,7 @@ __device__ void sampled_tail_warp(const int* sel_ids, const float* sel_logit, in
     }
     qscan1 += qtotal0;
 
-    const float u = philox_uniform(p.seed, p.counter + (uint64_t) t);
+    const float u = philox_uniform(p.seed, ctr);
     const bool pick0 = (lane < n_keep) && (qscan0 > u);
     const bool pick1 = (lane + 32 < n_keep) && (qscan1 > u);
     const unsigned pmask0 = __ballot_sync(0xFFFFFFFFu, pick0);
@@ -670,7 +672,8 @@ __device__ void sampled_tail_warp(const int* sel_ids, const float* sel_logit, in
 /// 0 runs the tail.  `STRATA_SAMPLER_ONE_BLOCK=1`, and the fallback when the split path cannot run.
 __global__ void __launch_bounds__(1024)
 sampler_one_block_kernel(const float* __restrict__ logits, int n_vocab, const int* __restrict__ history,
-                         int history_len, const SamplerParams p, int* __restrict__ out) {
+                         int history_len, const SamplerParams p, int* __restrict__ out,
+                         const uint64_t* __restrict__ counters_d = nullptr) {
     const int t = blockIdx.x;
     const float* l = logits + (size_t) t * n_vocab;
 
@@ -738,7 +741,7 @@ sampler_one_block_kernel(const float* __restrict__ logits, int n_vocab, const in
         prev_i = sel_ids[i];
     }
     if (warp != 0) return;
-    sampled_tail_warp(sel_ids, sel_logit, k, p, t, out);
+    sampled_tail_warp(sel_ids, sel_logit, k, p, t, out, nullptr, nullptr, counters_d);
 }
 
 // ---- THE SPLIT top_k.  `sampler_kernel` and the one-block kernel keep a row on ONE SM of 170 (5090) and walk its
@@ -892,7 +895,7 @@ sampler_split_part_kernel(const float* __restrict__ logits, int n_vocab, const i
 /// 64 entries, 32 KB) are copied to shared memory, merged into the row's top_k list, and `sampled_tail_warp` picks.
 __global__ void __launch_bounds__(32, 3)
 sampler_split_merge_kernel(const int2* __restrict__ cand, int n_blocks, int n_vocab, const SamplerParams p, int k,
-                           int* __restrict__ out) {
+                           int* __restrict__ out, const uint64_t* __restrict__ counters_d = nullptr) {
     const int t = blockIdx.x;
     const int lane = (int) threadIdx.x;
     __shared__ int2 lists[kSplitMaxBlocks * kSelMax];
@@ -906,7 +909,7 @@ sampler_split_merge_kernel(const int2* __restrict__ cand, int n_blocks, int n_vo
         if (lane == 0) { sel_ids[i] = id < n_vocab ? id : 0; sel_logit[i] = v; }
     });
     __syncwarp();
-    sampled_tail_warp(sel_ids, sel_logit, k, p, t, out);
+    sampled_tail_warp(sel_ids, sel_logit, k, p, t, out, nullptr, nullptr, counters_d);
 }
 
 // ---- COUPLED DRAFT SAMPLING (include/strata/core/coupled_draft.hpp): the MTP draft layer samples its draft with the
@@ -1431,7 +1434,7 @@ bool sample_greedy_cluster(const float* logits, int n_tokens, int n_vocab, int* 
 }
 
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
-                   const SamplerParams& p_in, int* out, void* stream) {
+                   const SamplerParams& p_in, int* out, void* stream, const uint64_t* counters_d) {
     SamplerParams p = p_in;
     p.gumbel = p_in.gumbel || gumbel_env();            // the target's pick; greedy rows never read it
     if (n_tokens <= 0 || n_vocab <= 0) return;
@@ -1491,10 +1494,10 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
                                         (cudaStream_t) stream>>>(logits, n_vocab, history, history_len, p, k,
                                                                  n_blocks, scratch);
             sampler_split_merge_kernel<<<(unsigned) n_tokens, 32, 0, (cudaStream_t) stream>>>(
-                scratch, n_blocks, n_vocab, p, k, out);
+                scratch, n_blocks, n_vocab, p, k, out, counters_d);
         } else {
             sampler_one_block_kernel<<<(unsigned) n_tokens, 1024, shmem, (cudaStream_t) stream>>>(
-                logits, n_vocab, history, history_len, p, out);
+                logits, n_vocab, history, history_len, p, out, counters_d);
         }
     }
     const cudaError_t e = cudaGetLastError();

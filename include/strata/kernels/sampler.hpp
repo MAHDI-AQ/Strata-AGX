@@ -42,7 +42,7 @@ struct SamplerParams {
 // each row are counted, and ids outside [0, n_vocab) are ignored.  Pass nullptr and 0 when no penalties apply.
 // A verify window's rows need DIFFERENT histories: row t follows the window's drafts 1..t (`penalty_rows`).
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
-                   const SamplerParams& p, int* out, void* stream);
+                   const SamplerParams& p, int* out, void* stream, const uint64_t* counters_d = nullptr);
 
 // The greedy pick (no penalties) on a thread-block cluster of 8 CTAs per row (sm_90+, CUDA; S19): the same token as
 // sample_tokens' one-block argmax, which takes it unless STRATA_ARGMAX_MULTI=0.  False (nothing launched) where it

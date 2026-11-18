@@ -13631,16 +13631,42 @@ int main(int argc, char** argv) {
                 for (ConvCheckpoint& c : storage) ckpt_pool.give(std::move(c));
                 if (!saved) return false;
                 pool_topup();   // what the park took (and what moved out) is allocated again, in the background
-                for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
-                    auto& st = stages[k];
-                    const strata::core::OnDevice on(st->dev);
-                    if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
-                    const strata::core::ConversationView view_k{src.ids, src.imgs, cs.parts[k], src.cvec};
-                    strata::core::SavedConversation part;
-                    if (!strata::core::conversation_snapshot_save(part, view_k, *src.stage_sessions[k], g, draft_of(k), err,
-                            std::move(stage_reuse[k]), &reused_bytes))
-                        return false;
-                    image.stage_images.push_back(std::move(part));
+                static const bool park_stage_threads = [] {
+                    const char* v = std::getenv("STRATA_PARK_STAGE_THREADS");
+                    return v != nullptr && v[0] != '\0' && v[0] != '0';
+                }();
+                if (park_stage_threads && n_st > 1) {
+                    std::vector<strata::core::SavedConversation> parts(n_st);
+                    std::vector<std::string> stage_errs(n_st);
+                    std::vector<size_t> stage_reused(n_st, 0);
+                    std::vector<uint8_t> stage_ok(n_st, 0);
+                    static StageThreads park_threads;
+                    park_threads.run(n_st, [&](size_t k) {
+                        auto& st = stages[k];
+                        const strata::core::OnDevice on(st->dev);
+                        if (cudaDeviceSynchronize() != cudaSuccess) { stage_errs[k] = "stage sync failed"; return; }
+                        const strata::core::ConversationView view_k{src.ids, src.imgs, cs.parts[k], src.cvec};
+                        stage_ok[k] = strata::core::conversation_snapshot_save(
+                            parts[k], view_k, *src.stage_sessions[k], g, draft_of(k), stage_errs[k],
+                            std::move(stage_reuse[k]), &stage_reused[k]) ? 1 : 0;
+                    });
+                    for (size_t k = 0; k < n_st; ++k) {
+                        reused_bytes += stage_reused[k];
+                        if (!stage_ok[k]) { err = stage_errs[k]; return false; }
+                        image.stage_images.push_back(std::move(parts[k]));
+                    }
+                } else {
+                    for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
+                        auto& st = stages[k];
+                        const strata::core::OnDevice on(st->dev);
+                        if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
+                        const strata::core::ConversationView view_k{src.ids, src.imgs, cs.parts[k], src.cvec};
+                        strata::core::SavedConversation part;
+                        if (!strata::core::conversation_snapshot_save(part, view_k, *src.stage_sessions[k], g, draft_of(k), err,
+                                std::move(stage_reuse[k]), &reused_bytes))
+                            return false;
+                        image.stage_images.push_back(std::move(part));
+                    }
                 }
                 auto mem_after = strata::core::sample_host_memory();
                 // (the park pools' idle memory is the first RAM to go back here too: a park the check refuses with the pools held would pass without them)
@@ -15105,6 +15131,7 @@ int main(int argc, char** argv) {
         // EOF after QUIT used to lock a destroyed mutex (undefined behaviour; an abort on macOS).
         struct StdinShared {
             std::atomic<bool> stop_req{false};
+            std::atomic<bool> has_lines{false};
             std::mutex mu;
             std::condition_variable cv;
             std::deque<std::string> lines;
@@ -15113,6 +15140,7 @@ int main(int argc, char** argv) {
         };
         const auto in_shared = std::make_shared<StdinShared>();
         std::atomic<bool>& stop_req = in_shared->stop_req;
+        std::atomic<bool>& in_has_lines = in_shared->has_lines;
         std::mutex& in_mu = in_shared->mu;
         std::condition_variable& in_cv = in_shared->cv;
         std::deque<std::string>& in_lines = in_shared->lines;
@@ -15186,6 +15214,7 @@ int main(int argc, char** argv) {
                 std::lock_guard<std::mutex> lk(st->mu);
                 st->lines.push_back(std::move(l));
                 if (is_bin_cmd) st->bins.push_back(std::move(bin));
+                st->has_lines.store(true, std::memory_order_release);
                 st->cv.notify_one();
             }
             std::lock_guard<std::mutex> lk(st->mu);
@@ -15878,10 +15907,15 @@ int main(int argc, char** argv) {
         std::vector<CoReq> co_pending, co_set;
         auto batch_on = [&] { for (const BSlot& b : bs) if (b.active) return true; return false; };
         auto try_next_line = [&](std::string& out) -> bool {
+            if (!in_has_lines.load(std::memory_order_acquire)) return false;
             std::lock_guard<std::mutex> lk(in_mu);
-            if (in_lines.empty()) return false;
+            if (in_lines.empty()) {
+                in_has_lines.store(false, std::memory_order_release);
+                return false;
+            }
             out = std::move(in_lines.front());
             in_lines.pop_front();
+            if (in_lines.empty()) in_has_lines.store(false, std::memory_order_release);
             if (out.rfind("BGENB ", 0) == 0 || out.rfind("GENB ", 0) == 0) {
                 cur_bin = std::move(in_shared->bins.front());
                 in_shared->bins.pop_front();
@@ -18876,7 +18910,7 @@ int main(int argc, char** argv) {
                     explicit NoHeadSampling(strata::core::Verifier& x) : v(x) { v.set_head_sampling(false); }
                     ~NoHeadSampling() { v.set_head_sampling(true); }
                 } no_head_sampling(ver);
-                const int64_t win_step = read_win_max_t ? std::max<int64_t>(S, (int64_t) ver.max_t()) : S;
+                const int64_t win_step = (read_win_max_t && n_stages == 1) ? std::max<int64_t>(S, (int64_t) ver.max_t()) : S;
                 std::vector<int32_t> win((size_t) win_step), outw((size_t) win_step), nxt((size_t) win_step);
                 pp_exact = true;   // between windows the session is exactly at `a`
                 for (int64_t q = a; q < b;) {
@@ -18918,7 +18952,7 @@ int main(int argc, char** argv) {
                     }();
                     if (logpos != nullptr && !ver.window_logprobs(nxt.data(), T, q, logpos_extra, logpos, e))
                         return false;
-                    if (!ver.commit(T, e) || (use_mtp && !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e, !read_win_max_t))) return false;
+                    if (!ver.commit(T, e) || (use_mtp && !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e, !read_win_max_t || (q + T < b)))) return false;
 #if defined(STRATA_HAVE_DFLASH2)
                     if (use_df2) {
                         const float* tp = df2_win_taps((int) T, e);

@@ -16665,6 +16665,21 @@
       "retired_in": ""
     },
     {
+      "name": "STRATA_KV_STREAM_WIDE",
+      "backends": [
+        "cuda"
+      ],
+      "reads": [
+        {
+          "file": "src/kernels/cuda/kv_stream.cu",
+          "line": 308,
+          "backend": "cuda"
+        }
+      ],
+      "status": "opt-in",
+      "purpose": "Use 256 threads per CTA in kv_stream copy_kernel."
+    },
+    {
       "name": "STRATA_KV_WIDE_HOST",
       "backends": [
         "sycl"
@@ -24373,6 +24388,21 @@
       "note": "on by default on Linux (lane PARK-POOL): unset = an arena of min(2 GiB, a quarter of the conversation cache) in 64 MiB steps (none under 128 MiB), reserved once and made resident in the background; the K/V buffers of parked conversations (segments of 512 KiB and more) are taken from it, so a park no longer pays the first touch of fresh pages. Idle bytes count against --conversation-cache-mib and are given back before any parked conversation is evicted or the RAM floor is reached. NAME=0 turns it off (the diagnostic switch; no user setting), NAME=N sets N MiB (still at most a quarter of the cache). Windows and macOS: the OS layer is not written, the arena is never created there (inert).",
       "retire_after": "",
       "retired_in": ""
+    },
+    {
+      "name": "STRATA_PARK_STAGE_THREADS",
+      "backends": [
+        "cuda"
+      ],
+      "reads": [
+        {
+          "file": "src/program/generate.cpp",
+          "line": 13638,
+          "backend": "cuda"
+        }
+      ],
+      "status": "opt-in",
+      "purpose": "Parallelize multi-stage conversation_snapshot_save across ckpt_threads during park."
     },
     {
       "name": "STRATA_PARK_TRACE",
@@ -37024,6 +37054,21 @@
       "retired_in": ""
     },
     {
+      "name": "STRATA_SAMPLER_BATCH_ROWS",
+      "backends": [
+        "cuda"
+      ],
+      "reads": [
+        {
+          "file": "src/core/verify.cpp",
+          "line": 5240,
+          "backend": "cuda"
+        }
+      ],
+      "status": "opt-in",
+      "purpose": "Batch homogeneous Verifier::sample_rows into a single multi-row sampler launch with per-row counters_d."
+    },
+    {
       "name": "STRATA_SAMPLER_ONE_BLOCK",
       "backends": [
         "cuda-hip",
@@ -43245,6 +43290,21 @@
       "note": "[auto] off unless set, not documented for users",
       "retire_after": "",
       "retired_in": ""
+    },
+    {
+      "name": "STRATA_TOPK_ACTIVE_SM89",
+      "backends": [
+        "cuda"
+      ],
+      "reads": [
+        {
+          "file": "src/kernels/cuda/qsa_select.cu",
+          "line": 3120,
+          "backend": "cuda"
+        }
+      ],
+      "status": "opt-in",
+      "purpose": "Use active_blocks reach and block_topk_sample_kernel above 28,672 blocks on sm_89."
     },
     {
       "name": "STRATA_TOPK_CAPACITY_GUARD",

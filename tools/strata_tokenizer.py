@@ -122,6 +122,7 @@ class Tokenizer:
             # change every prompt without any error (llama.cpp has one rule per `tokenizer.ggml.pre` type for the same reason).
             raise UnknownPreTokenizer("This model splits text with a rule Strata doesn't have yet (%r), so it isn't loaded: "
                                       "running it with the wrong rule would change what it reads." % (pre,))
+        self._piece_lock = threading.Lock()
         self.token_types = token_types
         self.special_ids = special_ids or {}
         self.ids = {t: i for i, t in enumerate(tokens)}
@@ -280,7 +281,8 @@ class Tokenizer:
         # instead of merged again.  The ids are the ones _bpe gives: this only skips the work.
         cache = self._piece_ids
         for piece in self._split(text):
-            got = cache.get(piece)
+            with self._piece_lock:
+                got = cache.get(piece)
             if got is None:
                 mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
                 got = []
@@ -289,8 +291,9 @@ class Tokenizer:
                     if i is None:
                         raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)
                     got.append(i)
-                if len(cache) < self.PIECE_CACHE_MAX:
-                    cache[piece] = got
+                with self._piece_lock:
+                    if len(cache) < self.PIECE_CACHE_MAX:
+                        cache[piece] = got
             out.extend(got)
         return out
 
@@ -459,7 +462,8 @@ class PromptEncoder:
         if src is None:
             ids, marks = self.tok.encode_marked(text, parse_special=True, plain=plain)
             ends, counts = [m[0] for m in marks], [m[1] for m in marks]
-            self.last_reused = 0
+            with self.lock:
+                self.last_reused = 0
         else:
             c, n = src[3][cut_k], src[4][cut_k]
             rest = tuple((max(x - c, 0), y - c) for x, y in plain if y > c)
@@ -467,7 +471,8 @@ class PromptEncoder:
             ids = src[2][:n] + tail
             ends = src[3][:cut_k + 1] + [c + m[0] for m in marks]
             counts = src[4][:cut_k + 1] + [n + m[1] for m in marks]
-            self.last_reused = c
+            with self.lock:
+                self.last_reused = c
         if not store:
             return ids
         # every rendered prompt starts with the template's header, so sharing a special boundary does not make two

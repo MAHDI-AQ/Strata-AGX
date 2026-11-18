@@ -1424,6 +1424,42 @@ int main(int argc, char** argv) {
         bad += flag_bad;
     }
 
+    {
+        const int nv = 248320;
+        const int T = 8;
+        std::vector<float> l((size_t) T * nv);
+        for (int t = 0; t < T; ++t)
+            for (int v = 0; v < nv; ++v)
+                l[(size_t) t * nv + v] = std::sin(0.013f * (float) (v + 1 + t * 37)) * 2.5f;
+        const std::vector<uint64_t> ctrs = {10, 500, 17, 9999, 42, 12345, 0, 777};
+        uint64_t* d_ctrs = nullptr;
+        check(cudaMalloc((void**) &d_ctrs, (size_t) T * sizeof(uint64_t)), "ctrs alloc");
+        check(cudaMemcpy(d_ctrs, ctrs.data(), (size_t) T * sizeof(uint64_t), cudaMemcpyHostToDevice), "ctrs copy");
+        float* d_l = nullptr;
+        int* d_out = nullptr;
+        check(cudaMalloc((void**) &d_l, l.size() * sizeof(float)), "multi-ctr logits");
+        check(cudaMalloc((void**) &d_out, (size_t) T * sizeof(int)), "multi-ctr out");
+        check(cudaMemcpy(d_l, l.data(), l.size() * sizeof(float), cudaMemcpyHostToDevice), "multi-ctr copy");
+        int wrong = 0, draws = 0;
+        for (bool gumbel : {false, true}) {
+            strata::kernels::SamplerParams p;
+            p.top_k = 20; p.top_p = 0.9f; p.min_p = 0.05f; p.temperature = 0.8f; p.seed = 42; p.counter = 0; p.gumbel = gumbel;
+            strata::kernels::sample_tokens(d_l, T, nv, nullptr, 0, p, d_out, nullptr, d_ctrs);
+            std::vector<int> got((size_t) T);
+            check(cudaMemcpy(got.data(), d_out, (size_t) T * sizeof(int), cudaMemcpyDeviceToHost), "multi-ctr read");
+            for (int t = 0; t < T; ++t) {
+                strata::kernels::SamplerParams pt = p;
+                pt.counter = ctrs[(size_t) t];
+                const int want = sampled_reference({l.begin() + (size_t) t * nv, l.begin() + (size_t) (t + 1) * nv}, {}, pt, 0);
+                if (got[(size_t) t] != want) ++wrong;
+            }
+            draws += T;
+        }
+        cudaFree(d_ctrs); cudaFree(d_l); cudaFree(d_out);
+        std::printf("  %-34s %s (%d of %d draws differ)\n", "multi-row counters_d", wrong ? "*** WRONG ***" : "matches", wrong, draws);
+        bad += wrong;
+    }
+
     std::printf("\nsampler: %d failures\n", bad);
     if (bad) return 1;
     if (selftest) std::printf("sampler_parity OK\n");

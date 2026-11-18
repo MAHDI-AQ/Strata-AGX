@@ -775,6 +775,9 @@ Verifier::~Verifier() {
     if (logit_bias_device_) cudaFree(logit_bias_device_);
     for (float* b : slot_bias_dev_) if (b) cudaFree(b);
     if (slot_hist_d_) cudaFree(slot_hist_d_);
+    if (h_slot_hist_) cudaFreeHost(h_slot_hist_);
+    if (h_counters_) cudaFreeHost(h_counters_);
+    if (d_counters_) cudaFree(d_counters_);
     if (cs_ && cs_ != ext_stream_) cudaStreamDestroy(cs_);   // set_stream: the stage's stream, shared, not ours
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
@@ -5234,6 +5237,90 @@ bool Verifier::sample_rows(int S, std::string& err) {
     err = "verify batch: sample_rows is the CUDA / HIP path";
     return false;
 #else
+    static const bool batch_rows_on = [] {
+        const char* v = std::getenv("STRATA_SAMPLER_BATCH_ROWS");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    if (batch_rows_on && S > 0) {
+        constexpr int kSlotHistMax = 4096;
+        const strata::kernels::SamplerParams& sp_ref = slot_sp_[(size_t) last_rows_[0]];
+        auto same_params = [](const strata::kernels::SamplerParams& a, const strata::kernels::SamplerParams& b) {
+            return a.greedy == b.greedy && a.temperature == b.temperature && a.top_k == b.top_k &&
+                   a.top_p == b.top_p && a.min_p == b.min_p && a.min_keep == b.min_keep &&
+                   a.seed == b.seed && a.gumbel == b.gumbel &&
+                   a.penalty_last_n == b.penalty_last_n && a.penalty_repeat == b.penalty_repeat &&
+                   a.penalty_freq == b.penalty_freq && a.penalty_present == b.penalty_present &&
+                   a.logit_bias == b.logit_bias;
+        };
+        bool homo = true;
+        for (int t = 1; t < S; ++t) {
+            if (!same_params(sp_ref, slot_sp_[(size_t) last_rows_[t]])) { homo = false; break; }
+        }
+        if (homo) {
+            strata::kernels::SamplerParams sp0 = sp_ref;
+            const bool pen = sp0.penalty_last_n > 0 && (sp0.penalty_repeat != 1.0f || sp0.penalty_freq != 0.0f || sp0.penalty_present != 0.0f);
+            const bool bias = sp0.logit_bias != nullptr;
+            if ((sp0.greedy || sp0.temperature <= 0.0f) && !pen && !bias) return true;
+            const OnDevice on_dev(device_);
+            if (counters_cap_ < (size_t) S) {
+                if (h_counters_) { cudaFreeHost(h_counters_); h_counters_ = nullptr; }
+                if (d_counters_) { cudaFree(d_counters_); d_counters_ = nullptr; }
+                counters_cap_ = 0;
+                if (cudaHostAlloc((void**) &h_counters_, (size_t) S * sizeof(uint64_t), cudaHostAllocDefault) != cudaSuccess ||
+                    cudaMalloc((void**) &d_counters_, (size_t) S * sizeof(uint64_t)) != cudaSuccess) {
+                    err = "verify batch: counter buffer allocation failed";
+                    return false;
+                }
+                counters_cap_ = (size_t) S;
+            }
+            for (int t = 0; t < S; ++t) h_counters_[t] = (uint64_t) last_pos_b_[t];
+            if (cudaMemcpyAsync(d_counters_, h_counters_, (size_t) S * sizeof(uint64_t), cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
+                err = "verify batch: counter copy failed";
+                return false;
+            }
+            int hlen = 0;
+            if (pen) {
+                hlen = std::min(sp0.penalty_last_n, kSlotHistMax);
+                const size_t need = (size_t) S * (size_t) hlen;
+                if (h_slot_hist_cap_ < need) {
+                    if (h_slot_hist_) { cudaFreeHost(h_slot_hist_); h_slot_hist_ = nullptr; }
+                    h_slot_hist_cap_ = 0;
+                    if (cudaHostAlloc((void**) &h_slot_hist_, need * sizeof(int32_t), cudaHostAllocDefault) != cudaSuccess) {
+                        err = "verify batch: pinned penalty-history allocation failed";
+                        return false;
+                    }
+                    h_slot_hist_cap_ = need;
+                }
+                if (slot_hist_cap_ < need) {
+                    if (slot_hist_d_) { cudaFree(slot_hist_d_); slot_hist_d_ = nullptr; }
+                    slot_hist_cap_ = 0;
+                    if (cudaMalloc((void**) &slot_hist_d_, need * sizeof(int32_t)) != cudaSuccess) {
+                        err = "verify batch: the penalty-history allocation failed";
+                        return false;
+                    }
+                    slot_hist_cap_ = need;
+                }
+                std::vector<const int32_t*> tails(slots_.size(), nullptr);
+                std::vector<int64_t> n_tails(slots_.size(), 0);
+                for (size_t b = 0; b < slots_.size() && b < slot_tail_.size(); ++b) {
+                    tails[b] = slot_tail_[b].data();
+                    n_tails[b] = (int64_t) slot_tail_[b].size();
+                }
+                std::fill_n(h_slot_hist_, need, -1);
+                strata::kernels::slot_penalty_rows(last_rows_, last_tokens_, S, tails.data(), n_tails.data(), hlen, h_slot_hist_);
+                if (cudaMemcpyAsync(slot_hist_d_, h_slot_hist_, need * sizeof(int32_t), cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
+                    err = "verify batch: the penalty-history copy failed";
+                    return false;
+                }
+            } else {
+                sp0.penalty_last_n = 0;
+            }
+            strata::kernels::sample_tokens(head_logits_, S, (int) n_vocab_, pen ? slot_hist_d_ : nullptr, hlen,
+                                           sp0, m_out_, cs_, d_counters_);
+            if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "verify batch: the row sampling failed"; return false; }
+            return true;
+        }
+    }
     bool any = false;
     std::vector<int32_t> hrows;
     for (int t = 0; t < S; ++t) {

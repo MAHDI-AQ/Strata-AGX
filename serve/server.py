@@ -6530,10 +6530,11 @@ class Service:
             # (an encoder restart, the cache's eviction) with other bits still matches its checkpoints
             self.embeddings.keys = [Path(p).stem[:16] for p, _ in encoded]
             write_temporary(combined, [p for p, _ in encoded])
+        sid = (req.get("_session_id") or req.get("user") or req.get("session_id") or "") if isinstance(req, dict) else ""
         # 1. Universal agent auto-pinning: detect leading system prompt & tools start for all model families
         if req is not None and req.get("strata_prefix") is None and not images:
             lead = self.shared_system_start(messages)
-            if lead:
+            if lead and len(messages) <= lead + 1 and not (sid and hasattr(self, "session_leases") and self.session_leases.get_slot(sid) is not None):
                 req["strata_prefix"] = {"messages": lead}
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images))
@@ -6542,7 +6543,6 @@ class Service:
         # must not create conversation checkpoints or evict parked agent sessions (ckpt=0).
         if req is not None and req.get("strata_checkpoint") is None:
             prio = getattr(req, "_strata_prio", "") or (req.get("_prio") if isinstance(req, dict) else "")
-            sid = (req.get("_session_id") or req.get("user") or req.get("session_id") or "") if isinstance(req, dict) else ""
             has_explicit_session = bool(sid and not str(sid).startswith("hash-"))
             is_aux = (
                 (isinstance(max_new, int) and max_new == 1) or
@@ -6620,7 +6620,11 @@ class Service:
                 text = text[:cut]
             if changed:
                 text, plain = unmark_think_literals(text, self.literals)
+                if self.prompts is not None:
+                    return self.prompts.encode(text, plain=plain, store=False)
                 return self.tok.encode(text, parse_special=True, plain=plain)
+            if self.prompts is not None:
+                return self.prompts.encode(text, store=False)
             return self.tok.encode(text, parse_special=True)
 
         if "tokens" in spec:
@@ -9655,6 +9659,13 @@ class Server(ThreadingHTTPServer):
         # stalls (GitHub's macOS runner: 35 s on the first lookup of every new process) each start waited that long before it listened
         socketserver.TCPServer.server_bind(self)
         self.server_name, self.server_port = self.server_address[:2]
+
+    def finish_request(self, request, client_address):
+        try:
+            request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        super().finish_request(request, client_address)
 
     def handle_error(self, request, client_address):
         if not isinstance(sys.exc_info()[1], ConnectionError):   # a client that hangs up needs no stack trace
