@@ -1518,6 +1518,36 @@
       "retired_in": ""
     },
     {
+      "name": "STRATA_ASYNC_STAGE_WAIT",
+      "reads": [
+        {
+          "file": "src/core/verify.cpp",
+          "line": 363,
+          "backend": "cuda-hip",
+          "fn": "getenv"
+        }
+      ],
+      "parse": "flag",
+      "default_state": "off",
+      "code_default": null,
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "first_commit": "perf/sm89-wave-k17",
+      "first_date": "2026-11-18",
+      "since": null,
+      "last_commit": "perf/sm89-wave-k17",
+      "last_date": "2026-11-18",
+      "status": "opt-in",
+      "owner": "",
+      "note": "",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
       "name": "STRATA_ATTN_BATCH",
       "backends": [
         "sycl"
@@ -3789,6 +3819,36 @@
       "retired_in": ""
     },
     {
+      "name": "STRATA_CONV_JEMALLOC_PURGE",
+      "reads": [
+        {
+          "file": "include/strata/core/conversation_cache.hpp",
+          "line": 31,
+          "backend": "cpu",
+          "fn": "getenv"
+        }
+      ],
+      "parse": "flag",
+      "default_state": "off",
+      "code_default": null,
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "first_commit": "perf/sm89-wave-k17",
+      "first_date": "2026-11-18",
+      "since": null,
+      "last_commit": "perf/sm89-wave-k17",
+      "last_date": "2026-11-18",
+      "status": "opt-in",
+      "owner": "",
+      "note": "",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
       "name": "STRATA_CONV_MADV_DONTNEED",
       "backends": [
         "cuda-hip"
@@ -3814,6 +3874,36 @@
       "first_date": "2026-11-18",
       "since": null,
       "last_commit": "16e8dde9dc",
+      "last_date": "2026-11-18",
+      "status": "opt-in",
+      "owner": "",
+      "note": "",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
+      "name": "STRATA_CONV_NOHUGEPAGE",
+      "reads": [
+        {
+          "file": "include/strata/core/conversation_buffer.hpp",
+          "line": 172,
+          "backend": "cpu",
+          "fn": "getenv"
+        }
+      ],
+      "parse": "flag",
+      "default_state": "off",
+      "code_default": null,
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "first_commit": "perf/sm89-wave-k17",
+      "first_date": "2026-11-18",
+      "since": null,
+      "last_commit": "perf/sm89-wave-k17",
       "last_date": "2026-11-18",
       "status": "opt-in",
       "owner": "",
@@ -26280,6 +26370,36 @@
       "retired_in": ""
     },
     {
+      "name": "STRATA_PF_FP8_PAD_SMALL_T",
+      "reads": [
+        {
+          "file": "src/prefill/gemm.cu",
+          "line": 1810,
+          "backend": "cuda-hip",
+          "fn": "getenv"
+        }
+      ],
+      "parse": "flag",
+      "default_state": "off",
+      "code_default": null,
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "first_commit": "perf/sm89-wave-k17",
+      "first_date": "2026-11-18",
+      "since": null,
+      "last_commit": "perf/sm89-wave-k17",
+      "last_date": "2026-11-18",
+      "status": "opt-in",
+      "owner": "",
+      "note": "",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
       "name": "STRATA_PF_FP8_PAIR_TICKET",
       "backends": [
         "cuda-hip"
@@ -28451,6 +28571,36 @@
       "status": "rollback",
       "owner": "program",
       "note": "Way back for the small-card prompt path (CUDA, one card, native pack, default chunk under 8,192 tokens): unset, the native fused expert kernels run inside the path's MMQ buffer layout (the layer-major walk's groups and the streamed chunks); 0: MMQ's kernels there, as before. STRATA_PF_SMALL=0 turns the whole rule off; STRATA_PF_FUSED named by hand still wins over both.",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
+      "name": "STRATA_PF_SMALL_T_RUN",
+      "reads": [
+        {
+          "file": "src/prefill/prefill.cpp",
+          "line": 4602,
+          "backend": "cuda-hip",
+          "fn": "getenv"
+        }
+      ],
+      "parse": "flag",
+      "default_state": "off",
+      "code_default": null,
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "first_commit": "perf/sm89-wave-k17",
+      "first_date": "2026-11-18",
+      "since": null,
+      "last_commit": "perf/sm89-wave-k17",
+      "last_date": "2026-11-18",
+      "status": "opt-in",
+      "owner": "",
+      "note": "",
       "retire_after": "",
       "retired_in": ""
     },
@@ -39381,6 +39531,36 @@
       "status": "default",
       "owner": "program",
       "note": "the engine's own default (the parallel-request stack, bit-exact, QUAL-PAR): on with 2 or more batch slots on Linux CUDA (arch_defaults.cpp parallel_default_env_cuda, applied in generate.cpp) and on Windows gfx1151; NAME=0 turns it off; a value you set is kept",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
+      "name": "STRATA_SLOT_COPY_STREAM_SYNC",
+      "reads": [
+        {
+          "file": "src/program/generate.cpp",
+          "line": 16055,
+          "backend": "cuda-hip",
+          "fn": "getenv"
+        }
+      ],
+      "parse": "flag",
+      "default_state": "off",
+      "code_default": null,
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "first_commit": "perf/sm89-wave-k17",
+      "first_date": "2026-11-18",
+      "since": null,
+      "last_commit": "perf/sm89-wave-k17",
+      "last_date": "2026-11-18",
+      "status": "opt-in",
+      "owner": "",
+      "note": "",
       "retire_after": "",
       "retired_in": ""
     },

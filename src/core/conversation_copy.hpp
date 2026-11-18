@@ -137,6 +137,13 @@ inline void background_thread_placement() {
 
 /// `queued`: the copy is only queued on the private stream, and the caller synchronizes the device (or orders a
 /// later launch after it with order_after_queued) before anything reads the target or writes the source.
+inline cudaError_t sync_private_stream() {
+    cudaStream_t s = nullptr;
+    cudaError_t e = private_stream(s);
+    if (e != cudaSuccess) return e;
+    return cudaStreamSynchronize(s);
+}
+
 inline cudaError_t copy_nonblocking(void* dst, const void* src, size_t bytes, bool queued = false) {
     if (const long at = test_copy_fail_at(); at > 0) {
         static std::atomic<long> copies{0};

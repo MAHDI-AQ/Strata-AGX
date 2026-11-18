@@ -4599,8 +4599,20 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     err = "prefill: releasing KV staging pool";
                     return false;
                 }
-                strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), state.host,
-                    core::qsa_kv_format(state), (p0 + s.page_size - 1) / s.page_size, s, m.kv_copy);
+                static const bool small_t_run = [] {
+                    const char* v = std::getenv("STRATA_PF_SMALL_T_RUN");
+                    return v != nullptr && v[0] == '1' && v[1] == '\0';
+                }();
+                const bool pref_tail_only = small_t_run && T <= 256 && p0 > state.n_slots * s.page_size;
+                if (pref_tail_only) {
+                    if ((p0 % s.page_size) != 0) {
+                        strata::kernels::kv_stage_block_from_host(pools_of(m.stage, m.ident_table), state.host,
+                            core::qsa_kv_format(state), p0 / s.page_size, s, m.kv_copy);
+                    }
+                } else {
+                    strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), state.host,
+                        core::qsa_kv_format(state), (p0 + s.page_size - 1) / s.page_size, s, m.kv_copy);
+                }
                 if (cudaPeekAtLastError() != cudaSuccess ||
                     cudaEventRecord(m.kv_ready, m.kv_copy) != cudaSuccess) {
                     err = "prefill: enqueueing KV prefetch";
@@ -5229,7 +5241,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // KV streaming: this layer's cells [0, p0) come in from the host copy to the staging pool, and the
                     // chunk's cells go to the host copy, the staging pool, and the VRAM slots of resident blocks
                     const bool staged = st.kv_mode == 1;
-                    if (staged) {
+                    static const bool small_t_run = [] {
+                        const char* v = std::getenv("STRATA_PF_SMALL_T_RUN");
+                        return v != nullptr && v[0] == '1' && v[1] == '\0';
+                    }();
+                    const bool staged_selected = small_t_run && staged && T <= 256 && p0 > st.n_slots * s.page_size;
+                    if (staged && !staged_selected) {
                         pt.mark(kPfKvStage, cs);
                         if (kv_pending == qsa_index) {
                             if (cudaStreamWaitEvent(cs, m.kv_ready, 0) != cudaSuccess) {
@@ -5242,6 +5259,20 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                             (p0 + s.page_size - 1) / s.page_size, s, m.cs);
                         pt.mark(kPfQsa, cs);
                         pf_step("reading the prompt (batched, step sync): the K/V staged from RAM at layer", l);
+                    } else if (staged_selected) {
+                        pt.mark(kPfKvStage, cs);
+                        if (kv_pending == qsa_index) {
+                            if (cudaStreamWaitEvent(cs, m.kv_ready, 0) != cudaSuccess) {
+                                err = "prefill: waiting for KV prefetch";
+                                return false;
+                            }
+                            kv_pending = -1;
+                        } else if ((p0 % s.page_size) != 0) {
+                            const int64_t tail_blk = p0 / s.page_size;
+                            strata::kernels::kv_stage_block_from_host(pools_of(m.stage, m.ident_table), st.host,
+                                                                      core::qsa_kv_format(st), tail_blk, s, m.cs);
+                        }
+                        pt.mark(kPfQsa, cs);
                     }
                     // #579 #613 (HIP, opt-in A/B, STRATA_KV_HOST_DMA=1): the append writes the staging pool and the
                     // resident slots only, and one DMA copies the chunk's blocks from the staging pool to the host copy
@@ -5418,6 +5449,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                 m.sel_batch, m.max_blocks, m.cap, m.attn, m.cs);
                         }
 #endif
+                    }
+                    if (staged_selected) {
+                        pt.mark(kPfKvStage, cs);
+                        strata::kernels::kv_stage_selected_from_host(pools_of(m.stage, m.ident_table), st.host,
+                                                                     core::qsa_kv_format(st), m.sel_ids, T * m.cap,
+                                                                     p0 / s.page_size, s, m.cs);
+                        pt.mark(kPfQsa, cs);
                     }
                     // STRATA_SEL_OVERLAP (debug, D-1's question): how much do neighbouring queries' selections share?
                     // Per tile of 16 queries: the union of their selected cells against the sum of their widths.

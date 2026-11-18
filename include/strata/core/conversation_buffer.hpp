@@ -168,6 +168,13 @@ private:
         T* allocate(std::size_t n) {
             T* p = static_cast<T*>(conversation_buffer_detail::segment_alloc(n * sizeof(T)));
 #if defined(__linux__)
+            static const bool conv_nohugepage = [] {
+                const char* v = std::getenv("STRATA_CONV_NOHUGEPAGE");
+                return v != nullptr && v[0] == '1' && v[1] == '\0';
+            }();
+            if (p && n > 0 && conv_nohugepage) {
+                (void) ::madvise(p, n * sizeof(T), MADV_NOHUGEPAGE);
+            }
             static const bool conv_no_mlock = [] {
                 const char* v = std::getenv("STRATA_CONV_NO_MLOCK");
                 return v != nullptr && v[0] == '1';

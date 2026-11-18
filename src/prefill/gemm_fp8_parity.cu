@@ -106,8 +106,13 @@ int main() {
     }
 
     const char* min_t_env = std::getenv("STRATA_PF_FP8_MIN_T");
-    const int64_t active_min_t = (min_t_env && min_t_env[0] && std::atoll(min_t_env) >= 1) ? std::atoll(min_t_env) : 128;
-    const int64_t Ts[] = {16, 32, 48, 64, 82, 96, 112, 128, 512, 2048};
+    const char* pad_env = std::getenv("STRATA_PF_FP8_PAD_SMALL_T");
+    const bool pad_small_t = pad_env && pad_env[0] == '1' && pad_env[1] == '\0';
+    const int64_t active_min_t = pad_small_t ? 1
+        : ((min_t_env && min_t_env[0] && std::atoll(min_t_env) >= 1) ? std::atoll(min_t_env) : 128);
+    const std::vector<int64_t> Ts = pad_small_t
+        ? std::vector<int64_t>{1, 2, 7, 15, 16, 17, 31, 32, 48, 64, 82, 96, 112, 128, 512, 2048}
+        : std::vector<int64_t>{16, 32, 48, 64, 82, 96, 112, 128, 512, 2048};
     const int64_t Tmax = 2048;
 
     uint16_t* X = nullptr;

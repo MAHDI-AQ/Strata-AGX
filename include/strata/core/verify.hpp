@@ -328,6 +328,7 @@ public:
     /// Waits for the last commit graph when commit() did not (an event recorded after it, not the whole device);
     /// false with `err` when it failed.  Free when nothing is pending.
     bool wait_commit(std::string& err);
+    bool sync_streams(std::string& err);
 
     // ---- PIPELINED WINDOWS (--pipeline-windows, a layer split on two GPUs).  One conversation's windows with the
     // stages overlapped: stage 0 runs window K+1 while stage 1 still runs window K.  The same window as `run`, driven
@@ -626,6 +627,7 @@ private:
     uint32_t* hflag_in_d_ = nullptr;
     uint32_t* hflag_out_h_ = nullptr;    ///< ... and the outgoing one's
     uint32_t* hflag_out_d_ = nullptr;
+    cudaEvent_t copy_done_ = nullptr;
     uint32_t* hcount_d_ = nullptr;       ///< handoff_publish's block counter (device memory)
     uint32_t* herr_h_ = nullptr;         ///< the bounded hand-off wait gave up (mapped; the reading stage's)
     uint32_t* herr_d_ = nullptr;

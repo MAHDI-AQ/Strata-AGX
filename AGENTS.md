@@ -122,3 +122,10 @@ follow it whether a person or an agent writes the text. The short version:
 
 - `STRATA_PF_FP8_MIN_T=32` (default `128`; lowers the SM89 FP8 prefill GEMM token threshold with sub-128 bucket sizing `16, 32, 48, 64, 96` in `src/prefill/gemm.cu`, registered in `data/settings-register.json` as `opt-in`; default path remains bitwise identical).
 - Production `8x512k` resident KV headroom: `--kv-resident 212992` (`208k`), maintaining `>= 600 MiB` free VRAM floor across all 4 GPUs (`min_vram_free=642 MiB` under `8x262k` load).
+
+## Wave K17 Opt-In Controls
+
+- `STRATA_CONV_JEMALLOC_PURGE=1` (`include/strata/core/conversation_cache.hpp`: dynamic `mallctl("arenas.narenas")` + `arena.<n>.purge` fallback `arena.4096.purge` in `release_free_heap()`), `STRATA_CONV_NOHUGEPAGE=1` (`include/strata/core/conversation_buffer.hpp`: `MADV_NOHUGEPAGE` on `mmap` conversation segments).
+- `STRATA_MSG_PREFIX_CACHE=1` (`serve/server.py`: `O(delta)` message-boundary prompt prefix cache respecting leading system merge, `tools`/`enable_thinking`/`reasoning_effort`, empty-assistant filtering, and non-`tool` checkpoint cuts).
+- `STRATA_PF_FP8_PAD_SMALL_T=1` (`src/prefill/gemm.cu`: `T_pad >= 16` zero-padded FP8 prefill for `1 <= T < pf_fp8_min_t()` routed through `y_tmp_` + `T`-row FP32 scale/residual epilogue), `STRATA_PF_SMALL_T_RUN=1` (`src/prefill/prefill.cpp`: `run_impl` tail-block + `kv_stage_selected_from_host` for `T <= 256` above resident KV), `STRATA_SLOT_COPY_STREAM_SYNC=1` (`src/program/generate.cpp`: stream-scoped sync in `direct_slot_copy` / `copy_to_slot`), `STRATA_ASYNC_STAGE_WAIT=1` (`src/core/verify.cpp`, `src/core/mtp.cpp`: `cudaEventRecord`/`cudaStreamWaitEvent` for `copy_`, `commit_done_` on split stages, and async `draft_from_row` D2D staging).
+- All 7 controls are registered in `data/settings-register.json` as `opt-in` (default paths remain bitwise identical).

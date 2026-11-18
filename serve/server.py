@@ -134,9 +134,11 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, parser_for_template, anthropic_to_messages, anthropic_tools,  # noqa: E402
-                            forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
-                            tool_choice_of, unmark_think_literals)
+import hashlib  # noqa: E402
+from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, _has_image, _text_of, parser_for_template,  # noqa: E402
+                            anthropic_to_messages, anthropic_tools, forced_call, images_of, literal_tags,
+                            mark_think_literals, openai_to_messages, require_messages, tool_choice_of,
+                            unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
@@ -5327,6 +5329,8 @@ class Service:
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
         self.effort_end = False
+        self._msg_prefix_cache = collections.OrderedDict()
+        self._msg_prefix_lock = threading.Lock()
         self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
         self.config_path = None                         # #564: the run config the web page's Settings view edits
         self.config_lock = threading.Lock()
@@ -6342,12 +6346,128 @@ class Service:
         tail = "" if off else EFFORT_TURN.format(EFFORT_TEXT.get(effort, EFFORT_TEXT["medium"]))
         return history + tail + full[len(mine):]
 
+    def _encode_prompt_msg_cache(self, messages, tools, kwargs, store: bool) -> list[int] | None:
+        keep_empty = os.environ.get("STRATA_KEEP_EMPTY_TURNS") == "1"
+        filtered = [
+            m for i, m in enumerate(messages)
+            if i == len(messages) - 1 or keep_empty or not (
+                isinstance(m, dict) and m.get("role") == "assistant"
+                and not _text_of(m.get("content")).strip()
+                and not _has_image(m.get("content")) and not m.get("tool_calls")
+            )
+        ]
+        if not filtered:
+            return None
+        num_sys = 0
+        while num_sys < len(filtered) and isinstance(filtered[num_sys], dict) and filtered[num_sys].get("role") in ("system", "developer"):
+            num_sys += 1
+        base_kw = {k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")} if self.effort_end else kwargs
+        effort_key = None if self.effort_end else (kwargs.get("enable_thinking"), kwargs.get("reasoning_effort"))
+        extra_kw = tuple(sorted((k, repr(v)) for k, v in base_kw.items()))
+        tools_json = json.dumps(tools or [], sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        h = hashlib.blake2b(digest_size=16)
+        h.update(f"{id(self.template)}:{int(self.effort_end)}:{int(keep_empty)}:{effort_key!r}:{extra_kw!r}:".encode("utf-8"))
+        h.update(tools_json.encode("utf-8"))
+        cum_hashes = [h.digest()]
+        for m in filtered:
+            h.update(b"\x00")
+            h.update(json.dumps(m, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            cum_hashes.append(h.digest())
+
+        min_k = max(1, num_sys)
+        hit_k = -1
+        hit_val = None
+        if len(filtered) > min_k:
+            with self._msg_prefix_lock:
+                for k in range(len(filtered) - 1, min_k - 1, -1):
+                    if isinstance(filtered[k - 1], dict) and filtered[k - 1].get("role") == "tool":
+                        continue
+                    val = self._msg_prefix_cache.get(cum_hashes[k])
+                    if val is not None:
+                        self._msg_prefix_cache.move_to_end(cum_hashes[k])
+                        hit_k = k
+                        hit_val = val
+                        break
+
+        can_store_end = store and len(filtered) >= min_k and not (
+            isinstance(filtered[-1], dict) and filtered[-1].get("role") == "tool"
+        )
+
+        if hit_val is not None:
+            prefix_ids, _cut_char, cut_tok, prefix_tail_str = hit_val
+            suffix = filtered[hit_k:]
+            marked_suffix, _, suffix_changed = mark_think_literals(suffix, None, self.literals)
+            dummy = {"role": "user", "content": "x"}
+            dummy_prefix = self.template.render([dummy], tools=None, add_generation_prompt=False, **base_kw)
+            hist_both = self.template.render([dummy] + marked_suffix, tools=None, add_generation_prompt=False, **base_kw)
+            full_both = self.render_prompt([dummy] + marked_suffix, None, kwargs)
+            if hist_both.startswith(dummy_prefix) and full_both.startswith(dummy_prefix):
+                hist_suffix = hist_both[len(dummy_prefix):]
+                full_suffix = full_both[len(dummy_prefix):]
+                hist_plain: tuple[tuple[int, int], ...] = ()
+                if suffix_changed:
+                    hist_suffix, hist_plain_list = unmark_think_literals(hist_suffix, self.literals)
+                    hist_plain = tuple(hist_plain_list)
+                    full_suffix, _ = unmark_think_literals(full_suffix, self.literals)
+                if full_suffix.startswith(hist_suffix):
+                    gen_tail = full_suffix[len(hist_suffix):]
+                    tail_in = prefix_tail_str + hist_suffix
+                    off_c = len(prefix_tail_str)
+                    tail_plain = tuple((s_i + off_c, e_i + off_c) for s_i, e_i in hist_plain)
+                    delta_ids, delta_marks = self.tok.encode_marked(tail_in, parse_special=True, plain=tail_plain)
+                    if delta_marks:
+                        d_c, d_n = delta_marks[-1]
+                        new_hist_ids = prefix_ids[:cut_tok] + delta_ids
+                        new_cut_tok = cut_tok + d_n
+                        new_tail = tail_in[d_c:]
+                        if can_store_end:
+                            with self._msg_prefix_lock:
+                                self._msg_prefix_cache[cum_hashes[len(filtered)]] = (new_hist_ids, d_c, new_cut_tok, new_tail)
+                                self._msg_prefix_cache.move_to_end(cum_hashes[len(filtered)])
+                                while len(self._msg_prefix_cache) > 64:
+                                    self._msg_prefix_cache.popitem(last=False)
+                        gen_ids, _ = self.tok.encode_marked(new_tail + gen_tail, parse_special=True)
+                        return new_hist_ids[:new_cut_tok] + gen_ids
+
+        if not can_store_end:
+            return None
+
+        marked, marked_tools, changed = mark_think_literals(filtered, tools, self.literals)
+        hist_str = self.template.render(marked, tools=marked_tools, add_generation_prompt=False, **base_kw)
+        full_str = self.render_prompt(marked, marked_tools, kwargs)
+        hist_plain = ()
+        if changed:
+            hist_str, hist_plain_list = unmark_think_literals(hist_str, self.literals)
+            hist_plain = tuple(hist_plain_list)
+            full_str, _ = unmark_think_literals(full_str, self.literals)
+        if not full_str.startswith(hist_str):
+            return None
+        hist_ids, hist_marks = self.tok.encode_marked(hist_str, parse_special=True, plain=hist_plain)
+        if not hist_marks:
+            return None
+        c_c, c_n = hist_marks[-1]
+        tail_str = hist_str[c_c:]
+        with self._msg_prefix_lock:
+            self._msg_prefix_cache[cum_hashes[len(filtered)]] = (hist_ids, c_c, c_n, tail_str)
+            self._msg_prefix_cache.move_to_end(cum_hashes[len(filtered)])
+            while len(self._msg_prefix_cache) > 64:
+                self._msg_prefix_cache.popitem(last=False)
+        gen_tail = full_str[len(hist_str):]
+        gen_ids, _ = self.tok.encode_marked(tail_str + gen_tail, parse_special=True)
+        return hist_ids[:c_n] + gen_ids
+
     def encode_prompt(self, messages, tools, kwargs, store: bool = True) -> list[int]:
         """The request's prompt: the template rendered and tokenized.  #537: a <think> / </think> written inside a
         message's text is encoded as the text it is, not as the model's reasoning markers (the template's own are).
         A control token's text (<|im_start|>, <|im_end|>, <|endoftext|>, ...) inside a message is text as well: only
         the control tokens the template writes are control tokens.  `store=False` (a token count) reuses the kept
         prompts without adding or replacing one."""
+        if (os.environ.get("STRATA_MSG_PREFIX_CACHE") == "1" and self.prompts is not None
+                and messages and kwargs.get("preserve_thinking") is not False
+                and not kwargs.get("add_vision_id")):
+            cached_ids = self._encode_prompt_msg_cache(messages, tools, kwargs, store)
+            if cached_ids is not None:
+                return cached_ids
         marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
         plain = ()

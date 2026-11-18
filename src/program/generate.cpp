@@ -16051,6 +16051,10 @@ int main(int argc, char** argv) {
             const char* v = std::getenv("STRATA_SLOT_COPY_DIRECT");
             return v != nullptr && v[0] != '\0' && v[0] != '0';
         }();
+        static const bool slot_copy_stream_sync = [] {
+            const char* v = std::getenv("STRATA_SLOT_COPY_STREAM_SYNC");
+            return v != nullptr && v[0] == '1' && v[1] == '\0';
+        }();
         auto direct_slot_copy = [&](bool into_slot, int b, const std::vector<int32_t>& ids, std::string& e, int64_t from_token = 0) -> bool {
             const int64_t upto = (int64_t) ids.size();
             const size_t n_dev = bslot_ss.size();
@@ -16059,7 +16063,13 @@ int main(int argc, char** argv) {
             std::vector<uint8_t> oks(n_dev, 0);
             auto do_k = [&](size_t k) {
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
-                if (cudaDeviceSynchronize() != cudaSuccess) {
+                if (slot_copy_stream_sync) {
+                    if (!stage_ver((int) k).sync_streams(errs[k]) ||
+                        !strata::core::conversation_sync_copy_stream(errs[k])) {
+                        if (errs[k].empty()) errs[k] = "batch slot copy: stream sync failed";
+                        return;
+                    }
+                } else if (cudaDeviceSynchronize() != cudaSuccess) {
                     errs[k] = "batch slot copy: device sync failed";
                     return;
                 }
@@ -16078,7 +16088,14 @@ int main(int argc, char** argv) {
                         return;
                     }
                 }
-                if (cudaDeviceSynchronize() != cudaSuccess) {
+                if (slot_copy_stream_sync) {
+                    const bool has_streamed_qsa = to.qsa_alloc > 0 && to.qsa_states[to.qsa_ord0].kv_mode != 0;
+                    if (!strata::core::conversation_sync_copy_stream(errs[k]) ||
+                        (queued && has_streamed_qsa && cudaStreamSynchronize(nullptr) != cudaSuccess)) {
+                        if (errs[k].empty()) errs[k] = "batch slot copy: stream sync failed";
+                        return;
+                    }
+                } else if (cudaDeviceSynchronize() != cudaSuccess) {
                     errs[k] = "batch slot copy: device sync failed";
                     return;
                 }
@@ -16132,11 +16149,19 @@ int main(int argc, char** argv) {
                     (dev_b == mtp.device() ||
                      (mtp.kv_state().kv_mode != 0 && slot_mtp[(size_t) b]->kv_state().kv_mode != 0));
                 if (can_direct_mtp) {
+                    const bool mtp_q = slot_copy_batchsync_env();
+                    const bool mtp_streamed = slot_mtp[(size_t) b]->kv_state().kv_mode != 0;
                     if (!mtp.idle(e) || !slot_mtp[(size_t) b]->idle(e) ||
                         !strata::core::conversation_kv_copy(mtp.kv_state(), slot_mtp[(size_t) b]->kv_state(),
-                                                            draft_geometry, upto, false, e, slot_copy_batchsync_env(), from_token) ||
-                        cudaDeviceSynchronize() != cudaSuccess)
+                                                            draft_geometry, upto, false, e, mtp_q, from_token))
                         return false;
+                    if (slot_copy_stream_sync) {
+                        if (!strata::core::conversation_sync_copy_stream(e) ||
+                            (mtp_q && mtp_streamed && cudaStreamSynchronize(nullptr) != cudaSuccess))
+                            return false;
+                    } else if (cudaDeviceSynchronize() != cudaSuccess) {
+                        return false;
+                    }
                 } else {
                     strata::core::ConversationKv image;
                     if (!mtp.idle(e) || !slot_mtp[(size_t) b]->idle(e) ||

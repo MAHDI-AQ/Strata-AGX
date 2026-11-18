@@ -1699,6 +1699,86 @@ __global__ void __launch_bounds__(256) y32_per_token_accum_epilogue_kernel(
     }
 }
 
+__global__ void __launch_bounds__(256) y32_per_token_scale_copy_epilogue_kernel(
+    float* __restrict__ Y, const float* __restrict__ y_tmp,
+    const float* __restrict__ d_inv_scale_tok,
+    int64_t T, int64_t N, int64_t ldy) {
+
+    const int64_t t = (int64_t) blockIdx.x;
+    if (t >= T) return;
+
+    const float s = d_inv_scale_tok[t];
+    float* row_y = Y + t * ldy;
+    const float* row_tmp = y_tmp + t * N;
+    const bool can_vec = ((reinterpret_cast<uintptr_t>(row_y) & 15u) == 0) &&
+                         ((reinterpret_cast<uintptr_t>(row_tmp) & 15u) == 0) &&
+                         ((N & 3) == 0);
+
+    if (can_vec) {
+        const int64_t N_vec = N / 4;
+        float4* y_v = reinterpret_cast<float4*>(row_y);
+        const float4* tmp_v = reinterpret_cast<const float4*>(row_tmp);
+        for (int64_t i = threadIdx.x; i < N_vec; i += blockDim.x) {
+            const float4 tv = tmp_v[i];
+            float4 yv;
+            yv.x = tv.x * s;
+            yv.y = tv.y * s;
+            yv.z = tv.z * s;
+            yv.w = tv.w * s;
+            y_v[i] = yv;
+        }
+    } else {
+        for (int64_t n = threadIdx.x; n < N; n += blockDim.x) {
+            row_y[n] = row_tmp[n] * s;
+        }
+    }
+}
+
+__global__ void __launch_bounds__(256) y32_copy_or_accum_epilogue_kernel(
+    float* __restrict__ Y, const float* __restrict__ y_tmp,
+    int64_t T, int64_t N, int64_t ldy, float beta) {
+
+    const int64_t t = (int64_t) blockIdx.x;
+    if (t >= T) return;
+
+    float* row_y = Y + t * ldy;
+    const float* row_tmp = y_tmp + t * N;
+    const bool can_vec = ((reinterpret_cast<uintptr_t>(row_y) & 15u) == 0) &&
+                         ((reinterpret_cast<uintptr_t>(row_tmp) & 15u) == 0) &&
+                         ((N & 3) == 0);
+
+    if (can_vec) {
+        const int64_t N_vec = N / 4;
+        float4* y_v = reinterpret_cast<float4*>(row_y);
+        const float4* tmp_v = reinterpret_cast<const float4*>(row_tmp);
+        if (beta == 0.0f) {
+            for (int64_t i = threadIdx.x; i < N_vec; i += blockDim.x) {
+                y_v[i] = tmp_v[i];
+            }
+        } else {
+            for (int64_t i = threadIdx.x; i < N_vec; i += blockDim.x) {
+                float4 yv = y_v[i];
+                const float4 tv = tmp_v[i];
+                yv.x = beta * yv.x + tv.x;
+                yv.y = beta * yv.y + tv.y;
+                yv.z = beta * yv.z + tv.z;
+                yv.w = beta * yv.w + tv.w;
+                y_v[i] = yv;
+            }
+        }
+    } else {
+        if (beta == 0.0f) {
+            for (int64_t n = threadIdx.x; n < N; n += blockDim.x) {
+                row_y[n] = row_tmp[n];
+            }
+        } else {
+            for (int64_t n = threadIdx.x; n < N; n += blockDim.x) {
+                row_y[n] = beta * row_y[n] + row_tmp[n];
+            }
+        }
+    }
+}
+
 inline int64_t get_t_bucket(int64_t T) {
     static constexpr int64_t kBuckets[] = {16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096};
     for (int64_t b : kBuckets) {
@@ -1749,8 +1829,10 @@ bool Gemm::fp8(const uint16_t* X, const uint8_t* W8, const float* d_inv_scale_w,
     if (ldx <= 0) ldx = K;
 
     if (!lt_handle_ || !lt_pref_) return false;
+    const bool pad_small_t = (T < pf_fp8_min_t()) && env_is_1("STRATA_PF_FP8_PAD_SMALL_T");
+    const int64_t T_pad = pad_small_t ? (T < 16 ? 16 : ((T + 15) / 16) * 16) : T;
     // 1. Ensure transient activation buffer x8_ is allocated
-    int64_t want_bytes = T * K;
+    int64_t want_bytes = T_pad * K;
     if (x8_bytes_ < want_bytes) {
         if (x8_) cudaFree(x8_);
         x8_ = nullptr;
@@ -1801,7 +1883,7 @@ bool Gemm::fp8(const uint16_t* X, const uint8_t* W8, const float* d_inv_scale_w,
     const bool bufs_ok = x8_ != nullptr && x8_bytes_ >= want_bytes &&
                          (per_token ? (d_inv_scale_tok_ != nullptr && inv_scale_tok_cap_ >= (size_t) T)
                                     : (d_inv_scale_x_ != nullptr));
-    const bool gdn_reuse = reuse_x8 && x8_key_valid_ && x8_key_x_ == X && x8_key_amax_ == act_amax &&
+    const bool gdn_reuse = !pad_small_t && reuse_x8 && x8_key_valid_ && x8_key_x_ == X && x8_key_amax_ == act_amax &&
                            x8_key_t_ == T && x8_key_k_ == K && x8_key_ldx_ == ldx &&
                            x8_key_per_token_ == per_token && bufs_ok;
     const bool ticket_reuse = !gdn_reuse && pf_fp8_pair_ticket_on() && act_ticket != nullptr &&
@@ -1837,7 +1919,10 @@ bool Gemm::fp8(const uint16_t* X, const uint8_t* W8, const float* d_inv_scale_w,
     if (!ticket_reuse && act_ticket != nullptr && pf_fp8_pair_ticket_on()) {
         *act_ticket = {X, T, K, ldx, act_amax, per_token, x8_gen_, true};
     }
-    if (gdn_qkvz_on()) {
+    if (pad_small_t && T_pad > T) {
+        cudaMemsetAsync(x8_ + T * K, 0, (size_t) (T_pad - T) * (size_t) K, (cudaStream_t) stream_);
+    }
+    if (gdn_qkvz_on() && !pad_small_t) {
         x8_key_valid_ = true;
         x8_key_x_ = X;
         x8_key_amax_ = act_amax;
@@ -1851,8 +1936,8 @@ bool Gemm::fp8(const uint16_t* X, const uint8_t* W8, const float* d_inv_scale_w,
     float* matmul_y = Y;
     float matmul_beta = beta;
     int64_t c_ldy = ldy;
-    if (per_token && beta != 0.0f) {
-        const size_t need_bytes = (size_t) T * (size_t) N * sizeof(float);
+    if (pad_small_t || (per_token && beta != 0.0f)) {
+        const size_t need_bytes = (size_t) T_pad * (size_t) N * sizeof(float);
         if (y_tmp_bytes_ < need_bytes) {
             if (y_tmp_) cudaFree(y_tmp_);
             y_tmp_ = nullptr;
@@ -1870,7 +1955,7 @@ bool Gemm::fp8(const uint16_t* X, const uint8_t* W8, const float* d_inv_scale_w,
     }
 
     // 3. cuBLASLt Tiered Memoization & Execution
-    int64_t t_bucket = get_t_bucket(T);
+    int64_t t_bucket = get_t_bucket(T_pad);
     AlgoCacheKey key{N, K, c_ldy, t_bucket, per_token};
 
     cublasLtMatmulDescOpaque_t opDesc;
@@ -1886,8 +1971,8 @@ bool Gemm::fp8(const uint16_t* X, const uint8_t* W8, const float* d_inv_scale_w,
 
     cublasLtMatrixLayoutOpaque_t aLayout, bLayout, cLayout;
     cublasLtMatrixLayoutInit(&aLayout, CUDA_R_8F_E4M3, (uint64_t) K, (uint64_t) N, (int64_t) K);
-    cublasLtMatrixLayoutInit(&bLayout, CUDA_R_8F_E4M3, (uint64_t) K, (uint64_t) T, (int64_t) K);
-    cublasLtMatrixLayoutInit(&cLayout, CUDA_R_32F, (uint64_t) N, (uint64_t) T, (int64_t) c_ldy);
+    cublasLtMatrixLayoutInit(&bLayout, CUDA_R_8F_E4M3, (uint64_t) K, (uint64_t) T_pad, (int64_t) K);
+    cublasLtMatrixLayoutInit(&cLayout, CUDA_R_32F, (uint64_t) N, (uint64_t) T_pad, (int64_t) c_ldy);
 
     size_t actual_ws_bytes = ws_bytes_;
     AlgoCacheVal cached_algo{{}, 0, false};
@@ -2046,13 +2131,19 @@ bool Gemm::fp8(const uint16_t* X, const uint8_t* W8, const float* d_inv_scale_w,
             return false;
         }
         if (per_token) {
-            if (beta == 0.0f) {
+            if (pad_small_t && beta == 0.0f) {
+                y32_per_token_scale_copy_epilogue_kernel<<<(unsigned) T, 256, 0, (cudaStream_t) stream_>>>(
+                    Y, y_tmp_, d_inv_scale_tok_, T, N, ldy);
+            } else if (beta == 0.0f) {
                 y32_per_token_scale_epilogue_kernel<<<(unsigned) T, 256, 0, (cudaStream_t) stream_>>>(
                     Y, d_inv_scale_tok_, T, N, ldy);
             } else {
                 y32_per_token_accum_epilogue_kernel<<<(unsigned) T, 256, 0, (cudaStream_t) stream_>>>(
                     Y, y_tmp_, d_inv_scale_tok_, T, N, ldy, beta);
             }
+        } else if (pad_small_t) {
+            y32_copy_or_accum_epilogue_kernel<<<(unsigned) T, 256, 0, (cudaStream_t) stream_>>>(
+                Y, y_tmp_, T, N, ldy, beta);
         }
         return true;
     }
@@ -2374,7 +2465,11 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
                 }
             }
         }
-        if (cw8 != nullptr && T >= pf_fp8_min_t()) {
+        static const bool pad_small_t_env = [] {
+            const char* v = std::getenv("STRATA_PF_FP8_PAD_SMALL_T");
+            return v != nullptr && v[0] == '1' && v[1] == '\0';
+        }();
+        if (cw8 != nullptr && (T >= pf_fp8_min_t() || (pad_small_t_env && T >= 1))) {
             if (fp8(X, cw8, d_scale_w, Y, T, N, K, ldy, beta, ldx, act_amax, reuse_x8, act_ticket)) return;
         }
     }

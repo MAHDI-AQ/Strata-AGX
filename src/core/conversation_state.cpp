@@ -471,6 +471,12 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
     return sync(error);
 }
 
+bool conversation_sync_copy_stream(std::string& error) {
+    const cudaError_t e = conversation_detail::sync_private_stream();
+    if (e != cudaSuccess) { error = std::string("conversation copy sync: ") + cudaGetErrorString(e); return false; }
+    return true;
+}
+
 bool conversation_checkpoint_copy(const SessionState& from, SessionState& to, const std::vector<int32_t>& ids,
                                   const ModelGeometry& g, std::string& error, bool queued) {
     // conversation_checkpoint_save(from) + conversation_checkpoint_restore(to) without the host image, for two

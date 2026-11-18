@@ -94,7 +94,7 @@ Strata-AGX supports homogeneous 1×, 2×, and 4× 24 GiB Ada Lovelace (`sm_89`) 
 
 ---
 
-## Wave K1–K16 `sm_89` Optimizations
+## Wave K1–K17 `sm_89` Optimizations
 
 Strata-AGX adds targeted Ada Lovelace (`sm_89`) optimizations while keeping `--vanilla-defaults` available to restore upstream defaults:
 
@@ -151,4 +151,4 @@ Forked from [`Niko1221/Strata`](https://github.com/Niko1221/Strata) (`v0.2.15`).
 python3 tools/upstream_sync_audit.py --repo . --upstream-ref upstream/main --fetch
 ```
 
-See [`docs/SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md`](docs/SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md) for the full `sm_89` architecture, Wave K1–K15 optimization map, and upstream sync protocol, and [`AGENTS.md`](AGENTS.md) for agent rules.
+See [`docs/SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md`](docs/SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md) for the full `sm_89` architecture, Wave K1–K17 optimization map, and upstream sync protocol, and [`AGENTS.md`](AGENTS.md) for agent rules.

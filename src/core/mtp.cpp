@@ -2188,12 +2188,21 @@ bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t c
     const OnDevice on_device(device_);
     // row 0 is the real pair; rows 1.. repeat it and only write cells the next round overwrites
     const int64_t HCN = g_->hc * g_->n_embd;
-    for (int t = 0; t < T; ++t)
-        if (cudaMemcpy((void*) (window_R_ + (size_t) t * HCN), R_row, (size_t) HCN * sizeof(float),
-                       cudaMemcpyDeviceToDevice) != cudaSuccess) {
+    static const bool async_wait = [] {
+        const char* v = std::getenv("STRATA_ASYNC_STAGE_WAIT");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    for (int t = 0; t < T; ++t) {
+        const cudaError_t me = async_wait
+            ? cudaMemcpyAsync((void*) (window_R_ + (size_t) t * HCN), R_row, (size_t) HCN * sizeof(float),
+                              cudaMemcpyDeviceToDevice, cs_)
+            : cudaMemcpy((void*) (window_R_ + (size_t) t * HCN), R_row, (size_t) HCN * sizeof(float),
+                         cudaMemcpyDeviceToDevice);
+        if (me != cudaSuccess) {
             err = "mtp: staging the first residual failed";
             return false;
         }
+    }
     std::vector<int32_t> toks((size_t) T, token);
     return draft(T, toks.data(), cell, 0, drafts, err, probs, min_p, n_drafts, result);
 }

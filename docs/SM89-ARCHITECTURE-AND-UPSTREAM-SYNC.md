@@ -34,7 +34,7 @@ Common `sm_89` serving flags across profiles:
 
 ---
 
-## 4. Wave K1–K14 Subsystem & Optimization Map
+## 4. Wave K1–K17 Subsystem & Optimization Map
 
 | Wave | Subsystem / Files | Optimization / Change | Status |
 |---|---|---|---|
@@ -45,6 +45,8 @@ Common `sm_89` serving flags across profiles:
 | K12 | `src/core/weights.cpp`, `src/prefill/prefill.cpp` | `STRATA_L2_PERSIST=1` (49.50 MiB L2 window), `STRATA_PREFILL_SMALL_T_RESIDENT=1` | Active |
 | K13 | `native_mmvq.cu`, `sampler.cu`, `weights.cpp`, `prefill.cpp`, `native_head.cpp`, `generate.cpp`, `qsa_select.cu` | `IlQ6K NC>=7` (and `NC>=5 && R>1`) routed to `native_mmvq_il_kernel` (`STACK:0`) + `NC=5..6 R=1` `native_mmvq_il_pf_kernel` (`DB=0, MINB=4`, `STACK:0`), `sampled_tail_warp` dead `double* ex` removed + `p.temperature > 0.01f ? (1.0f / p.temperature) : 100.0f` FP32 clamp, `pack_l2_persist` atomic commit + `256B` align + `~WeightTable` free, `kv_stage_block_from_host` tail-only, `STRATA_EMBED_VRAM="0"` locked default (`NativeEmbed::ensure_device` retained defensively), parallel `ckpt_threads` `direct_slot_copy`, `#63-D` shift UB fix, dead-flag purge | Active |
 | K14 | `verify.cpp`, `sampler.cu`, `generate.cpp`, `qsa_select.cu`, `kv_stream.cu`, `serve/server.py`, `tools/strata_tokenizer.py` | `STRATA_SAMPLER_BATCH_ROWS=1` batched homogeneous `Verifier::sample_rows` + `counters_d` multi-row sampler (`STACK:0`, `LOCAL:0`), multi-stage `read_windows` `win_step`/`sync` guard, lock-free `in_has_lines` `try_next_line`, `STRATA_PARK_STAGE_THREADS=1` parallel stage park, `STRATA_TOPK_ACTIVE_SM89=1` active-block QSA top-k, `STRATA_KV_STREAM_WIDE=1` 256-thread `copy_kernel`, `PromptEncoder` prefix/tokenizer locks, `TCP_NODELAY`, `STRATA_PARK_SEGPOOL_MIB=0` | Active |
+| K15–K16 | `gemm.cu`, `kv_stream.cu`, `weights.cpp`, `generate.cpp`, `serve/server.py` | `STRATA_KV_STAGE_SEL_GPU=1`, `STRATA_SAMPLER_ASYNC=1`, `STRATA_GDN_NORM_QFUSE=1`, `STRATA_GDN_CONV_GROUPS=1`, `STRATA_CONC_SUBCHUNK=512`, `STRATA_PREFILL_LOW_PRIO=1`, `STRATA_PARK_STAGE_POOL=1`, `STRATA_MLOCK_CODE=1`, `STRATA_DROP_STARTUP_MMAP=1`, `STRATA_PF_FP8_MIN_T=32`, `--kv-resident 212992` | Active |
+| K17 | `conversation_cache.hpp`, `conversation_buffer.hpp`, `serve/server.py`, `gemm.cu`, `prefill.cpp`, `generate.cpp`, `verify.cpp`, `mtp.cpp` | `STRATA_CONV_JEMALLOC_PURGE=1`, `STRATA_CONV_NOHUGEPAGE=1`, `STRATA_MSG_PREFIX_CACHE=1`, `STRATA_PF_FP8_PAD_SMALL_T=1`, `STRATA_PF_SMALL_T_RUN=1`, `STRATA_SLOT_COPY_STREAM_SYNC=1`, `STRATA_ASYNC_STAGE_WAIT=1` | Active |
 
 ---
 
