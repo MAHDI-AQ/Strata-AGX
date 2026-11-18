@@ -111,6 +111,9 @@ Strata-AGX adds targeted Ada Lovelace (`sm_89`) optimizations while keeping `--v
   - `STRATA_BINARY_IPC=1` (`BGENB`): Binary IPC framing between `serve/server.py` and `build/strata`.
   - `--group-spread-mtp`: Cross-GPU `pmtp_verdict` ordering with shared MTP drafter (`--batch-mtp-mode shared`) and parallel `ckpt_threads` `direct_slot_copy`.
   - `STRATA_EMBED_VRAM=0` + `NativeEmbed::ensure_device`: Mapped portable host memory + `init_native_embed_fp8` as the safe default (`NativeEmbed::ensure_device` retained defensively for multi-GPU safety).
+- **Wave K17 Small-T, Prefix Cache, Allocator & CUDA-Graph Logit-Writeback Fix (`c75ac8060`):**
+  - Track 1 (`STRATA_CONV_JEMALLOC_PURGE=1`, `STRATA_CONV_NOHUGEPAGE=1`), Track 2 (`STRATA_MSG_PREFIX_CACHE=1`), Track 3 (`STRATA_PF_FP8_PAD_SMALL_T=1`, `STRATA_PF_SMALL_T_RUN=1` + `kv_stage_selected_from_host`), Track 4 (`STRATA_SLOT_COPY_STREAM_SYNC=1`, `STRATA_ASYNC_STAGE_WAIT=1`), and `Verifier::record_window` (`target_logits = hl`, `zero_dram = false`, `spec_gumbel_fused = false` so captured solo/batch graphs always populate `head_logits_` for subsequent penalized/sampled requests).
+  - Measured on 4x RTX 4090 (`sm_89`, `8x512k @ 208k` resident): `65k` burst `246.09 turns/min` (`+13.3%` vs K16, `agg_decode=197.72 tok/s`, `8/8` needles), `196k` burst `134.45 turns/min` (`+7.6%` vs K16, `8/8` needles), `agx_fast_gate --slots 8` `SD_r512_c8=714.92 tok/s`, `NEEDLE_GATE 8/8`, `min_vram_free=638 MiB`, `quality_isolation_bench_4slot --smoke` `100.0% / 0.0% / 100.0%` (`0` spills, `8/8` parity, `0` Xids).
 
 ---
 

@@ -2759,18 +2759,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     (std::getenv("STRATA_LM_HEAD_FP8") == nullptr || std::getenv("STRATA_LM_HEAD_FP8")[0] != '0');
                 if (use_fp8) {
                     std::string herr;
-                    const bool zero_dram = ((std::getenv("STRATA_SPEC_GUMBEL") != nullptr && std::getenv("STRATA_SPEC_GUMBEL")[0] == '1') ||
-                                            (std::getenv("STRATA_ZERO_DRAM_SAMPLER") != nullptr && std::getenv("STRATA_ZERO_DRAM_SAMPLER")[0] == '1'));
-                    const bool has_penalties = (sampling_.penalty_last_n > 0 && (sampling_.penalty_repeat != 1.0f || sampling_.penalty_freq != 0.0f || sampling_.penalty_present != 0.0f)) ||
-                                               (sampling_.logit_bias != nullptr);
-                    // Zero DRAM logit writeback when greedy without penalties or under zero_dram active (Zero-DRAM Gumbel sampler);
-                    // need_logits is FALSE when zero_dram is active unless penalty_last_n > 0 or logit_bias != nullptr
-                    const bool need_logits = (std::getenv("STRATA_LOGITS") != nullptr && std::getenv("STRATA_LOGITS")[0] != '0') ||
-                                             (std::getenv("STRATA_SAVE_LOGITS") != nullptr) ||
-                                             (batch_rec_) ||
-                                             has_penalties ||
-                                             (!zero_dram && (!sampling_.greedy && sampling_.temperature > 0.0f));
-                    float* const target_logits = need_logits ? hl : nullptr;
+                    // Never bake target_logits=nullptr or zero_dram=true into captured CUDA graphs:
+                    // a later penalized, logit_bias, or sampled request may replay this graph.
+                    (void) std::getenv("STRATA_LOGITS");
+                    (void) std::getenv("STRATA_SAVE_LOGITS");
+                    const bool zero_dram = false;
+                    float* const target_logits = hl;
                     const float temp = (sampling_.temperature > 0.0f) ? sampling_.temperature : 1.0f;
                     if (!head_->run_fp8(head_mixed_ + (size_t) h0 * N, target_logits, m_out_ + h0, HT, cs, herr,
                                        temp, zero_dram, sampling_.seed, (uint64_t) last_pos0_ + h0)) {
@@ -3794,15 +3788,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
-    const bool spec_gumbel_fused = (head_ != nullptr && head_->is_fp8() &&
-        (std::getenv("STRATA_LM_HEAD_FP8") == nullptr || std::getenv("STRATA_LM_HEAD_FP8")[0] != '0') &&
-        ((std::getenv("STRATA_SPEC_GUMBEL") != nullptr && std::getenv("STRATA_SPEC_GUMBEL")[0] == '1') ||
-         (std::getenv("STRATA_ZERO_DRAM_SAMPLER") != nullptr && std::getenv("STRATA_ZERO_DRAM_SAMPLER")[0] == '1')) &&
-        !(sampling_.penalty_last_n > 0 && (sampling_.penalty_repeat != 1.0f || sampling_.penalty_freq != 0.0f || sampling_.penalty_present != 0.0f)) &&
-        !sampling_.logit_bias &&
-        !batch_rec_ &&
-        !(std::getenv("STRATA_LOGITS") != nullptr && std::getenv("STRATA_LOGITS")[0] != '0') &&
-        !(std::getenv("STRATA_SAVE_LOGITS") != nullptr));
+    // record_window forces zero_dram=false so host sample_tokens always runs when sampling/penalties are active.
+    const bool spec_gumbel_fused = false;
 
     if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {
         if (!spec_gumbel_fused) {
@@ -5970,15 +5957,8 @@ bool Verifier::pl_finish(int32_t* out, std::string& err) {
     if (le_ < g.n_layers) return true;   // an earlier stage: the hand-off is written
     const int T = fl_T_;
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
-    const bool spec_gumbel_fused = (head_ != nullptr && head_->is_fp8() &&
-        (std::getenv("STRATA_LM_HEAD_FP8") == nullptr || std::getenv("STRATA_LM_HEAD_FP8")[0] != '0') &&
-        ((std::getenv("STRATA_SPEC_GUMBEL") != nullptr && std::getenv("STRATA_SPEC_GUMBEL")[0] == '1') ||
-         (std::getenv("STRATA_ZERO_DRAM_SAMPLER") != nullptr && std::getenv("STRATA_ZERO_DRAM_SAMPLER")[0] == '1')) &&
-        !(sampling_.penalty_last_n > 0 && (sampling_.penalty_repeat != 1.0f || sampling_.penalty_freq != 0.0f || sampling_.penalty_present != 0.0f)) &&
-        !sampling_.logit_bias &&
-        !batch_rec_ &&
-        !(std::getenv("STRATA_LOGITS") != nullptr && std::getenv("STRATA_LOGITS")[0] != '0') &&
-        !(std::getenv("STRATA_SAVE_LOGITS") != nullptr));
+    // record_window forces zero_dram=false so host sample_tokens always runs when sampling/penalties are active.
+    const bool spec_gumbel_fused = false;
 
     if (head_sampling_ && !spec_gumbel_fused && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {   // run()'s host-side sampling, Philox(seed, pos0 + t)
         SamplerParams sp = sampling_;
