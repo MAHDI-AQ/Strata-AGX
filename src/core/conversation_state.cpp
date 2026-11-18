@@ -180,29 +180,49 @@ struct CkptAsync {
     size_t cap = 0;
     int dev = -1;
 };
-CkptAsync& ckpt_async() { static CkptAsync a; return a; }
-// STRATA_CKPT_VRAM_SLOTS=N (with STRATA_CKPT_ASYNC): the last N saved GDN states stay in VRAM (allocated only while
+CkptAsync& ckpt_async(int dev) {
+    static std::array<CkptAsync, 8> a;
+    return a[(size_t) std::clamp(dev, 0, 7)];
+}
+// STRATA_CKPT_VRAM_SLOTS=N (with STRATA_CKPT_ASYNC): the last N saved GDN states per GPU stay in VRAM (allocated only while
 // more than 1.5 GB stays free); a restore of a checkpoint whose tag a slot holds copies device to device.
 struct VramSlot { void* p = nullptr; size_t n = 0; uint64_t tag = 0, used = 0; int dev = -1; };
-struct VramSlots { std::vector<VramSlot> s; uint64_t clock = 0, next_tag = 0; };
+struct VramSlots { std::mutex mu; std::vector<VramSlot> s; uint64_t clock = 0, next_tag = 0; };
 VramSlots& vram_slots() { static VramSlots v; return v; }
 int vram_slots_n() {
     static const int n = [] { const char* v = std::getenv("STRATA_CKPT_VRAM_SLOTS"); return v ? std::max(0, std::min(16, std::atoi(v))) : 0; }();
     return n;
 }
-// a slot for `n` bytes on `dev`: a free one, a new one if VRAM allows, else the least recently used (nullptr: none)
-VramSlot* vram_slot_for(size_t n, int dev) {
+// a slot index for `n` bytes on `dev`: a free/new one if VRAM allows, else the least recently used (-1: none)
+int vram_slot_for(size_t n, int dev, void*& out_p) {
+    out_p = nullptr;
     VramSlots& v = vram_slots();
-    VramSlot* best = nullptr;
-    for (VramSlot& x : v.s)
-        if (x.dev == dev && x.n == n && (best == nullptr || x.used < best->used)) best = &x;
-    if ((int) v.s.size() < vram_slots_n()) {
+    std::lock_guard<std::mutex> lk(v.mu);
+    int best = -1;
+    int dev_cnt = 0;
+    for (int i = 0; i < (int) v.s.size(); ++i) {
+        VramSlot& x = v.s[(size_t) i];
+        if (x.dev != dev) continue;
+        ++dev_cnt;
+        if (x.n == n && (best < 0 || x.used < v.s[(size_t) best].used)) best = i;
+    }
+    if (dev_cnt < vram_slots_n()) {
         size_t fr = 0, tot = 0;
         if (cudaMemGetInfo(&fr, &tot) == cudaSuccess && fr > n + ((size_t) 3 << 29)) {
             VramSlot x;
-            if (cudaMalloc(&x.p, n) == cudaSuccess) { x.n = n; x.dev = dev; v.s.push_back(x); return &v.s.back(); }
+            if (cudaMalloc(&x.p, n) == cudaSuccess) {
+                x.n = n; x.dev = dev; x.tag = 0; x.used = ++v.clock;
+                v.s.push_back(x);
+                out_p = x.p;
+                return (int) v.s.size() - 1;
+            }
         }
         (void) cudaGetLastError();
+    }
+    if (best >= 0) {
+        v.s[(size_t) best].tag = 0;
+        v.s[(size_t) best].used = ++v.clock;
+        out_p = v.s[(size_t) best].p;
     }
     return best;
 }
@@ -221,7 +241,10 @@ bool ckpt_async_on() {
 // instead of 37.  The same bytes in the same places.  One set of buffers: the mutex serializes the saves a layer
 // split runs on one thread per stage (STRATA_CKPT_THREADS), which otherwise gather through the same buffer.
 struct CkptGather { std::mutex mu; void* stage = nullptr; void* host = nullptr; size_t cap = 0; int dev = -1; };
-CkptGather& ckpt_gather() { static CkptGather a; return a; }
+CkptGather& ckpt_gather(int dev) {
+    static std::array<CkptGather, 8> a;
+    return a[(size_t) std::clamp(dev, 0, 7)];
+}
 bool ckpt_gather_on() {
 #if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
     return false;
@@ -236,10 +259,10 @@ int ckpt_gather_small(ConversationCheckpoint& c, const SessionState& ss, const C
     const size_t ple = c.ple.size(), tails = c.tails.size(), dead = c.dead.size(), block_pos = c.block_pos.size();
     const size_t total = ple + tails + dead + block_pos;
     if (total == 0) return 1;
-    CkptGather& a = ckpt_gather();
-    std::lock_guard<std::mutex> lk(a.mu);
     int dev = 0;
     (void) cudaGetDevice(&dev);
+    CkptGather& a = ckpt_gather(dev);
+    std::lock_guard<std::mutex> lk(a.mu);
     if (a.stage != nullptr && (a.cap < total || a.dev != dev)) {
         const int cur = dev;
         (void) cudaSetDevice(a.dev); (void) cudaFree(a.stage); (void) cudaFreeHost(a.host); (void) cudaSetDevice(cur);
@@ -271,11 +294,13 @@ int ckpt_gather_small(ConversationCheckpoint& c, const SessionState& ss, const C
 }  // namespace
 
 void conversation_checkpoint_join(const void* only) {
-    CkptAsync& a = ckpt_async();
-    std::lock_guard<std::mutex> lk(a.mu);
-    if (a.pending.valid() && (only == nullptr || only == a.dst)) {
-        const cudaError_t e = a.pending.get();
-        if (e != cudaSuccess) std::fprintf(stderr, "strata: STRATA_CKPT_ASYNC: a checkpoint copy failed (%s)\n", cudaGetErrorString(e));
+    for (int d = 0; d < 8; ++d) {
+        CkptAsync& a = ckpt_async(d);
+        std::lock_guard<std::mutex> lk(a.mu);
+        if (a.pending.valid() && (only == nullptr || only == a.dst)) {
+            const cudaError_t e = a.pending.get();
+            if (e != cudaSuccess) std::fprintf(stderr, "strata: STRATA_CKPT_ASYNC: a checkpoint copy failed (%s)\n", cudaGetErrorString(e));
+        }
     }
 }
 
@@ -286,7 +311,16 @@ bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const Mo
                      bool& staged) {
     staged = false;
     const auto j0 = std::chrono::steady_clock::now();
-    conversation_checkpoint_join(nullptr);   // (the staging buffer is reused)
+    int cur_dev = 0;
+    (void) cudaGetDevice(&cur_dev);
+    {
+        CkptAsync& a = ckpt_async(cur_dev);
+        std::lock_guard<std::mutex> lk(a.mu);
+        if (a.pending.valid()) {
+            const cudaError_t e = a.pending.get();
+            if (e != cudaSuccess) std::fprintf(stderr, "strata: STRATA_CKPT_ASYNC: a checkpoint copy failed (%s)\n", cudaGetErrorString(e));
+        }
+    }
     if (std::getenv("STRATA_PARK_TRACE")) std::fprintf(stderr, "strata parktrace: save join %.2f ms\n",
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - j0).count());
 #if defined(STRATA_GPU_METAL)
@@ -306,9 +340,9 @@ bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const Mo
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r0).count(),
         conversation_trace::thread_minflt() - rf0, c.gdn.size() >> 20, (const void*) c.gdn.data(), conversation_trace::where(c.gdn.data()));
     if (ckpt_async_on() && c.gdn.size() >= ((size_t) 1 << 20)) {
-        CkptAsync& a = ckpt_async();
         int dev = 0;
         (void) cudaGetDevice(&dev);
+        CkptAsync& a = ckpt_async(dev);
         if (a.stage != nullptr && (a.cap < c.gdn.size() || a.dev != dev)) {
             const int cur = dev;
             (void) cudaSetDevice(a.dev); (void) cudaFree(a.stage); (void) cudaFreeHost(a.host);
@@ -322,16 +356,16 @@ bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const Mo
         }
         (void) cudaGetLastError();
         const auto q0 = std::chrono::steady_clock::now();
-        VramSlot* slot = vram_slots_n() > 0 ? vram_slot_for(c.gdn.size(), dev) : nullptr;
-        if (slot != nullptr) slot->tag = 0;   // (being rewritten)
-        void* dsrc = slot != nullptr ? slot->p : a.stage;
+        void* slot_p = nullptr;
+        const int slot_idx = vram_slots_n() > 0 ? vram_slot_for(c.gdn.size(), dev, slot_p) : -1;
+        void* dsrc = slot_idx >= 0 ? slot_p : a.stage;
         c.dev_tag = 0;
         if (dsrc != nullptr && copy(dsrc, ss.gdn_state, c.gdn.size(), error)) {   // device to device: fast
             const auto q1 = std::chrono::steady_clock::now();
-            if (slot != nullptr) {
+            if (slot_idx >= 0) {
                 VramSlots& v = vram_slots();
-                slot->tag = c.dev_tag = ++v.next_tag;
-                slot->used = ++v.clock;
+                std::lock_guard<std::mutex> lk(v.mu);
+                v.s[(size_t) slot_idx].tag = c.dev_tag = ++v.next_tag;
             }
             uint8_t* dst = c.gdn.data();
             const size_t n = c.gdn.size();
@@ -394,14 +428,20 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
 
 bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionState& ss,
                                      const ModelGeometry& g, std::string& error) {
-    const VramSlot* hit = nullptr;
+    const void* hit_p = nullptr;
     if (c.dev_tag != 0) {
         int dev = 0;
         (void) cudaGetDevice(&dev);
-        for (VramSlot& x : vram_slots().s)
-            if (x.tag == c.dev_tag && x.dev == dev && x.n == c.gdn.size()) { x.used = ++vram_slots().clock; hit = &x; }
+        VramSlots& v = vram_slots();
+        std::lock_guard<std::mutex> lk(v.mu);
+        for (VramSlot& x : v.s)
+            if (x.tag == c.dev_tag && x.dev == dev && x.n == c.gdn.size()) {
+                x.used = ++v.clock;
+                hit_p = x.p;
+                break;
+            }
     }
-    if (hit == nullptr) conversation_checkpoint_join(c.gdn.data());
+    if (hit_p == nullptr) conversation_checkpoint_join(c.gdn.data());
 #if defined(STRATA_GPU_METAL)
     (void) g;
     if (!strata::metal_engine::window_checkpoint_restore(c, &ss, error)) return false;
@@ -413,7 +453,7 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
     ConversationStateSizes z;
     if (!conversation_session_sizes(g, ss, z, error)) return false;
     if (!sync(error)) return false;   // the copies below no longer ride the legacy stream's implicit ordering
-    if (!copy(ss.gdn_state, hit != nullptr ? hit->p : (const void*) c.gdn.data(), c.gdn.size(), error) ||
+    if (!copy(ss.gdn_state, hit_p != nullptr ? hit_p : (const void*) c.gdn.data(), c.gdn.size(), error) ||
         !copy(ss.ple_hist, c.ple.data(), c.ple.size(), error)) return false;
     for (size_t j = 0; j < owned_qsa(ss); ++j) {
         const auto& st = owned(ss, j);

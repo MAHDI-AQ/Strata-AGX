@@ -21,6 +21,7 @@
 // selection, native indexer) and a profile-filled VRAM expert tier with its residency table on the device.
 #pragma once
 
+#include <array>
 #include <cstdio>
 
 #include "strata/core/expert_source.hpp"
@@ -220,6 +221,8 @@ public:
     void set_handoff_flags(uint32_t* in_host, uint32_t* in_dev, uint32_t* out_host, uint32_t* out_dev) {
         hflag_in_h_ = in_host; hflag_in_d_ = in_dev; hflag_out_h_ = out_host; hflag_out_d_ = out_dev;
     }
+    /// This stage raises a hand-off flag (set_handoff_flags gave it an outgoing word).
+    bool publishes_handoff() const { return hflag_out_d_ != nullptr; }
     /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
     /// and `final_R` are the last stage's.
     void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
@@ -458,21 +461,36 @@ private:
     int row_base_ = 0;                     ///< ... its hand-off rows start here (a pipeline group's own rows)
     int brow_[strata::kernels::kWindowMaxT] = {};                     ///< ... and row t is slot brow_[t]
     bool last_batch_ = false;              ///< the last run was a batch window (set_plan_slot: one group)
-    std::map<std::vector<int>, cudaGraphExec_t> exec_bm_, commit_bm_;   ///< full row layout avoids slot-ID collisions
-    std::map<std::vector<int>, uint64_t> bm_used_;   ///< last use of each captured layout (LRU)
+    struct BatchKey {
+        int len = 0;
+        std::array<int, strata::kernels::kWindowMaxT + 2> data{};
+        bool operator<(const BatchKey& o) const noexcept {
+            if (len != o.len) return len < o.len;
+            for (int i = 0; i < len; ++i) {
+                if (data[(size_t) i] != o.data[(size_t) i]) return data[(size_t) i] < o.data[(size_t) i];
+            }
+            return false;
+        }
+        bool operator==(const BatchKey& o) const noexcept {
+            if (len != o.len) return false;
+            for (int i = 0; i < len; ++i) {
+                if (data[(size_t) i] != o.data[(size_t) i]) return false;
+            }
+            return true;
+        }
+    };
+    std::map<BatchKey, cudaGraphExec_t> exec_bm_, commit_bm_;   ///< full row layout avoids slot-ID collisions
+    std::map<BatchKey, uint64_t> bm_used_;   ///< last use of each captured layout (LRU)
     uint64_t bm_tick_ = 0;
     size_t batch_graph_limit_ = 0;         ///< 0: keep every captured batch graph (0.1.39); N: LRU-evict beyond N layouts
     int last_rows_[strata::kernels::kWindowMaxT] = {};                ///< the slots of the last batch window's rows
-    std::vector<int> bkey(const int* rows, int S, int hbase) const {   // #871: the doorbell variant has its own graphs
-        std::vector<int> k = batch_key(rows, S, hbase);
-        k.push_back(ar_off_ ? 1 : 0);
-        return k;
-    }
-    static std::vector<int> batch_key(const int* rows, int S, int hbase) {
-        std::vector<int> k;
-        k.reserve((size_t) S + 1);
-        k.push_back(hbase);
-        for (int t = 0; t < S; ++t) k.push_back(rows[t]);
+    BatchKey bkey(const int* rows, int S, int hbase) const noexcept {   // #871: the doorbell variant has its own graphs
+        BatchKey k;
+        k.data[0] = hbase;
+        const int n = S < strata::kernels::kWindowMaxT ? S : strata::kernels::kWindowMaxT;
+        for (int t = 0; t < n; ++t) k.data[(size_t) (t + 1)] = rows[t];
+        k.data[(size_t) (n + 1)] = ar_off_ ? 1 : 0;
+        k.len = n + 2;
         return k;
     }
     // batch_launch / batch_poll (with external serving, batch_serve runs on another thread: running and the served
@@ -480,6 +498,9 @@ private:
     std::atomic<bool> b_running_{false};
     std::atomic<int64_t> b_k_{0};
     int64_t b_steps_ = 0;
+    // STRATA_BATCH_DOORBELL=1: how many times the graphs batch_launch queued increment m_seq_ (the window, and the
+    // commit or save graph behind it on the same stream).  Unread unless that flag is exactly "1".
+    uint32_t b_seq_want_ = 1;
     std::atomic<bool> ext_serve_{false};
     // when a layer was last served (steady clock ticks): the serving thread writes it, batch_poll's checks read it
     std::atomic<int64_t> b_last_{0};
@@ -513,15 +534,15 @@ private:
     float* dc_hist_ = nullptr;
     void* dc_arena_ = nullptr;
     int32_t *h_commitd_ = nullptr, *m_commitd_ = nullptr, *commitd_ = nullptr;
-    std::map<std::vector<int>, cudaGraphExec_t> save_bm_, dcommit_bm_;
+    std::map<BatchKey, cudaGraphExec_t> save_bm_, dcommit_bm_;
     bool capture_deferred(const int* rows, int S, int hbase, std::string& err);
     /// Free the graph pair of the least recently used batch layout other than `keep` (`evicted`: there was one).
-    bool evict_batch_graph(const std::vector<int>& keep, bool& evicted, std::string& err);
+    bool evict_batch_graph(const BatchKey& keep, bool& evicted, std::string& err);
     /// cudaGraphInstantiate; out of VRAM, batch layouts other than `key` are evicted (LRU) until it fits, and then (a
     /// single-request window, `keep_t` > 0) the graphs of the other window sizes, largest first (#3702): a window size
     /// whose graph does not fit used to end the engine ("verify: instantiate: out of memory"); a freed size is captured
     /// again when it is next used.
-    bool instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, const std::vector<int>& key, const char* what,
+    bool instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, const BatchKey& key, const char* what,
                               std::string& err, int keep_t = -1, unsigned long long flags = 0);
     /// Free the graph of the largest window size other than `keep_t` (and the prelaunched one); `evicted`: there was one.
     bool evict_window_graph(int keep_t, bool& evicted, std::string& err);

@@ -1,3 +1,13 @@
+## Strata-AGX (`v0.2.15` + SM89 Fork) — Mandatory Agent Rules
+
+- **Ref Invariant (`HEAD == main == green`):** Keep `main` and the `green` tag aligned at the latest verified commit. Branch `feat/*`, `perf/*`, or `lever/*` from `main`, and promote back only after passing all spill, parity, and serving gates.
+- **SM89 Pipeline & Session Lease Architecture:** Target Ada Lovelace (`sm_89`) cards with `--kv q4_0` (or `q8_0`), `--batch-mtp-mode shared --group-spread-mtp --concurrent-prefill`, and `"STRATA_EMBED_VRAM": "0"` (`NativeEmbed::ensure_device` retained defensively; `--vanilla-defaults` restores upstream defaults). Radix trees, paged KV, HiCache, and SGLang-style prefix sharing are excluded in favor of **Session Lease + in-place delta appending + `O_DIRECT` NVMe streaming**.
+- **CUDA Spill Gate:** Run `python3 tools/check_cuda_spills.py <build-dir>/libstrata_kernels.a <build-dir>/libstrata_core.a` and `python3 -m unittest tools.test_check_cuda_spills` — must report `0` disallowed spills across all `sm_89` objects (`sampler`, `native_mmvq`, `qsa_select`, `gdn_chunk`, `iq_kernels`, `gemm`, `kv_stream`, `verify_kernels`) and `OK`.
+- **8/8 Idle-GPU Parity:** With no competing server holding VRAM, pass `batch_groups_test`, `batch_read_test`, `batch_rows_parity`, `kv_window_parity`, `gemm_fp8_parity`, `sampler_parity`, `qsa_merge_daily_parity`, `qsa_slots_parity`.
+- **Upstream Sync Audit:** Run `python3 tools/upstream_sync_audit.py --repo . --upstream-ref upstream/main --fetch` before integrating upstream `Niko1221/Strata` updates.
+
+---
+
 # AGENTS.md
 
 Version 0.2.15, engine 0.1.60. The public model families are
@@ -23,6 +33,8 @@ Strata has three parts:
   `START-HERE.bat` or `setup.sh`, is setup from a source checkout, for developers. The release paths are the
   installer and `strata launch`.
 
+- **`STRATA_READ_WIN_MAX_T=0` on multi-stage `--layer-split`:** Keep `STRATA_READ_WIN_MAX_T=0` (upstream default) when `ver.max_t() > S` (e.g., `--lookup-chain 3` with `--spec 4`) on multi-stage `--layer-split`; setting `1` allows `read_windows` to emit `T > S` (such as `T=6` on `enable_thinking=false` turn headers), which leaves the hidden state misaligned at `turn_at`.
+
 ## Installing Strata for a user
 
 Follow **[docs/AI_SETUP.md](docs/AI_SETUP.md)**. For a user who wants the desktop app, send them to the installer
@@ -33,7 +45,7 @@ short version is:
 
    ```sh
    curl -fsSL --connect-timeout 15 --max-time 120 https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh                  # Linux, Mac
-   irm -TimeoutSec 120 https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 | iex                         # Windows PowerShell
+   irm https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 | iex                         # Windows PowerShell
    ```
 
    On Windows, open a new terminal afterwards so that `strata` is on the PATH.

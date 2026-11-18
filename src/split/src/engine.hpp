@@ -96,6 +96,15 @@ public:
     // the draft head's TOPK_N highest (penalized) logits for that token into last_draft_cands as top_tokens() gives them
     int draft(int T, bool from_main, int src_row, const std::vector<int>& tokens, int pos0, const Penalties::Row* pen = nullptr,
               bool cands = false);
+    // Path A: Hardened Asynchronous MTP Drafting Decoupling
+    void draft_async(int T, bool from_main, int src_row, const std::vector<int>& tokens, int pos0,
+                     uint32_t step_seq, int k_drafts);
+    void wait_mtp_done();
+    bool poll_draft_ready(uint32_t step_seq);
+    std::vector<int> get_async_drafts(uint32_t step_seq, int k_drafts);
+    void pl_commit_async(int lane, int accepted_drafts, cudaStream_t stream = nullptr);
+    uint32_t next_step_seq() { return ++step_seq_; }
+    uint32_t step_seq() const { return step_seq_; }
     // FNX_BATCH_DRAFT: draft() for several lanes in one draft-layer window (greedy, no penalties): lane reqs[i].lane's reqs[i].T rows (source rows as draft() takes them,
     // tokens and cells from pos0), the rows of the lanes one after the other (at most MAXT in all). Returns each lane's draft (for the token after its last row).
     // The window runs eagerly. A chained step (from_main false) takes its source row from the batch before: src_row is the row's index in THAT window. The engine's
@@ -409,6 +418,9 @@ private:
     // draft(), from per-card source rows (T rows of D on each card)
     int draft_rows(const std::vector<const float*>& src, int T, const std::vector<int>& tokens, int pos0,
                    const Penalties::Row* pen = nullptr, bool cands = false);
+    void draft_rows_async(const std::vector<const float*>& src, int T, const std::vector<int>& tokens, int pos0,
+                          uint32_t step_seq, int k_drafts);
+    uint32_t step_seq_ = 0;
     std::vector<int> draft_index_;   // token -> its index in the draft vocabulary, -1 if not in it (mtp_attach)
     // pieces of a layer, for the main layers and the draft layer
     void dense(const DW& W, const void* y, float* out, CardBuf& b, int T);

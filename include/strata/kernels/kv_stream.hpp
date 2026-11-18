@@ -82,6 +82,9 @@ inline uint64_t kv_stream_map_bytes(int64_t n_slots) { return (uint64_t) n_slots
 /// Every block evicted: page table all -1, slots free, counters zero.
 void kv_stream_reset(const KvStreamMap& m, void* stream);
 
+/// Evict blocks [min_block, n_blocks) from the residency map while preserving prefix blocks [0, min_block).
+bool kv_stream_invalidate_from(const KvStreamMap& m, int64_t min_block, void* stream);
+
 /// Make every block named by the selections of `n_q` queries resident (ids [n_q][cap], width from
 /// steps[q * kStepCount + kStepWidth]). Capturable. `n_slots` must hold the distinct blocks of one call
 /// (n_q x (cap / page_size + 2)); a call that cannot sets ctl[3] (see `kv_stream_counters`).
@@ -101,6 +104,11 @@ void kv_ring_restore(const QsaAttnPools& slots, const KvHostPools& host, int fmt
 /// path's staging of one layer. Not capturable (DMA).
 void kv_stage_from_host(const QsaAttnPools& stage, const KvHostPools& host, int fmt, int64_t n_blocks,
                         const QsaShapes& s, void* stream);
+void kv_stage_block_from_host(const QsaAttnPools& stage, const KvHostPools& host, int fmt, int64_t block_idx,
+                              const QsaShapes& s, void* stream);
+void kv_stage_selected_from_host(const QsaAttnPools& stage, const KvHostPools& host, int fmt,
+                                 const int32_t* sel_ids_dev, int64_t n_sel, int64_t n_prefix_blocks,
+                                 const QsaShapes& s, void* stream);
 
 /// #579 #613 (HIP A/B, STRATA_KV_HOST_DMA=1): the reverse of kv_stage_from_host for blocks [b0, b1) - the staging
 /// pool's blocks into the host copy, by DMA, so the prompt path's append need not write host memory from a kernel.

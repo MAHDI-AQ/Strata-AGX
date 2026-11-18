@@ -481,74 +481,183 @@ __device__ __forceinline__ void warp_first(float& bv, int& bi) {
 /// `*prob_out`.  The sampler's own calls take kProb = false, whose code is the tail above, unchanged.
 template <bool kProb = false>
 __device__ void sampled_tail_warp(const int* sel_ids, const float* sel_logit, int k, const SamplerParams& p, int t,
-                                  int* __restrict__ out, double* ex, float* prob_out = nullptr,
+                                  int* __restrict__ out, float* prob_out = nullptr,
                                   const int32_t* __restrict__ sub_to_id = nullptr) {
     const int lane = (int) (threadIdx.x & 31);
-    const float inv_t = p.temperature > 0.0f ? 1.0f / p.temperature : 0.0f;
-    int n_keep = k;
-    float mx = sel_logit[0];
-    for (int i = 1; i < k; ++i) mx = fmaxf(mx, sel_logit[i]);
-    if (p.top_p < 1.0f) {
-        for (int i = lane; i < k; i += 32) ex[i] = exp((double) sel_logit[i] - (double) mx);
-        __syncwarp();
-        double sum = 0.0;
-        if (lane == 0)
-            for (int i = 0; i < k; ++i) sum += ex[i];
-        sum = __shfl_sync(kFullMask, sum, 0);
-        __syncwarp();                            // lane 0 has read every `ex` before it is overwritten
-        for (int i = lane; i < k; i += 32) ex[i] = ex[i] / sum;
-        __syncwarp();
-        int cut = k;
-        if (lane == 0) {
-            double cum = 0.0;
-            for (int i = 0; i < k; ++i) {
-                cum += ex[i];
-                if (cum >= (double) p.top_p) { cut = i + 1; break; }
-            }
-        }
-        cut = __shfl_sync(kFullMask, cut, 0);
-        if (cut < p.min_keep) cut = p.min_keep < k ? p.min_keep : k;
-        n_keep = cut;
-        __syncwarp();                            // `ex` is written again below
+    const float inv_t = p.temperature > 0.01f ? (1.0f / p.temperature) : 100.0f;
+
+    // Load up to 2 candidates per lane into registers
+    const float l0 = (lane < k) ? sel_logit[lane] : -1e30f;
+    const float l1 = (lane + 32 < k) ? sel_logit[lane + 32] : -1e30f;
+    const int id0 = (lane < k) ? sel_ids[lane] : 0;
+    const int id1 = (lane + 32 < k) ? sel_ids[lane + 32] : 0;
+
+    // 1. Warp-parallel Maximum Logit Reduction
+    float my_max = fmaxf(l0, l1);
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        my_max = fmaxf(my_max, __shfl_xor_sync(0xFFFFFFFFu, my_max, mask));
     }
-    // min_p on top_p's survivors, as in `sampler_kernel` (every lane, the same float arithmetic)
+
+    // Condition 3 sentinel guard: NaN / -inf
+    if (my_max <= -1e20f || !isfinite(my_max)) {
+        if (lane == 0) {
+            const int pi = (k > 0) ? (k - 1) : 0;
+            out[t] = sel_ids[pi];
+            if constexpr (kProb) { if (prob_out != nullptr) *prob_out = 1.0f; }
+        }
+        return;
+    }
+
+    // 2. Softmax Exponentials and Normalization (FP32)
+    const float e0 = (lane < k) ? expf(l0 - my_max) : 0.0f;
+    const float e1 = (lane + 32 < k) ? expf(l1 - my_max) : 0.0f;
+    float my_sum = e0 + e1;
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        my_sum += __shfl_xor_sync(0xFFFFFFFFu, my_sum, mask);
+    }
+    const float inv_sum = (my_sum > 0.0f) ? (1.0f / my_sum) : 0.0f;
+    const float p0 = e0 * inv_sum;
+    const float p1 = e1 * inv_sum;
+
+    // 3. Top-P Cumulative Distribution Scan
+    int n_keep = k;
+    if (p.top_p < 1.0f) {
+        float scan0 = p0;
+        #pragma unroll
+        for (int offset = 1; offset < 32; offset <<= 1) {
+            const float val = __shfl_up_sync(0xFFFFFFFFu, scan0, offset);
+            if (lane >= offset) scan0 += val;
+        }
+
+        const float total0 = __shfl_sync(0xFFFFFFFFu, scan0, 31);
+        float scan1 = p1;
+        #pragma unroll
+        for (int offset = 1; offset < 32; offset <<= 1) {
+            const float val = __shfl_up_sync(0xFFFFFFFFu, scan1, offset);
+            if (lane >= offset) scan1 += val;
+        }
+        scan1 += total0;
+
+        const bool over0 = (lane < k) && (scan0 >= p.top_p);
+        const bool over1 = (lane + 32 < k) && (scan1 >= p.top_p);
+        const unsigned mask0 = __ballot_sync(0xFFFFFFFFu, over0);
+        const unsigned mask1 = __ballot_sync(0xFFFFFFFFu, over1);
+
+        int cut = k;
+        if (mask0 != 0) cut = __ffs(mask0);
+        else if (mask1 != 0) cut = 32 + __ffs(mask1);
+        if (cut < p.min_keep) cut = (p.min_keep < k) ? p.min_keep : k;
+        n_keep = cut;
+    }
+
+    // 4. Min-P Truncation in Logit Space
     if (p.min_p > 0.0f) {
         const float thresh = sel_logit[0] + logf(p.min_p);
-        for (int i = 0; i < n_keep; ++i)
-            if (sel_logit[i] < thresh) { n_keep = i; break; }
+        const bool drop0 = (lane < n_keep) && (l0 < thresh);
+        const bool drop1 = (lane + 32 < n_keep) && (l1 < thresh);
+        const unsigned dmask0 = __ballot_sync(0xFFFFFFFFu, drop0);
+        const unsigned dmask1 = __ballot_sync(0xFFFFFFFFu, drop1);
+        if (dmask0 != 0) n_keep = __ffs(dmask0) - 1;
+        else if (dmask1 != 0) n_keep = 32 + __ffs(dmask1) - 1;
     }
-    // temperature, then one Philox draw
-    float smx = sel_logit[0] * inv_t;
-    for (int i = 1; i < n_keep; ++i) smx = fmaxf(smx, sel_logit[i] * inv_t);
-    for (int i = lane; i < n_keep; i += 32) ex[i] = exp((double) (sel_logit[i] * inv_t) - (double) smx);
-    __syncwarp();
-    double sum = 0.0;
-    if (lane == 0)
-        for (int i = 0; i < n_keep; ++i) sum += ex[i];
-    sum = __shfl_sync(kFullMask, sum, 0);
-    __syncwarp();
-    for (int i = lane; i < n_keep; i += 32) ex[i] = ex[i] / sum;
-    __syncwarp();
-    if (lane == 0) {
-        int pi = n_keep > 0 ? n_keep - 1 : 0;
-        int pick = sel_ids[pi];
-        if (p.gumbel) {
-            double best = -1.0;
-            for (int i = 0; i < n_keep; ++i) {
-                const int id = sub_to_id != nullptr ? sub_to_id[sel_ids[i]] : sel_ids[i];
-                const double r = ex[i] / gumbel_exp(p.seed, p.counter + (uint64_t) t, (uint32_t) id);
-                if (r > best) { best = r; pick = sel_ids[i]; pi = i; }
-            }
-        } else {
-            const float u = philox_uniform(p.seed, p.counter + (uint64_t) t);
-            double cum = 0.0;
-            for (int i = 0; i < n_keep; ++i) {
-                cum += ex[i];
-                if ((double) u < cum) { pick = sel_ids[i]; pi = i; break; }
+
+    // 5. Temperature Scaling & Final Selection
+    const float sl0 = (lane < n_keep) ? (l0 * inv_t) : -1e30f;
+    const float sl1 = (lane + 32 < n_keep) ? (l1 * inv_t) : -1e30f;
+    float s_max = fmaxf(sl0, sl1);
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        s_max = fmaxf(s_max, __shfl_xor_sync(0xFFFFFFFFu, s_max, mask));
+    }
+
+    float sp0 = 0.0f, sp1 = 0.0f;
+    if (inv_t > 20.0f) {
+        const double de0 = (lane < n_keep) ? exp((double) sl0 - (double) s_max) : 0.0;
+        const double de1 = (lane + 32 < n_keep) ? exp((double) sl1 - (double) s_max) : 0.0;
+        double d_sum = de0 + de1;
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            d_sum += __shfl_xor_sync(0xFFFFFFFFu, d_sum, mask);
+        }
+        const double d_inv = (d_sum > 0.0) ? (1.0 / d_sum) : 0.0;
+        sp0 = (float) (de0 * d_inv);
+        sp1 = (float) (de1 * d_inv);
+    } else {
+        const float se0 = (lane < n_keep) ? expf(sl0 - s_max) : 0.0f;
+        const float se1 = (lane + 32 < n_keep) ? expf(sl1 - s_max) : 0.0f;
+        float s_sum = se0 + se1;
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            s_sum += __shfl_xor_sync(0xFFFFFFFFu, s_sum, mask);
+        }
+        const float s_inv = (s_sum > 0.0f) ? (1.0f / s_sum) : 0.0f;
+        sp0 = se0 * s_inv;
+        sp1 = se1 * s_inv;
+    }
+
+    if (p.gumbel) {
+        const int id_t0 = (sub_to_id != nullptr && lane < n_keep) ? sub_to_id[id0] : id0;
+        const int id_t1 = (sub_to_id != nullptr && lane + 32 < n_keep) ? sub_to_id[id1] : id1;
+        const float r0 = (lane < n_keep) ? (sp0 / gumbel_exp(p.seed, p.counter + (uint64_t) t, (uint32_t) id_t0)) : -1.0f;
+        const float r1 = (lane + 32 < n_keep) ? (sp1 / gumbel_exp(p.seed, p.counter + (uint64_t) t, (uint32_t) id_t1)) : -1.0f;
+        float best_r = fmaxf(r0, r1);
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            best_r = fmaxf(best_r, __shfl_xor_sync(0xFFFFFFFFu, best_r, mask));
+        }
+        const bool win0 = (lane < n_keep) && (r0 == best_r);
+        const bool win1 = (lane + 32 < n_keep) && (r1 == best_r);
+        const unsigned wmask0 = __ballot_sync(0xFFFFFFFFu, win0);
+        const unsigned wmask1 = __ballot_sync(0xFFFFFFFFu, win1);
+        int win = 0;
+        if (wmask0 != 0) win = __ffs(wmask0) - 1;
+        else if (wmask1 != 0) win = 32 + __ffs(wmask1) - 1;
+        if (lane == (win & 31)) {
+            const int s = (win < 32) ? id0 : id1;
+            out[t] = s;
+            if constexpr (kProb) {
+                if (prob_out != nullptr) *prob_out = (n_keep > 0) ? (float)((win < 32) ? sp0 : sp1) : 1.0f;
             }
         }
-        out[t] = pick;
-        if constexpr (kProb) *prob_out = n_keep > 0 ? (float) ex[pi] : 1.0f;
+        return;
+    }
+
+    float qscan0 = sp0;
+    #pragma unroll
+    for (int offset = 1; offset < 32; offset <<= 1) {
+        const float val = __shfl_up_sync(0xFFFFFFFFu, qscan0, offset);
+        if (lane >= offset) qscan0 += val;
+    }
+    const float qtotal0 = __shfl_sync(0xFFFFFFFFu, qscan0, 31);
+    float qscan1 = sp1;
+    #pragma unroll
+    for (int offset = 1; offset < 32; offset <<= 1) {
+        const float val = __shfl_up_sync(0xFFFFFFFFu, qscan1, offset);
+        if (lane >= offset) qscan1 += val;
+    }
+    qscan1 += qtotal0;
+
+    const float u = philox_uniform(p.seed, p.counter + (uint64_t) t);
+    const bool pick0 = (lane < n_keep) && (qscan0 > u);
+    const bool pick1 = (lane + 32 < n_keep) && (qscan1 > u);
+    const unsigned pmask0 = __ballot_sync(0xFFFFFFFFu, pick0);
+    const unsigned pmask1 = __ballot_sync(0xFFFFFFFFu, pick1);
+
+    int win = 0;
+    if (pmask0 != 0) win = __ffs(pmask0) - 1;
+    else if (pmask1 != 0) win = 32 + __ffs(pmask1) - 1;
+    else win = (n_keep > 0) ? (n_keep - 1) : 0;
+
+    if (lane == (win & 31)) {
+        const int s = (win < 32) ? id0 : id1;
+        out[t] = s;
+        if constexpr (kProb) {
+            if (prob_out != nullptr) {
+                *prob_out = (n_keep > 0) ? (float)((win < 32) ? sp0 : sp1) : 1.0f;
+            }
+        }
     }
 }
 
@@ -629,7 +738,7 @@ sampler_one_block_kernel(const float* __restrict__ logits, int n_vocab, const in
         prev_i = sel_ids[i];
     }
     if (warp != 0) return;
-    sampled_tail_warp(sel_ids, sel_logit, k, p, t, out, ex);
+    sampled_tail_warp(sel_ids, sel_logit, k, p, t, out);
 }
 
 // ---- THE SPLIT top_k.  `sampler_kernel` and the one-block kernel keep a row on ONE SM of 170 (5090) and walk its
@@ -694,7 +803,7 @@ __device__ __forceinline__ void warp_merge_lists(const int2* lists, int nl, int 
 /// and runs `k` warp-argmax rounds over them with the threshold of `sampler_one_block_kernel` - no shared memory
 /// and no block barrier per round.  Warp 0 then merges the four warp lists into the block's list in `cand`
 /// (row-major: row t, block b, entry i at `(t * n_blocks + b) * k + i`, as (id, value bits)).
-__global__ void __launch_bounds__(kSplitWarps * 32)
+__global__ void __launch_bounds__(kSplitWarps * 32, 4)
 sampler_split_part_kernel(const float* __restrict__ logits, int n_vocab, const int* __restrict__ history,
                           int history_len, const SamplerParams p, int k, int n_blocks, int2* __restrict__ cand) {
     const int t = blockIdx.y;
@@ -745,6 +854,8 @@ sampler_split_part_kernel(const float* __restrict__ logits, int n_vocab, const i
     __shared__ int2 wl[kSplitWarps][kSelMax];
     float prev_v = __int_as_float(0x7f800000);   // +inf and id -1: round 0 takes every logit
     int prev_i = -1;
+    float min_p_cut = __int_as_float(0xff800000);
+    const bool use_min_p_prune = (p.min_p > 0.0f && p.min_p <= 1.0f && p.top_p >= 1.0f && p.min_keep <= 1);
     int i = 0;
     for (; i < k; ++i) {
         // two chains (even and odd j), each walked in ascending id with a strict `>`, so each keeps its first in
@@ -761,6 +872,8 @@ sampler_split_part_kernel(const float* __restrict__ logits, int n_vocab, const i
         take_first(b0, i0, b1, i1);
         warp_first(b0, i0);
         if (i0 >= n_vocab) break;                // the same in every lane: nothing left in these 1,024 logits
+        if (i == 0 && use_min_p_prune) min_p_cut = b0 + logf(p.min_p);
+        if (i > 0 && use_min_p_prune && b0 < min_p_cut) break;
         if (lane == 0) wl[warp][i] = make_int2(i0, __float_as_int(b0));
         prev_v = b0;
         prev_i = i0;
@@ -777,7 +890,7 @@ sampler_split_part_kernel(const float* __restrict__ logits, int n_vocab, const i
 
 /// **SPLIT STAGE 2: ONE WARP PER ROW MERGES THE BLOCK LISTS, THEN RUNS THE TAIL.**  The row's lists (at most 64 x
 /// 64 entries, 32 KB) are copied to shared memory, merged into the row's top_k list, and `sampled_tail_warp` picks.
-__global__ void __launch_bounds__(32)
+__global__ void __launch_bounds__(32, 3)
 sampler_split_merge_kernel(const int2* __restrict__ cand, int n_blocks, int n_vocab, const SamplerParams p, int k,
                            int* __restrict__ out) {
     const int t = blockIdx.x;
@@ -793,7 +906,7 @@ sampler_split_merge_kernel(const int2* __restrict__ cand, int n_blocks, int n_vo
         if (lane == 0) { sel_ids[i] = id < n_vocab ? id : 0; sel_logit[i] = v; }
     });
     __syncwarp();
-    sampled_tail_warp(sel_ids, sel_logit, k, p, t, out, ex);
+    sampled_tail_warp(sel_ids, sel_logit, k, p, t, out);
 }
 
 // ---- COUPLED DRAFT SAMPLING (include/strata/core/coupled_draft.hpp): the MTP draft layer samples its draft with the
@@ -845,7 +958,7 @@ __global__ void coupled_penalize_kernel(float* __restrict__ logits, int nv, cons
 /// The merge of `sampler_split_merge_kernel` (lists of `kpart` entries, the request's top_k taken from them), then
 /// `sampled_tail_warp` with the counter of the row that will verify this draft.  Lane 0 maps the pick to its token
 /// id, writes it and its probability, and appends it to the ring for the next draft's penalty window.
-__global__ void __launch_bounds__(32)
+__global__ void __launch_bounds__(32, 3)
 coupled_merge_kernel(const int2* __restrict__ cand, int n_blocks, int nv, int kpart,
                      const SamplerParams* __restrict__ dp, const int* __restrict__ step_rec,
                      const int* __restrict__ sub_to_id, int* __restrict__ ring, int cap, int j, int* __restrict__ out_id,
@@ -869,7 +982,7 @@ coupled_merge_kernel(const int2* __restrict__ cand, int n_blocks, int nv, int kp
     if (p.greedy || p.temperature <= 0.0f) {   // never launched for greedy requests; the argmax, defensively
         if (lane == 0) { pick[0] = sel_ids[0]; prob[0] = 1.0f; }
     } else {
-        sampled_tail_warp<true>(sel_ids, sel_logit, k, p, 0, pick, ex, prob, sub_to_id);
+        sampled_tail_warp<true>(sel_ids, sel_logit, k, p, 0, pick, prob, sub_to_id);
     }
     __syncwarp();
     if (lane == 0) {
@@ -1208,6 +1321,66 @@ int2* split_scratch(void* stream, size_t entries) {
 
 }  // namespace
 
+constexpr int kGreedySplitCtas = 64;
+
+__global__ void __launch_bounds__(256) sampler_greedy_split_part_kernel(const float* __restrict__ logits, int n_vocab,
+                                                                        int2* __restrict__ cand) {
+    __shared__ float sv[8];
+    __shared__ int si[8];
+    const int t = (int) blockIdx.y;
+    const float* l = logits + (size_t) t * n_vocab;
+    float bv = __int_as_float(0xff800000);
+    int best = n_vocab;
+    const int stride = kGreedySplitCtas * 256;
+    for (int v = (int) blockIdx.x * 256 + (int) threadIdx.x; v < n_vocab; v += stride) {
+        const float x = l[v];
+        if (x > bv) { bv = x; best = v; }
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        const float ov = __shfl_down_sync(0xFFFFFFFFu, bv, off);
+        const int oi = __shfl_down_sync(0xFFFFFFFFu, best, off);
+        if (ov > bv || (ov == bv && oi < best)) { bv = ov; best = oi; }
+    }
+    const int warp = (int) (threadIdx.x >> 5), lane = (int) (threadIdx.x & 31);
+    if (lane == 0) { sv[warp] = bv; si[warp] = best; }
+    __syncthreads();
+    if (warp == 0) {
+        bv = (lane < 8) ? sv[lane] : __int_as_float(0xff800000);
+        best = (lane < 8) ? si[lane] : n_vocab;
+        for (int off = 4; off > 0; off >>= 1) {
+            const float ov = __shfl_down_sync(0xFFFFFFFFu, bv, off);
+            const int oi = __shfl_down_sync(0xFFFFFFFFu, best, off);
+            if (ov > bv || (ov == bv && oi < best)) { bv = ov; best = oi; }
+        }
+        if (lane == 0) cand[(size_t) t * kGreedySplitCtas + blockIdx.x] = make_int2(best, __float_as_int(bv));
+    }
+}
+
+__global__ void __launch_bounds__(64) sampler_greedy_split_merge_kernel(const int2* __restrict__ cand, int n_vocab,
+                                                                        int* __restrict__ out) {
+    __shared__ float sv[2];
+    __shared__ int si[2];
+    const int t = (int) blockIdx.x;
+    const int tid = (int) threadIdx.x;
+    const int2 c = cand[(size_t) t * kGreedySplitCtas + tid];
+    int best = c.x;
+    float bv = __int_as_float(c.y);
+    for (int off = 16; off > 0; off >>= 1) {
+        const float ov = __shfl_down_sync(0xFFFFFFFFu, bv, off);
+        const int oi = __shfl_down_sync(0xFFFFFFFFu, best, off);
+        if (ov > bv || (ov == bv && oi < best)) { bv = ov; best = oi; }
+    }
+    const int warp = tid >> 5, lane = tid & 31;
+    if (lane == 0) { sv[warp] = bv; si[warp] = best; }
+    __syncthreads();
+    if (tid == 0) {
+        float bv0 = sv[0]; int best0 = si[0];
+        const float bv1 = sv[1]; const int best1 = si[1];
+        if (bv1 > bv0 || (bv1 == bv0 && best1 < best0)) { bv0 = bv1; best0 = best1; }
+        out[t] = (best0 < n_vocab) ? best0 : 0;
+    }
+}
+
 bool sample_greedy_cluster(const float* logits, int n_tokens, int n_vocab, int* out, void* stream) {
 #if defined(__HIPCC__)
     (void) logits; (void) n_tokens; (void) n_vocab; (void) out; (void) stream;
@@ -1279,7 +1452,21 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
         }();
         // One block per token, 1,024 threads over the vocabulary.  See `sampler_greedy_kernel`.
         const int gthreads = 1024;
-        if (!(multi && shmem == 0 && !p.logit_bias && sample_greedy_cluster(logits, n_tokens, n_vocab, out, stream)))
+        bool launched_multi = false;
+        if (multi && shmem == 0 && !p.logit_bias) {
+            launched_multi = sample_greedy_cluster(logits, n_tokens, n_vocab, out, stream);
+            if (!launched_multi && n_tokens <= 16 && !stream_capturing(stream)) {
+                int2* scratch = split_scratch(stream, (size_t) 16 * kSplitMaxBlocks * kSelMax);
+                if (scratch != nullptr) {
+                    sampler_greedy_split_part_kernel<<<dim3(kGreedySplitCtas, (unsigned) n_tokens), 256, 0,
+                                                       (cudaStream_t) stream>>>(logits, n_vocab, scratch);
+                    sampler_greedy_split_merge_kernel<<<(unsigned) n_tokens, 64, 0, (cudaStream_t) stream>>>(
+                        scratch, n_vocab, out);
+                    launched_multi = true;
+                }
+            }
+        }
+        if (!launched_multi)
             sampler_greedy_kernel<<<(unsigned) n_tokens, gthreads, shmem, (cudaStream_t) stream>>>(
                 logits, n_vocab, history, history_len, p, p.penalty_last_n, p.penalty_last_n, out);
     } else if (sampled_path() == SampledPath::Old) {

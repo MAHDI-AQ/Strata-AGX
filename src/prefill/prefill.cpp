@@ -113,6 +113,7 @@ bool ple_batch_enabled() {
 }  // namespace
 #include "strata/core/defaults_026.hpp"
 #include "strata/prefill/kernels.hpp"
+#include "strata/kernels/cuda/handoff_fp8.cuh"
 #include "strata/prefill/kva.hpp"   // STRATA_KVA: the optional approximate-prefill plan (research, off by default)
 
 #include <cuda_runtime.h>
@@ -699,6 +700,12 @@ std::atomic<bool> g_cpu_pool_busy{false};
 // STRATA_PREFILL_CPU_SHARE_BATCH: a slot is decoding beside this read (Prefill::set_share_blocked): the pool is its windows'
 std::atomic<bool> g_share_blocked{false};
 double g_pinned_share = 1.0;
+bool g_resident_experts_only = false;
+bool g_slim_workspace = false;
+inline bool j1_env_flag(const char* name) {
+    const char* v = std::getenv(name);
+    return v != nullptr && v[0] == '1';
+}
 // The streamed ring: 384 slots when (nearly) every streamed expert is DMA'd from pinned RAM - measured on Q2_0,
 // 8192-token chunks: 96 slots 1153 tok/s, 384 1294 (the next layer's experts arrive during its attention half) -
 // and 96 when a large share goes through host copies (IQ3_S on 64 GB, a third unpinned: 96 slots 1216, 256 1070 -
@@ -779,7 +786,7 @@ inline uint64_t ring_bytes() {
 // (RTX 3060, IQ3_XXS: chunk 6400 -> 6656, prompt +3.9%), with other rounding in the prompt path.
 inline bool emb_reuse_account() {
     static const bool on = [] { const char* v = std::getenv("STRATA_EMB_REUSE_ACCOUNT"); return v != nullptr && v[0] == '1'; }();
-    return on;
+    return on || Prefill::slim_workspace();
 }
 inline bool ring_bytes_on() {
     static const bool on = [] { const char* v = std::getenv("STRATA_RING_BYTES"); return v == nullptr || v[0] != '0'; }();
@@ -792,6 +799,7 @@ inline int ring_budget_slots() {
     return (int) (n <= 0 ? 0 : (n > cap ? cap : n));
 }
 inline int ring_slots(size_t T) {
+    if (Prefill::resident_experts_only()) return 0;
     const char* v = std::getenv("STRATA_PREFILL_RING");
 #if defined(STRATA_USE_HIP)
     // S6: with the matrix-core attention (the gfx12 default since 148-amd; STRATA_HIP_WMMA=1 or auto elsewhere / forced, on a card that
@@ -830,7 +838,7 @@ inline int ring_slots(size_t T) {
 }
 // The staging buffers a layout holds: the ring, and at least STAGE_GRP for the staged walk's grouped gather.  Counted
 // and taken through this one place, so the bytes the prompt path borrows cover every buffer it writes.
-inline int stage_slots(size_t T) { return std::max(ring_slots(T), STAGE_GRP); }
+inline int stage_slots(size_t T) { return Prefill::resident_experts_only() ? 0 : std::max(ring_slots(T), STAGE_GRP); }
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
 // The BF16-weight projections (hyper-connection, SSM alpha/beta, indexer, router, shared gate, PLE key/value) take
 // BF16 activations here and FP32 ones in decode. STRATA_PREFILL_BF16X2=1 adds each activation's BF16 remainder as a
@@ -875,7 +883,14 @@ static void handoff_piece(int64_t T, int P, int i, int64_t& r0, int64_t& nr) {
 // (STRATA_HANDOFF_PIPE_WORKER=0: a thread per chunk again, for an A/B of the two halves.)
 static bool handoff_pipe_worker() {
     static const bool v = [] { const char* e = std::getenv("STRATA_HANDOFF_PIPE_WORKER"); return !e || std::atoi(e) != 0; }();
-    return handoff_pipe_pieces() > 0 && v;
+    const bool fp8_async = Prefill::slim_workspace() && j1_env_flag("STRATA_HANDOFF_FP8");
+    return (handoff_pipe_pieces() > 0 || fp8_async) && v;
+}
+// STRATA_HANDOFF_FP8_ASYNC=1: the FP8 hand-off D2H runs on a side stream and the next stage waits on its
+// event. Any other value, including unset, keeps the producer's cudaStreamSynchronize.
+static bool handoff_fp8_async_on() {
+    const char* e = std::getenv("STRATA_HANDOFF_FP8_ASYNC");
+    return e != nullptr && e[0] == '1' && e[1] == '\0';
 }
 struct HandWorker {
     std::mutex mu;
@@ -1007,6 +1022,14 @@ constexpr int64_t ZV_PAD = 64;
 inline bool gr_unfused() {
     static const bool v = [] { const char* e = std::getenv("STRATA_GR_UNFUSED"); return e && e[0] == '1'; }();
     return v;
+}
+
+// PF-1a: the norm/mix producers compute their image's amax only when Gemm::fp8 will consume it under this gate.
+// Default 0: the producers get nullptr, so nothing is memset, reduced or counted, and fp8 takes its x16_amax_kernel
+// exactly as before (the parity test switches it per call; a process reads it once).
+inline bool pf8_fused_amax() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_PF_FP8_FUSED_AMAX"); return e && e[0] == '1'; }();
+    return on;
 }
 
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
@@ -1507,6 +1530,12 @@ struct Prefill::Impl {
     uint16_t *xn16 = nullptr, *lo16 = nullptr;
     float* mixed = nullptr;
     uint16_t *mixed_bf = nullptr, *mixed_h = nullptr;
+    // PF-1a (STRATA_PF_FP8_FUSED_AMAX=1): one amax per activation image the FP8 GEMMs scale, and the block-max
+    // scratch the instrumented producers write.  PF-1a wires `mixed` (mixed_h, the norm/mix producers below); the
+    // other three keep their producers on x16_amax_kernel's fallback for now.
+    float *amax_mixed = nullptr, *amax_y = nullptr, *amax_attn = nullptr, *amax_sh = nullptr;
+    float* pf8_block_max = nullptr;
+    int64_t pf8_block_max_n = 0;
     bool f16_io = false;   // HIP, STRATA_HIP_PROMPT_F16=1: this stage's 16-bit GEMMs run FP16 in and out (set in init)
     bool xn_f16 = false;   // Turing, BF16 on FP16 tensor cores: xn16 written as the FP16 values the GEMM would convert
     uint16_t *xn16_lo = nullptr, *lo16_lo = nullptr, *mixed_bf_lo = nullptr;   // bf16x2(): the BF16 GEMMs' low parts
@@ -1646,11 +1675,23 @@ struct Prefill::Impl {
     // layer split: the device, and the hand-off to the next stage (two pinned chunk buffers, used in turn)
     int device = -1;
     float* hand[2] = {};
+    // Path B: FP8 hand-off compression (STRATA_HANDOFF_FP8=1)
+    strata::kernels::cuda::HandoffBufferFP8 fp8_hand[2] = {};
+    uint8_t* fp8_hand_payload_dev = nullptr;
+    float* fp8_hand_scales_dev = nullptr;
+    size_t fp8_hand_dev_payload_bytes = 0;
+    size_t fp8_hand_dev_scale_bytes = 0;
     // STRATA_HANDOFF_PIPE: per hand-off buffer, "the chunk's work is done" and one "landed" event per piece
     int hand_pieces = 0;
     cudaEvent_t hand_done[2] = {};
     cudaEvent_t hand_ev[2][kHandPiecesMax] = {};
     std::unique_ptr<HandWorker> hand_worker;   // STRATA_HANDOFF_PIPE: the next stage's chunks' thread (lazily)
+    // STRATA_HANDOFF_FP8_ASYNC=1. Off: these stay null and the producer synchronizes m.cs.
+    // fp8_ready[b] is "pinned host buffer b is visible to the next stage".
+    cudaStream_t fp8_side = nullptr;
+    cudaEvent_t fp8_pack_done = nullptr;
+    cudaEvent_t fp8_ready[2] = {};
+    bool fp8_side_used = false;
     // C-4: the chunk's token ids on the device, for one batched embedding gather
     int32_t* tok_dev = nullptr;
     std::vector<int32_t> tok_host;
@@ -1779,12 +1820,16 @@ void Prefill::release() {
     if (impl_->copy) cudaStreamSynchronize(impl_->copy);
     if (impl_->kv_copy) cudaStreamSynchronize(impl_->kv_copy);
     if (impl_->ple_copy) (void) cudaStreamSynchronize(impl_->ple_copy);
+    if (impl_->fp8_side) (void) cudaStreamSynchronize(impl_->fp8_side);
     for (int i = 0; i < RING_MAX; ++i) {
         if (impl_->copied[i]) cudaEventDestroy(impl_->copied[i]);
         if (impl_->used[i]) cudaEventDestroy(impl_->used[i]);
     }
     for (int b = 0; b < 2; ++b) {
         if (impl_->hand[b]) cudaFreeHost(impl_->hand[b]);
+        if (impl_->fp8_hand[b].payload) cudaFreeHost(impl_->fp8_hand[b].payload);
+        if (impl_->fp8_hand[b].scales) cudaFreeHost(impl_->fp8_hand[b].scales);
+        impl_->fp8_hand[b] = {};
         if (impl_->hand_done[b]) cudaEventDestroy(impl_->hand_done[b]);
         for (cudaEvent_t& e : impl_->hand_ev[b])
             if (e) cudaEventDestroy(e);
@@ -1799,9 +1844,15 @@ void Prefill::release() {
     if (impl_->i8_rec) cudaFree(impl_->i8_rec);
     if (impl_->kv_copy) cudaStreamDestroy(impl_->kv_copy);
     if (impl_->ple_copy) (void) cudaStreamDestroy(impl_->ple_copy);
+    if (impl_->fp8_side) (void) cudaStreamDestroy(impl_->fp8_side);
+    if (impl_->fp8_pack_done) (void) cudaEventDestroy(impl_->fp8_pack_done);
+    for (cudaEvent_t e : impl_->fp8_ready)
+        if (e) (void) cudaEventDestroy(e);
     if (impl_->ple_raw_free) (void) cudaEventDestroy(impl_->ple_raw_free);
     if (impl_->kv_released) cudaEventDestroy(impl_->kv_released);
     if (impl_->kv_ready) cudaEventDestroy(impl_->kv_ready);
+    if (impl_->fp8_hand_payload_dev) { (void) cudaFree(impl_->fp8_hand_payload_dev); impl_->fp8_hand_payload_dev = nullptr; }
+    if (impl_->fp8_hand_scales_dev) { (void) cudaFree(impl_->fp8_hand_scales_dev); impl_->fp8_hand_scales_dev = nullptr; }
     if (impl_->grp_host) cudaFreeHost(impl_->grp_host);
     if (impl_->lm.dev) cudaFree(impl_->lm.dev);
     if (impl_->lm.R_host) cudaFreeHost(impl_->lm.R_host);
@@ -2172,7 +2223,7 @@ size_t bounds_ints(int64_t n_expert) {
 // region less (the region already holds more than this set).
 bool pf_hc_region() {
     static const bool on = [] { const char* v = std::getenv("STRATA_PF_HC_REGION"); return v != nullptr && std::atoi(v) != 0; }();
-    return on && !gr_unfused();
+    return (on || Prefill::slim_workspace()) && !gr_unfused();
 }
 uint64_t hc_set_bytes(size_t T, bool f16_io) {
     Alloc a; a.count_only = true; bool ok = true;
@@ -2188,7 +2239,16 @@ uint64_t hc_set_bytes(size_t T, bool f16_io) {
 // MMQ in the same buffers, so each keeps MMQ's size for stream_all_min() - 1 tokens.  `src`: the layout streams experts
 // (Prefill::init got an ExpertSource; without one no chunk takes the streamed walk, so no chunk is fused).
 bool fused_layout(size_t T, bool src) {
-    return src && fused_ring() && mmq_plan().any && ring_slots(T) > STAGE && (int64_t) T >= stream_all_min();
+    return (src || Prefill::resident_experts_only()) && fused_ring() && mmq_plan().any &&
+           (ring_slots(T) > STAGE || Prefill::resident_experts_only()) && (int64_t) T >= stream_all_min();
+}
+inline bool need_dq_bufs(const core::ModelGeometry& g) {
+    if (!Prefill::slim_workspace() || !mmq_plan().any) return true;
+    const MmqPlan& mp = mmq_plan();
+    for (int64_t l = 0; l < g.n_layers; ++l) {
+        if ((size_t) l >= mp.layer.size() || !mp.layer[(size_t) l]) return true;
+    }
+    return false;
 }
 // The MoE buffers MMQ and the fused path share: GU and H in floats, Xq and Hq in bytes.  Without `fused` (the
 // default): MMQ's, for T tokens.
@@ -2406,13 +2466,60 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         err = "prefill: the stage's layer range is wrong";
         return false;
     }
+    if (Prefill::resident_experts_only()) {
+        if (cache == nullptr || host_res == nullptr) {
+            err = "prefill: --resident-experts-only requires a resident expert cache";
+            return false;
+        }
+        for (int64_t l = stage_lb_; l < stage_le_; ++l) {
+            for (int64_t e = 0; e < g.n_expert; ++e) {
+                if (host_res[(size_t) l * (size_t) g.n_expert + (size_t) e] < 0) {
+                    err = "prefill: --resident-experts-only requires 100% resident experts (miss at layer " +
+                          std::to_string(l) + " expert " + std::to_string(e) + ")";
+                    return false;
+                }
+            }
+        }
+    }
     // the CPU share's staged-chunk limit, before the ring is sized below (a caller that sizes loans first armed it)
-    arm_cpu_share(cpu_pool_ != nullptr);
-    for (int b = 0; next_ != nullptr && b < 2; ++b)
+    arm_cpu_share(cpu_pool_ != nullptr && !Prefill::resident_experts_only());
+    const bool use_fp8_handoff_init = (std::getenv("STRATA_HANDOFF_FP8") != nullptr &&
+                                       std::getenv("STRATA_HANDOFF_FP8")[0] == '1');
+    const bool skip_fp32_hand = Prefill::slim_workspace() && use_fp8_handoff_init;
+    for (int b = 0; !skip_fp32_hand && next_ != nullptr && b < 2; ++b)
         if (!m.hand[b] && cudaHostAlloc((void**) &m.hand[b], (size_t) chunk * D * 4, cudaHostAllocPortable) != cudaSuccess) {
             err = "prefill: the layer split's hand-off buffers";
             return false;
         }
+    if (use_fp8_handoff_init) {
+        for (int b = 0; next_ != nullptr && b < 2; ++b) {
+            size_t p_bytes = (size_t) chunk * strata::kernels::cuda::kHandoffFP8StrideBytes;
+            size_t s_bytes = (size_t) chunk * strata::kernels::cuda::kHandoffBlocksPerToken * sizeof(float);
+            if (!m.fp8_hand[b].payload &&
+                (cudaHostAlloc((void**) &m.fp8_hand[b].payload, p_bytes, cudaHostAllocPortable) != cudaSuccess ||
+                 cudaHostAlloc((void**) &m.fp8_hand[b].scales, s_bytes, cudaHostAllocPortable) != cudaSuccess)) {
+                err = "prefill: the layer split's FP8 hand-off host buffers";
+                return false;
+            }
+            m.fp8_hand[b].payload_bytes = p_bytes;
+            m.fp8_hand[b].scale_bytes = s_bytes;
+            m.fp8_hand[b].total_bytes = p_bytes + s_bytes;
+        }
+        if (next_ != nullptr || stage_lb_ > 0) {
+            size_t p_bytes = (size_t) chunk * strata::kernels::cuda::kHandoffFP8StrideBytes;
+            size_t s_bytes = (size_t) chunk * strata::kernels::cuda::kHandoffBlocksPerToken * sizeof(float);
+            if (!m.fp8_hand_payload_dev && cudaMalloc((void**) &m.fp8_hand_payload_dev, p_bytes) != cudaSuccess) {
+                err = "prefill: the layer split's FP8 hand-off device payload buffer";
+                return false;
+            }
+            if (!m.fp8_hand_scales_dev && cudaMalloc((void**) &m.fp8_hand_scales_dev, s_bytes) != cudaSuccess) {
+                err = "prefill: the layer split's FP8 hand-off device scales buffer";
+                return false;
+            }
+            m.fp8_hand_dev_payload_bytes = p_bytes;
+            m.fp8_hand_dev_scale_bytes = s_bytes;
+        }
+    }
     if (next_ != nullptr && handoff_pipe_pieces() > 0 && m.hand_pieces == 0) {   // events only: no device memory
         bool ok = true;
         auto make = [](cudaEvent_t& e) { return e != nullptr || cudaEventCreateWithFlags(&e, cudaEventDisableTiming) == cudaSuccess; };
@@ -2439,11 +2546,12 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     m.borrow_spill = m.borrowed && borrow_spill;
     bool ok = true;
     // one-time: events, the stager, the host buffers (for the largest chunk), the identity page table
-    for (int i = 0; i < ring_cap(); ++i) {
-        if (cudaEventCreateWithFlags(&m.copied[i], cudaEventDisableTiming) != cudaSuccess) ok = false;
-        if (cudaEventCreateWithFlags(&m.used[i], cudaEventDisableTiming) != cudaSuccess) ok = false;
-    }
-    if (!m.stager) {
+    if (!Prefill::resident_experts_only()) {
+        for (int i = 0; i < ring_cap(); ++i) {
+            if (cudaEventCreateWithFlags(&m.copied[i], cudaEventDisableTiming) != cudaSuccess) ok = false;
+            if (cudaEventCreateWithFlags(&m.used[i], cudaEventDisableTiming) != cudaSuccess) ok = false;
+        }
+        if (!m.stager) {
         m.stager = std::make_unique<Stager>();
         const int hw = (int) std::thread::hardware_concurrency();
         const char* stv = std::getenv("STRATA_STAGER_THREADS");   // D-5: the host copy threads of unpinned blobs
@@ -2476,9 +2584,10 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         }
         if (!m.stager->init((size_t) MAXBLOB(), threads)) ok = false;
         m.stager->batch = std::min(m.stager->batch, m.stager->kRing);
+        }
     }
-    pf_mark("init: stager ring (pinned host buffers)", tr_last, (uint64_t) m.stager->kRing * (uint64_t) MAXBLOB());
-    if (!m.warmer && src != nullptr && src->warms()) {
+    pf_mark("init: stager ring (pinned host buffers)", tr_last, m.stager ? (uint64_t) m.stager->kRing * (uint64_t) MAXBLOB() : 0);
+    if (!Prefill::resident_experts_only() && !m.warmer && src != nullptr && src->warms()) {
         const char* wv = std::getenv("STRATA_PREFILL_WARM");
         if (wv != nullptr && std::atoi(wv) != 0) {
             m.warmer = std::make_unique<PrefillWarmer>(src);
@@ -2606,7 +2715,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         uint16_t* gs = o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
         void* ws = o.take<uint8_t>(GEMM_WS, ok);
         // STRATA_DEQUANT_SIDE: the second dequant scratch (counted by bytes_needed_impl, retaken by relayout)
-        uint16_t* gs2 = gemm_dequant_side() ? o.take<uint16_t>((size_t) GEMM_SCRATCH, ok) : nullptr;
+        const bool use_dequant_side = gemm_dequant_side() && !Prefill::slim_workspace();
+        uint16_t* gs2 = use_dequant_side ? o.take<uint16_t>((size_t) GEMM_SCRATCH, ok) : nullptr;
         if (!ok) { err = "prefill: GEMM scratch does not fit"; return false; }
         if (!m.gemm.init_external(stream, gs, GEMM_SCRATCH, ws, GEMM_WS, err)) return false;
         { std::string side_err; if (!m.gemm.set_dequant_side(gs2, side_err)) std::fprintf(stderr, "prefill: STRATA_DEQUANT_SIDE=1 not taken (%s): the dense weights are dequantized in front of their GEMMs\n", side_err.c_str()); }
@@ -2641,6 +2751,14 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
                      (long long) (Prefill::bytes_needed(g, ss, chunk, src != nullptr) >> 20), (long long) (o.used >> 20));
     { int wd = 0; if (cudaGetDevice(&wd) == cudaSuccess) warm_gemm_libraries(wd); else (void) cudaGetLastError(); }
     pf_mark("init: warm_gemm_libraries (BLAS handles, workspaces)", tr_last);
+    if (Prefill::slim_workspace()) {
+        if (static bool slim_said = false; !slim_said) {
+            slim_said = true;
+            std::fprintf(stderr, "strata prefill: --prefill-slim-workspace active (emb_reuse_account=1, "
+                                 "pf_hc_region=1, dequant_side=0, need_dq_bufs=%d, skip_fp32_hand=%d)\n",
+                         need_dq_bufs(g) ? 1 : 0, skip_fp32_hand ? 1 : 0);
+        }
+    }
     return true;
 }
 
@@ -2663,6 +2781,15 @@ bool Prefill::carve(size_t T, void* alloc) {
     m.inj = o.take<float>(T * HC, ok);
     m.mixed = o.take<float>(T * N, ok); m.mixed_bf = o.take<uint16_t>(T * N, ok);
     m.mixed_h = o.take<uint16_t>(T * N, ok);
+    // PF-1a: the four amax slots (one float each) and the producers' per-block amax scratch (the widest producer grid
+    // is gr_mix/gr_mix_r's blocks_for(T * N); gr_upmix and the norm writers launch fewer blocks).  Only when the fused
+    // path is on, so the default layout and its byte count are exactly what they were.
+    if (pf8_fused_amax()) {
+        m.amax_mixed = o.take<float>(1, ok); m.amax_y = o.take<float>(1, ok);
+        m.amax_attn = o.take<float>(1, ok); m.amax_sh = o.take<float>(1, ok);
+        m.pf8_block_max_n = (int64_t) (((size_t) N * (size_t) T + 255) / 256);
+        m.pf8_block_max = o.take<float>((size_t) m.pf8_block_max_n, ok);
+    }
     // Embedding rows are dead after gr_broadcast on m.cs; subsequent half outputs use the same stream.
     m.bo = m.emb;
     if (!hcr && bf16x2_hc(m.f16_io)) { m.xn16_lo = o.take<uint16_t>(T * D, ok); m.lo16_lo = o.take<uint16_t>(T * LR, ok); }
@@ -2730,7 +2857,11 @@ bool Prefill::carve(size_t T, void* alloc) {
         }
         if (base == nullptr) ok = false;
     }
-    for (int i = 0; i < DQ; ++i) { m.dq_gu[i] = o.take<uint16_t>(kFF2 * kEmbd, ok); m.dq_d[i] = o.take<uint16_t>(kEmbd * kFF, ok); }
+    if (need_dq_bufs(g)) {
+        for (int i = 0; i < DQ; ++i) { m.dq_gu[i] = o.take<uint16_t>(kFF2 * kEmbd, ok); m.dq_d[i] = o.take<uint16_t>(kEmbd * kFF, ok); }
+    } else {
+        for (int i = 0; i < DQ; ++i) { m.dq_gu[i] = nullptr; m.dq_d[i] = nullptr; }
+    }
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
         const size_t ids_rows = mmq_ids_rows(T);
@@ -2832,7 +2963,8 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
     o.owned = &m.owned;
     uint16_t* gs = o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
     void* ws = o.take<uint8_t>(GEMM_WS, ok);
-    uint16_t* gs2 = gemm_dequant_side() ? o.take<uint16_t>((size_t) GEMM_SCRATCH, ok) : nullptr;   // STRATA_DEQUANT_SIDE
+    const bool use_dequant_side = gemm_dequant_side() && !Prefill::slim_workspace();
+    uint16_t* gs2 = use_dequant_side ? o.take<uint16_t>((size_t) GEMM_SCRATCH, ok) : nullptr;   // STRATA_DEQUANT_SIDE
     if (ok) m.gemm.rebind(gs, GEMM_SCRATCH, ws, GEMM_WS);
     if (ok) { std::string side_err; if (!m.gemm.set_dequant_side(gs2, side_err)) std::fprintf(stderr, "prefill: STRATA_DEQUANT_SIDE=1 not taken (%s): the dense weights are dequantized in front of their GEMMs\n", side_err.c_str()); }
     if (!ok || !carve((size_t) chunk, &o)) {
@@ -2979,8 +3111,8 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     }
     // y[rows, n_out] = x[rows, k] . w^T for a Q8_0 matrix: MMQ from the FP32 rows (bounds slot 0: rows, 1: rows*hc)
     auto proj = [&](const float* x, const uint16_t* x16, const void* w, float* y, int64_t rows, int64_t n_out,
-                    int64_t k, int slot) {
-        if (!q8) { m.gemm.native(x16, kQ8_0, w, y, rows, n_out, k); return; }
+                    int64_t k, int slot, const float* act_amax = nullptr, PrefillFp8Activation* act_ticket = nullptr) {
+        if (!q8) { m.gemm.native(x16, kQ8_0, w, y, rows, n_out, k, 0, 0.0f, 0, act_amax, false, act_ticket); return; }
         mmq::quantize(x, nullptr, xq, kQ8_0, k, k, rows, m.cs);
         mmq::Product p;
         p.w = w; p.type = kQ8_0; p.w_rows = n_out; p.w_cols = k; p.expert_bytes = mmq::matrix_bytes(kQ8_0, n_out, k);
@@ -3030,10 +3162,16 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         m.gemm.bf16(xn16, w_dn, lo, nb, LR, HCN);
         gr_silu(lo, lo16, nb, m.cs);
         m.gemm.bf16(lo16, w_up, gated, nb, HCN, LR);
-        gr_mix_r(Rm, grs, w_hn, gated, mixed, nullptr, nb, m.cs, mixed_h);
+        // PF-1a: mixed_h's amax for the FP8 K/V projections below (the block array must cover blocks_for(nb * Nn))
+        const bool amax_ok = pf8_fused_amax() && m.pf8_block_max != nullptr &&
+                             (nb * (int64_t) Nn + 255) / 256 <= m.pf8_block_max_n;
+        if (amax_ok) cudaMemsetAsync(m.amax_mixed, 0, sizeof(float), m.cs);
+        gr_mix_r(Rm, grs, w_hn, gated, mixed, nullptr, nb, m.cs, mixed_h, nullptr,
+                 amax_ok ? m.amax_mixed : nullptr, amax_ok ? m.pf8_block_max : nullptr);
         // K and V into the drafter's cache, as the prompt path's QSA layers append theirs
-        proj(mixed, mixed_h, w_k, Kc, nb, KV, Nn, 0);
-        proj(mixed, mixed_h, w_v, Vc, nb, KV, Nn, 0);
+        PrefillFp8Activation fp8_act;
+        proj(mixed, mixed_h, w_k, Kc, nb, KV, Nn, 0, amax_ok ? m.amax_mixed : nullptr, &fp8_act);
+        proj(mixed, mixed_h, w_v, Vc, nb, KV, Nn, 0, amax_ok ? m.amax_mixed : nullptr, &fp8_act);
         rms_rows(Kc, w_kn, nb * g.n_head_kv, g.head_dim, g.head_dim, EPS, m.cs);
         rope(Kc, nb, g.n_head_kv, g.head_dim, KV, c0, strata::kernels::rope_scaling(), m.cs);
         if (st.kv_rot) {   // rotated as the drafter's own decode stores them (mtp.cpp)
@@ -3397,6 +3535,10 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
 }
 
 void Prefill::set_pinned_share(double share) { g_pinned_share = share; }
+void Prefill::set_resident_experts_only(bool on) { g_resident_experts_only = on; }
+bool Prefill::resident_experts_only() { return g_resident_experts_only || j1_env_flag("STRATA_RESIDENT_EXPERTS_ONLY"); }
+void Prefill::set_slim_workspace(bool on) { g_slim_workspace = on; }
+bool Prefill::slim_workspace() { return g_slim_workspace || j1_env_flag("STRATA_PREFILL_SLIM_WORKSPACE"); }
 void Prefill::set_ring_override(int slots) { g_ring_override = slots > 0 ? slots : 0; }
 void Prefill::set_ring_budget(int slots, int64_t small_max) {
     g_ring_budget = slots > 0 ? slots : 0;
@@ -3546,7 +3688,8 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     if (owned_pages) o.granule = 2ull << 20;
     o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
     o.take<uint8_t>(GEMM_WS, ok);
-    if (gemm_dequant_side()) o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);   // STRATA_DEQUANT_SIDE: the second scratch
+    const bool use_dequant_side = gemm_dequant_side() && !Prefill::slim_workspace();
+    if (use_dequant_side) o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);   // STRATA_DEQUANT_SIDE: the second scratch
     auto f = [&](size_t n) { o.take<float>(n, ok); };
     // `carve`'s order, buffer for buffer: emb, R, xn, grs, xn16, lo, lo16, gated, inj, mixed, mixed_bf, mixed_h,
     // bo aliases emb. This counted `xn` unconditionally (carve takes it only under STRATA_GR_UNFUSED) and never counted
@@ -3563,6 +3706,8 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     const bool hcr = pf_hc_region();
     if (!hcr) { o.take<uint16_t>(T * (D + (hc_pad() ? XN_PAD : 0)), ok); f(T * LR); o.take<uint16_t>(T * LR, ok); f(T * D); }
     f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok);
+    // PF-1a: carve's four amax slots and the producers' per-block amax scratch (only when the fused path is on)
+    if (pf8_fused_amax()) { f(1); f(1); f(1); f(1); f((T * (size_t) N + 255) / 256); }
     if (!emb_reuse_account()) f(T * N);   // bo: aliases emb in carve; still counted unless STRATA_EMB_REUSE_ACCOUNT=1
     const bool f16_io = prompt_f16();   // the current device's mode (the stage's), as Prefill::init will decide it
     if (!hcr && bf16x2_hc(f16_io)) { o.take<uint16_t>(T * D, ok); o.take<uint16_t>(T * LR, ok); }
@@ -3574,7 +3719,9 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
                                        moe_set_bytes(T, g.n_expert, fused_layout(T, src), tail),
                                        hcr ? hc_set_bytes(T, f16_io) : (uint64_t) 0}), ok);
-    for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(kFF2 * kEmbd, ok); o.take<uint16_t>(kEmbd * kFF, ok); }
+    if (need_dq_bufs(g)) {
+        for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(kFF2 * kEmbd, ok); o.take<uint16_t>(kEmbd * kFF, ok); }
+    }
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
         const size_t ids_rows = mmq_ids_rows(T);
@@ -3601,6 +3748,10 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     f((size_t) strata::kernels::NG_HC_DIM);
     strata::kernels::KvHostPools stage;
     take_stage(o, ss, s, stage, ok);
+    if (owned_pages && Prefill::slim_workspace() && j1_env_flag("STRATA_HANDOFF_FP8")) {
+        o.take<uint8_t>(T * strata::kernels::cuda::kHandoffFP8StrideBytes, ok);
+        o.take<float>(T * strata::kernels::cuda::kHandoffBlocksPerToken, ok);
+    }
     return o.used + (8u << 20);   // alignment slack
 }
 
@@ -3610,6 +3761,7 @@ uint64_t Prefill::bytes_needed_no_ring(const core::ModelGeometry& g, const core:
 }
 
 int64_t Prefill::ring_default_slots() {
+    if (Prefill::resident_experts_only()) return 0;
     const int r = g_pinned_share >= 0.9 ? (fused_ring() ? 1024 : 384) : 96;
     return (int64_t) std::min(r, ring_cap());
 }
@@ -3625,6 +3777,7 @@ int64_t Prefill::ring_cap_for(int64_t old_chunk) {
 
 // the unpinned arm keeps its measured 96 (the PR's rule; the byte budget would have been ~49 slots on IQ3_S)
 int64_t Prefill::ring_max_slots() {
+    if (Prefill::resident_experts_only()) return 0;
     return g_pinned_share >= 0.9 ? (int64_t) ring_budget_slots() : (int64_t) std::min(96, ring_cap());
 }
 
@@ -3733,11 +3886,18 @@ struct ColdTrace {
     }
 };
 ColdTrace g_cold;
+// STRATA_GDN_QKVZ=1: attn_gate skips a second FP8 quantize of the activation attn_qkv just wrote.
+// Unset or 0 keeps both quantize launches.  Decode does not read this; it already quantizes once.
+bool gdn_qkvz_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_GDN_QKVZ"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
 bool native_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
-                 std::string& err, int64_t ldy = 0, int64_t ldx = 0) {
+                 std::string& err, int64_t ldy = 0, int64_t ldx = 0, const float* act_amax = nullptr,
+                 bool reuse_x8 = false, PrefillFp8Activation* act_ticket = nullptr) {
     if (!w->native_data) { err = "prefill: " + name + " has no native GGUF blocks (run with --native)"; return false; }
     const bool ct = g_cold.begin();
-    gm.native(X, w->native_type, w->native_data, Y, T, w->ne1, w->ne0, ldy, 0.0f, ldx);
+    gm.native(X, w->native_type, w->native_data, Y, T, w->ne1, w->ne0, ldy, 0.0f, ldx, act_amax, reuse_x8, act_ticket);
     if (ct) g_cold.end("native", name, T, w->ne1, w->ne0);
     return true;
 }
@@ -3980,10 +4140,38 @@ struct KvaTap {
 };
 }  // namespace
 
+// Side stream for STRATA_HANDOFF_FP8_ASYNC. False: the caller keeps today's synchronize. Events are
+// cudaEventDisableTiming; the next stage joins with cudaStreamWaitEvent, not a producer-side copy wait.
+bool Prefill::open_fp8_side(Prefill::Impl& m) {
+    if (m.fp8_side != nullptr && m.fp8_pack_done != nullptr && m.fp8_ready[0] != nullptr && m.fp8_ready[1] != nullptr)
+        return true;
+    if (m.fp8_side == nullptr &&
+        cudaStreamCreateWithFlags(&m.fp8_side, cudaStreamNonBlocking) != cudaSuccess) {
+        m.fp8_side = nullptr;
+        (void) cudaGetLastError();
+        return false;
+    }
+    auto make = [](cudaEvent_t& e) {
+        return e != nullptr || cudaEventCreateWithFlags(&e, cudaEventDisableTiming) == cudaSuccess;
+    };
+    if (!make(m.fp8_pack_done) || !make(m.fp8_ready[0]) || !make(m.fp8_ready[1])) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    static bool said = false;
+    if (!said) {
+        said = true;
+        std::fprintf(stderr, "strata prefill: FP8 hand-off D2H on a side stream (STRATA_HANDOFF_FP8_ASYNC=1); "
+                             "the next stage waits on the event\n");
+    }
+    return true;
+}
+
 bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
     err.clear();
+    const bool is_first = (hand_in_ == nullptr && fp8_hand_in_ == nullptr);
     // force_chunk is for this run only: taken before any early return can leave it to the next one
-    const int64_t forced = hand_in_ == nullptr ? std::exchange(force_chunk_, 0) : 0;
+    const int64_t forced = is_first ? std::exchange(force_chunk_, 0) : 0;
     const bool forced_single = force_single_, forced_planned = force_planned_;
     Impl& m = *impl_;
     const core::OnDevice on_device(m.device);
@@ -4018,7 +4206,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     int64_t kva_positions = 0, kva_chunks = 0;   // what actually took the approximate path (diagnostics)
     kva_floor_ = 0;   // this run's: raised below as chunks are approximated
     if (kva.capture && kva_capture.f.empty()) kva_capture.open(kva.capture_dir, kva.capture_fp32);
-    if (kva.capture && pos0 == 0 && hand_in_ == nullptr) kva_capture.begin_prompt();   // one prompt per capture
+    if (kva.capture && pos0 == 0 && is_first) kva_capture.begin_prompt();   // one prompt per capture
     if (kva_run && kva.mode == KvaConfig::Mode::Oracle && kva_oracle.f.empty())
         kva_oracle.open(kva.oracle_dir, kva.oracle_fp32);
     // The direct successor's future lives on the Prefill object. Intermediate
@@ -4064,10 +4252,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const int64_t planned_C = forced > 0 ? 0 : plan_chunk(n);
     const int64_t C = forced > 0 ? forced : planned_C > 0 ? planned_C : m.T;
     if (planned_C > 0 && C < std::min(n, m.T)) log_plan(n, C, stage_count());
-    const bool single_chunk = hand_in_ == nullptr ? (forced > 0 ? forced_single : n <= C) : single_chunk_;
+    const bool single_chunk = is_first ? (forced > 0 ? forced_single : n <= C) : single_chunk_;
     // a read the pipe chunked takes no CPU share: its chunks overlap on the stages by design, and which stage won the
     // pool would decide which experts the CPU computed (other bits) - timing, where the chunks are a function of n
-    const bool pipe_chunked = hand_in_ == nullptr ? (forced > 0 ? forced_planned : planned_C > 0 && C < std::min(n, m.T))
+    const bool pipe_chunked = is_first ? (forced > 0 ? forced_planned : planned_C > 0 && C < std::min(n, m.T))
                                                   : pipe_chunked_;
     const bool helped = single_chunk && bind_stage_helper(n);
     if (helped) std::swap(m.pp, m.help_pp);
@@ -4126,7 +4314,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     std::future<bool> ple_next;             // declared after everything it reads: an early return waits for it
     int ple_buf = 0;
 
-    if (hand_in_ == nullptr) stopped_at_ = -1;
+    if (is_first) stopped_at_ = -1;
 #if defined(STRATA_HAVE_DFLASH2)
     std::vector<int> tap_slot;
     // the taps of the layers THIS stage runs (the whole model without a split), at [row][its taps][n_embd]; on a split the callback of each stage
@@ -4149,7 +4337,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         if (should_stop && should_stop()) { err = "cancelled"; return false; }
         // the first stage: end the run before this chunk (every chunk before it is handed on; the caller's drain
         // waits for the later stages to read them)
-        if (c0 > 0 && hand_in_ == nullptr && stop_at_chunk && stop_at_chunk()) {
+        if (c0 > 0 && is_first && stop_at_chunk && stop_at_chunk()) {
             stopped_at_ = c0;
             break;
         }
@@ -4193,7 +4381,37 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         const auto tsetup = Clock::now();
         // ---- embeddings, broadcast to the four streams - or, in a later stage of a layer split, the rows the
         // previous stage handed on
-        if (hand_in_ != nullptr && hand_ev_ != nullptr) {
+        if (fp8_hand_in_ != nullptr && m.fp8_hand_payload_dev != nullptr) {
+            const size_t p_bytes = (size_t) T * strata::kernels::cuda::kHandoffFP8StrideBytes;
+            const size_t total_blocks = (size_t) T * strata::kernels::cuda::kHandoffBlocksPerToken;
+            const size_t s_bytes = total_blocks * sizeof(float);
+
+            // STRATA_HANDOFF_FP8_ASYNC: the producer did not wait. This stream waits for the side-stream D2H.
+            if (fp8_hand_ev_ != nullptr &&
+                cudaStreamWaitEvent(m.cs, reinterpret_cast<cudaEvent_t>(const_cast<void*>(fp8_hand_ev_)), 0) !=
+                    cudaSuccess) {
+                err = std::string("prefill: the layer split's FP8 hand-off wait: ") +
+                      cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            // 1. Ingest compressed buffer from host pinned memory into staging device VRAM
+            if (cudaMemcpyAsync(m.fp8_hand_payload_dev, fp8_hand_in_->payload, p_bytes,
+                                cudaMemcpyHostToDevice, m.cs) != cudaSuccess ||
+                cudaMemcpyAsync(m.fp8_hand_scales_dev, fp8_hand_in_->scales, s_bytes,
+                                cudaMemcpyHostToDevice, m.cs) != cudaSuccess) {
+                err = "prefill: the layer split's FP8 hand-off upload failed";
+                return false;
+            }
+
+            // 2. Launch unpack kernel directly into m.R on receiving GPU
+            const int64_t elems_per_tok = std::min<int64_t>(D, strata::kernels::cuda::kHandoffElemsPerToken);
+            strata::kernels::cuda::unpack_activations_mxfp8(
+                m.fp8_hand_payload_dev, m.fp8_hand_scales_dev, m.R, T,
+                elems_per_tok,
+                strata::kernels::cuda::kHandoffFP8StrideBytes,
+                m.cs
+            );
+        } else if (hand_in_ != nullptr && hand_ev_ != nullptr) {
             // STRATA_HANDOFF_PIPE: each piece's upload waits on the GPU for its download on the stage before.  The
             // stage before split the chunk it handed on (n rows); one chunk here is all of it, otherwise (a smaller
             // chunk here) every piece is waited for before the one copy.
@@ -4225,7 +4443,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
         // C-4: the whole chunk's rows in one gather (the same per-element arithmetic as the per-token path, so the
         // same bits); a chunk with picture rows, or a token outside the table, takes the per-token path
-        bool batched = hand_in_ == nullptr && m.tok_dev != nullptr;
+        bool batched = is_first && m.tok_dev != nullptr;
         const core::NativeEmbed* nemb = core::native_embed();
         const core::WeightRef* wemb = nemb ? nullptr : m.wt->find("token_embd.weight");
         if (batched && nemb == nullptr &&
@@ -4255,7 +4473,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                       (uint64_t) (wemb->ne0 / wemb->group_elems), m.emb, m.cs);
             }
         }
-        for (int64_t t = 0; hand_in_ == nullptr && !batched && t < T;) {
+        for (int64_t t = 0; is_first && !batched && t < T;) {
             const float* row = embd_rows ? embd_rows[p0 + t] : nullptr;
             if (row) {
                 // #1996: the picture's rows live in the caller's (pageable) memory.  A run of consecutive rows is
@@ -4283,7 +4501,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 ++t;
             }
         }
-        if (hand_in_ == nullptr) gr_broadcast(m.emb, m.R, T, m.cs);
+        if (is_first) gr_broadcast(m.emb, m.R, T, m.cs);
         // ---- the PLE rows of the whole chunk, one batched SSD request on a thread (see ple_gather).  A later chunk's
         // were read ahead during the previous chunk; the first chunk's are read beside layer 0 - they are needed from
         // layer 1 on, and gathering them here first left the GPU idle for the whole read (~0.4 s of a 32K prompt)
@@ -4387,7 +4605,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // k lands in ring slot k % ring); a copy is issued once the entry `ring` before it is consumed (its slot's
         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
         const strata::kernels::cpu::ExpertLayout& lay0 = strata::kernels::cpu::expert_layout();
-        const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
+        const bool res_only = Prefill::resident_experts_only();
+        const bool stream_all = !res_only && m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
+        const bool known_all = stream_all || (res_only && (int64_t) T >= stream_all_min());
         // the CPU share: this chunk takes the pool if no other stage of a layer split has it now (released at the end
         // of the chunk, after the last layer's CPU thread is joined)
         struct PoolHold {
@@ -4861,6 +5081,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 if (!hcd && !hdown && !bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
                 gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);
                 pt.mark(kPfHcUp, cs);
+                const bool pfa = pf8_fused_amax();
                 bool upmixed = false;
                 // on the FP16 prompt path (m.f16_io) lo16 holds FP16 bits (act16) and gr_upmix reads it on the FP16 matrix-core builtin (g_act_f16)
                 if (wu->q8_scale == nullptr && hc_upmix() && T >= std::max(pf_switch_min_t(), hc_upmix_min_t()) && !gr_unfused() && !m.lo16_lo && !m.mixed_bf_lo &&
@@ -4868,12 +5089,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     static int checks = [] { const char* e = std::getenv("STRATA_HC_UPMIX_CHECK"); return e ? std::atoi(e) : 0; }();
                     if (checks > 0) {   // the default pair first, kept for the comparison
                         --checks;
+                        if (pfa) cudaMemsetAsync(m.amax_mixed, 0, sizeof(float), m.cs);
                         if (!bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err)) return false;
-                        gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h);
+                        gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h,
+                                 nullptr, pfa ? m.amax_mixed : nullptr, pfa ? m.pf8_block_max : nullptr);
                         std::vector<float> ref((size_t) T * N), got((size_t) T * N);
                         cudaMemcpyAsync(ref.data(), m.mixed, ref.size() * 4, cudaMemcpyDeviceToHost, m.cs);
                         upmixed = gr_upmix(m.lo16, (const uint16_t*) wu->data, m.R, m.grs, (const float*) wn->data,
-                                           m.mixed, m.mixed_bf, m.mixed_h, T, m.cs);
+                                           m.mixed, m.mixed_bf, m.mixed_h, T, m.cs, pfa ? m.amax_mixed : nullptr,
+                                           pfa ? m.pf8_block_max : nullptr);
                         cudaMemcpyAsync(got.data(), m.mixed, got.size() * 4, cudaMemcpyDeviceToHost, m.cs);
                         cudaStreamSynchronize(m.cs);
                         double e2 = 0, r2 = 0, emax = 0;
@@ -4885,8 +5109,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                      "max |diff| %.3e (%s)\n", (long long) l, half, (long long) T,
                                      std::sqrt(e2 / std::max(r2, 1e-30)), emax, upmixed ? "upmix" : "upmix refused");
                     } else {
+                        if (pfa) cudaMemsetAsync(m.amax_mixed, 0, sizeof(float), m.cs);
                         upmixed = gr_upmix(m.lo16, (const uint16_t*) wu->data, m.R, m.grs, (const float*) wn->data,
-                                           m.mixed, m.mixed_bf, m.mixed_h, T, m.cs);
+                                           m.mixed, m.mixed_bf, m.mixed_h, T, m.cs, pfa ? m.amax_mixed : nullptr,
+                                           pfa ? m.pf8_block_max : nullptr);
                     }
                 }
                 if (!upmixed && !bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo, 0, m.cs)) return false;
@@ -4895,10 +5121,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 pt.mark(kPfHcMix, cs);
                 if (upmixed) {
                 } else if (gr_unfused()) {
-                    gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h, m.mixed_bf_lo);
+                    if (pfa) cudaMemsetAsync(m.amax_mixed, 0, sizeof(float), m.cs);
+                    gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h, m.mixed_bf_lo,
+                           pfa ? m.amax_mixed : nullptr, pfa ? m.pf8_block_max : nullptr);
                 } else {
+                    if (pfa) cudaMemsetAsync(m.amax_mixed, 0, sizeof(float), m.cs);
                     gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h,
-                             m.mixed_bf_lo);
+                             m.mixed_bf_lo, pfa ? m.amax_mixed : nullptr, pfa ? m.pf8_block_max : nullptr);
                 }
 
                 if (wd_q8.data) {   // the HC GEMMs that read the scratch are enqueued: the next user waits for them
@@ -4916,7 +5145,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfGdn, cs);
                     float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                    if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
+                    PrefillFp8Activation fp8_act;
+                    if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err, 0, 0, pfa ? m.amax_mixed : nullptr, false, &fp8_act)) return false;
                     // KVA: the gate projection feeds only the output normalization, which a state-only layer skips
                     // (STRATA_KVA_GDN_NORM=1 keeps the full recurrence as the A/B control for the state-only one)
                     static const bool kva_gdn_norm = [] {
@@ -4924,7 +5154,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         return v != nullptr && std::atoi(v) != 0;
                     }();
                     if ((!kva_state_only || kva_gdn_norm) &&
-                        !native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
+                        !native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err, 0, 0, pfa ? m.amax_mixed : nullptr, gdn_qkvz_on() && m.gemm.fp8_image_ready(), &fp8_act)) return false;
                     if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                     if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                     pt.mark(kPfGdnConv, cs);   // "gdn" is the projections in; the rest on their own lines
@@ -4946,8 +5176,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, m.cs,
                                        ld_y);
                     pt.mark(kPfGdnOut, cs);
-                    if (!kva_state_only)   // KVA: the out projection feeds only the residual write and the MoE half
+                    if (!kva_state_only) {   // KVA: the out projection feeds only the residual write and the MoE half
                         if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err, 0, ld_y)) return false;
+                    }
                     ++gdn_index;
                     if (kva_state_only) {
                         // the layer consumed no expert: its stream entries must still be released, or the issuer
@@ -4968,10 +5199,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           *wikn = need(v, "indexer.k_norm.weight", err);
                     if (!wq || !wk || !wv || !wo || !wik || !wiq || !wqn || !wkn || !wiqn || !wikn) return false;
                     pt.mark(kPfQsa, cs);
-                    if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
-                    if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err)) return false;
+                    PrefillFp8Activation fp8_act;
+                    if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err, 0, 0, pfa ? m.amax_mixed : nullptr, false, &fp8_act)) return false;
+                    if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err, 0, 0, pfa ? m.amax_mixed : nullptr, false, &fp8_act)) return false;
                     // KVA: the query projections have no consumer when only the KV/indexer state advances
-                    if (!kva_state_only && !native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
+                    if (!kva_state_only && !native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err, 0, 0, pfa ? m.amax_mixed : nullptr, false, &fp8_act)) return false;
                     pt.mark(kPfQsaIdxG, cs);   // STRATA_PREFILL_TIMING: "qsa proj" is the k, v and q projections
                     if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                     if (!kva_state_only && !bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
@@ -5385,8 +5617,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     // the shared expert and its scalar gate
                     auto shared_expert = [&]() -> bool {
-                        if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
-                        if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
+                        PrefillFp8Activation fp8_act;
+                        if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err, 0, 0, pfa ? m.amax_mixed : nullptr, false, &fp8_act)) return false;
+                        if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err, 0, 0, pfa ? m.amax_mixed : nullptr, false, &fp8_act)) return false;
                         swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs);
                         if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
                         if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
@@ -5396,7 +5629,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     };
                     // Only the router needs to finish before readback. Queue the shared expert afterwards
                     // so it can overlap CPU grouping and the routed-only path's initial expert uploads.
-                    const bool defer_shared = !stream_all && stream_ahead_enabled();
+                    const bool defer_shared = !known_all && stream_ahead_enabled();
                     if (!defer_shared && !shared_expert()) return false;
                     // #136: STRATA_PF_FUSED=1 - the Q2_0 pack's experts on the fused int8 kernels (moe_fused.hpp),
                     // grouped on the GPU: no host sync.  Only where every expert's place is known before the routing -
@@ -5433,12 +5666,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // rotated inside experts_native (fused::set_down_rotation); every other folded layer keeps MMQ
                     const bool fold_ok = had_block == 128 && ((mmq_gt == 145 && mmq_dt == 146) || (mmq_gt == 144 && mmq_dt == 144)) &&
                                          (!had_gu || m.Xr != nullptr);
-                    const bool fused_nat = (use_mmq || fused_only) && stream_all && no_peer && lay.native && ((!had_gu && !had_d) || fold_ok) &&
+                    const bool fused_nat = (use_mmq || fused_only) && known_all && no_peer && lay.native && ((!had_gu && !had_d) || fold_ok) &&
                                            fused::native_supported(mmq_gt, mmq_dt);
 #if defined(STRATA_PF_OWN_ONLY)
-                    const bool fused_l = ((use_mmq || fused_only) && stream_all && no_peer && !lay.native && fused::enabled()) || fused_nat;
+                    const bool fused_l = ((use_mmq || fused_only) && known_all && no_peer && !lay.native && fused::enabled()) || fused_nat;
 #else
-                    const bool fused_l = (use_mmq && stream_all && no_peer && !lay.native && fused::enabled()) || fused_nat;
+                    const bool fused_l = (use_mmq && known_all && no_peer && !lay.native && fused::enabled()) || fused_nat;
 #endif
                     bool dm16_used = false;   // STRATA_PF_DM16: this layer's down rows are FP16 (fused::dm_f16_used() after the experts)
                     bool fz_staged_l = false;   // P4-SMALL: this staged chunk's groups ran on the fused kernels (GU / H hold their tables and int8 rows)
@@ -5497,8 +5730,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // of which at most a third of the ring streamed: the next batch's blobs arrive while one computes.
                         // An expert the routing did not pick has no tiles; its ring slot is given back with its batch.
                         const size_t per = (size_t) std::max(1, m.ring / 3);
-                        size_t k = seq_start[(size_t) l];
-                        const size_t kend = seq_start[(size_t) l + 1];
+                        size_t k = seq_start.empty() ? 0 : seq_start[(size_t) l];
+                        const size_t kend = seq_start.empty() ? 0 : seq_start[(size_t) l + 1];
                         // STRATA_PF_BATCH=N (opt-in): experts per launch (the same rows, so the same bits; a launch is one
                         // persistent grid, so fewer launches leave fewer grid tails) - at most kMaxBatch, or up to
                         // kBatchRoom in a WideBatch on the native NT = 256 kernels (STRATA_PF_FUSED_NT=256 or _F16=1) or
@@ -6549,7 +6782,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     m.warmer->submit(l + 1, std::move(nxt));
                                 }
                             }
-                            m.stager->start(std::move(js));
+                            if (m.stager) m.stager->start(std::move(js));
                         }
                         StagerDone stager_done{stream_all ? nullptr : m.stager.get()};
                         auto stage_one = [&](size_t j) -> bool {
@@ -7215,6 +7448,104 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
         pt.mark(kPfStart, cs);
         if (next_ != nullptr) {
+            const bool use_fp8_handoff = (std::getenv("STRATA_HANDOFF_FP8") != nullptr &&
+                                          std::getenv("STRATA_HANDOFF_FP8")[0] == '1');
+            if (use_fp8_handoff && m.fp8_hand[hand_buf_].payload != nullptr && m.fp8_hand_payload_dev != nullptr) {
+                // Prompt handoff is outside the decode graph. Inside a capture, keep the synchronizing copy.
+                // The capture query runs only when the flag is exactly 1, so the default path does not touch it.
+                bool async_hand = false;
+                if (handoff_fp8_async_on()) {
+                    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+                    const bool capturing = m.cs != nullptr &&
+                        (cudaStreamIsCapturing(m.cs, &cap) != cudaSuccess || cap != cudaStreamCaptureStatusNone);
+                    async_hand = !capturing && open_fp8_side(m);
+                }
+                if (m.fp8_side_used && !async_hand) {
+                    if (cudaStreamSynchronize(m.fp8_side) != cudaSuccess) {
+                        err = std::string("prefill: the layer split's FP8 hand-off: ") +
+                              cudaGetErrorString(cudaGetLastError());
+                        return false;
+                    }
+                    m.fp8_side_used = false;
+                }
+                // The device payload is one buffer. The previous chunk's D2H still reads it until fp8_ready fires.
+                if (async_hand && m.fp8_side_used &&
+                    cudaStreamWaitEvent(m.cs, m.fp8_ready[hand_buf_ ^ 1], 0) != cudaSuccess) {
+                    err = std::string("prefill: the layer split's FP8 hand-off: ") +
+                          cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+                // 1. Pack activations on current GPU
+                const int64_t elems_per_tok = std::min<int64_t>(D, strata::kernels::cuda::kHandoffElemsPerToken);
+                strata::kernels::cuda::pack_activations_mxfp8(
+                    m.R, m.fp8_hand_payload_dev, m.fp8_hand_scales_dev, T,
+                    elems_per_tok,
+                    strata::kernels::cuda::kHandoffFP8StrideBytes,
+                    m.cs
+                );
+
+                // 2. Transfer compressed payload + scales to host pinned buffer (52.49 MB vs 209.7 MB)
+                const size_t p_bytes = (size_t) T * strata::kernels::cuda::kHandoffFP8StrideBytes;
+                const size_t total_blocks = (size_t) T * strata::kernels::cuda::kHandoffBlocksPerToken;
+                const size_t s_bytes = total_blocks * sizeof(float);
+                bool hand_ok = true;
+                if (async_hand) {
+                    // Pack stays on m.cs. The side stream waits for it, copies, and records the event the next
+                    // stage waits on. No CPU wait on that copy: the next chunk's compute overlaps the D2H.
+                    hand_ok = cudaEventRecord(m.fp8_pack_done, m.cs) == cudaSuccess &&
+                              cudaStreamWaitEvent(m.fp8_side, m.fp8_pack_done, 0) == cudaSuccess &&
+                              cudaMemcpyAsync(m.fp8_hand[hand_buf_].payload, m.fp8_hand_payload_dev, p_bytes,
+                                              cudaMemcpyDeviceToHost, m.fp8_side) == cudaSuccess &&
+                              cudaMemcpyAsync(m.fp8_hand[hand_buf_].scales, m.fp8_hand_scales_dev, s_bytes,
+                                              cudaMemcpyDeviceToHost, m.fp8_side) == cudaSuccess &&
+                              cudaEventRecord(m.fp8_ready[hand_buf_], m.fp8_side) == cudaSuccess;
+                    if (hand_ok) m.fp8_side_used = true;
+                } else if (cudaMemcpyAsync(m.fp8_hand[hand_buf_].payload, m.fp8_hand_payload_dev, p_bytes,
+                                           cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
+                           cudaMemcpyAsync(m.fp8_hand[hand_buf_].scales, m.fp8_hand_scales_dev, s_bytes,
+                                           cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
+                           cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                    hand_ok = false;
+                }
+                if (!hand_ok) {
+                    err = std::string("prefill: the layer split's FP8 hand-off: ") + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+                // on_stage_chunk saves this stage's state and requires the compute stream to have finished.
+                // The D2H is on the side stream, so this wait does not cover the copy.
+                if (async_hand && cudaEventSynchronize(m.fp8_pack_done) != cudaSuccess) {
+                    err = std::string("prefill: the layer split's FP8 hand-off: ") +
+                          cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+
+                if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
+                if (next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
+                next_err_.clear();
+                next_->fp8_hand_in_ = &m.fp8_hand[hand_buf_];
+                next_->fp8_in_tokens_ = T;
+                next_->fp8_hand_ev_ = async_hand ? static_cast<const void*>(m.fp8_ready[hand_buf_]) : nullptr;
+                next_->hand_in_ = nullptr;
+                next_->hand_ev_ = nullptr;
+                next_->hand_pieces_ = 0;
+                next_->single_chunk_ = single_chunk;
+                next_->pipe_chunked_ = pipe_chunked;
+                if (handoff_pipe_worker()) {
+                    if (!m.hand_worker) m.hand_worker = std::make_unique<HandWorker>();
+                    next_run_ = m.hand_worker->submit(std::packaged_task<bool()>([this, tokens, c0, T, p0] {
+                        const bool r = next_->run_impl(tokens + c0, T, p0, next_err_);
+                        (void) cudaGetLastError();
+                        return r;
+                    }));
+                } else {
+                    next_run_ = std::async(std::launch::async, [this, tokens, c0, T, p0] {
+                        strata::aux_cpus::pin_current_thread();
+                        return next_->run_impl(tokens + c0, T, p0, next_err_);
+                    });
+                }
+                hand_buf_ ^= 1;
+                continue;
+            }
             // The current hand-off slot was used two chunks ago.
             float* h = m.hand[hand_buf_];
             const int hp = m.hand_pieces;
@@ -7247,6 +7578,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             next_->hand_in_ = h;
             next_->hand_ev_ = hp > 0 ? static_cast<const void*>(m.hand_ev[hand_buf_]) : nullptr;
             next_->hand_pieces_ = hp;
+            next_->fp8_hand_ev_ = nullptr;
             next_->single_chunk_ = single_chunk;
             next_->pipe_chunked_ = pipe_chunked;
             if (handoff_pipe_worker()) {
@@ -7764,6 +8096,8 @@ int64_t Prefill::lm_prepare_chain(int64_t n, std::string& why) {
         if (p->next_run_.valid()) { why = "a layer split's chunk hand-off is in flight"; return 0; }
     for (Prefill* p = next_; p != nullptr; p = p->next_) {
         p->hand_in_ = nullptr;
+        p->fp8_hand_in_ = nullptr;
+        p->fp8_hand_ev_ = nullptr;
         p->hand_ev_ = nullptr;
         p->hand_pieces_ = 0;
     }
@@ -7832,7 +8166,7 @@ bool Prefill::run_multi(const std::vector<Seg>& segs, std::string& err) {
     int64_t total = 0;
     for (const Seg& sg : segs) total += sg.n;
     std::string why;
-    if (hand_in_ != nullptr || !impl_) { err = "prefill: multi-prompt read declined (chunk hand-off in use)"; return false; }
+    if (hand_in_ != nullptr || fp8_hand_in_ != nullptr || !impl_) { err = "prefill: multi-prompt read declined (chunk hand-off in use)"; return false; }
     if (!tap_layers_.empty()) { err = "prefill: multi-prompt read declined (the DFlash2 prompt taps are for one prompt)"; return false; }
     for (Prefill* q = this; q != nullptr; q = q->next_) q->lm_force_ = true;
     struct ForceOff { Prefill* h; ~ForceOff() { for (Prefill* q = h; q != nullptr; q = q->next_) q->lm_force_ = false; } } force_off{this};
@@ -8013,7 +8347,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
             }
             js.push_back({b, (size_t) lay.blob_bytes(l)});
         }
-        m.stager->start(std::move(js));
+        if (m.stager) m.stager->start(std::move(js));
         return true;
     };
     struct StagerStop {
@@ -8060,7 +8394,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
         std::vector<int> job_of(uniq.size(), -1), stage_of(uniq.size(), -1);
         for (size_t u = 0; u < uniq.size(); ++u) job_of[u] = pf_job[(size_t) uniq[u]];
         for (int32_t e = 0; e < NE; ++e)   // prefetched but not routed: not read, if not started yet
-            if (cnt[(size_t) e] == 0 && pf_job[(size_t) e] >= 0) m.stager->skip(pf_job[(size_t) e]);
+            if (cnt[(size_t) e] == 0 && pf_job[(size_t) e] >= 0 && m.stager) m.stager->skip(pf_job[(size_t) e]);
         if (!pf_on && m.src != nullptr) {   // STRATA_LM_PREFETCH=0: the routed experts only, started now
             std::vector<Stager::Job> js;
             const bool pdirect = false;   // (STRATA_PREFILL_DIRECT, #1670's other commit, is not ported)
@@ -8079,7 +8413,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                 }
                 js.push_back({b, (size_t) lay.blob_bytes(l)});
             }
-            m.stager->start(std::move(js));
+            if (m.stager) m.stager->start(std::move(js));
         }
         struct StagerDone {
             Stager* st;
@@ -8613,6 +8947,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                     }
                 }
                 bool normed = false;
+                const bool pfa = pf8_fused_amax();
                 for (int half = 0; half < 2; ++half) {
                     // ---- the hyper-connection read of this half (run_impl's)
                     const char* pre = half == 0 ? "hc_attn_" : "hc_ffn_";
@@ -8641,9 +8976,15 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                     gr_silu(m.lo, m.lo16, T, cs, m.lo16_lo);
                     if (!bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo, 0, cs)) return false;
                     if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo, 0, cs)) return false;
-                    if (gr_unfused()) gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, cs, m.mixed_h, m.mixed_bf_lo);
-                    else gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, cs, m.mixed_h,
-                                  m.mixed_bf_lo);
+                    if (gr_unfused()) {
+                        if (pfa) cudaMemsetAsync(m.amax_mixed, 0, sizeof(float), cs);
+                        gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, cs, m.mixed_h, m.mixed_bf_lo,
+                               pfa ? m.amax_mixed : nullptr, pfa ? m.pf8_block_max : nullptr);
+                    } else {
+                        if (pfa) cudaMemsetAsync(m.amax_mixed, 0, sizeof(float), cs);
+                        gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, cs, m.mixed_h,
+                                 m.mixed_bf_lo, pfa ? m.amax_mixed : nullptr, pfa ? m.pf8_block_max : nullptr);
+                    }
                     if (wd_q8.data) {   // the HC GEMMs that read the scratch are enqueued: the next user waits for them
                         core::NativeDense::hc_bf16_release(cs, 0, 0);
                         core::NativeDense::hc_bf16_release(cs, 1, 0);
@@ -8659,8 +9000,9 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                         pt.mark(kPfGdn, cs);
                         float* state = ssp->gdn_state + (size_t) (gdn_index - ssp->gdn_ord0) * gdn_floats;
                         float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                        if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
-                        if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
+                        PrefillFp8Activation fp8_act;
+                        if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err, 0, 0, pfa ? m.amax_mixed : nullptr, false, &fp8_act)) return false;
+                        if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err, 0, 0, pfa ? m.amax_mixed : nullptr, gdn_qkvz_on() && m.gemm.fp8_image_ready(), &fp8_act)) return false;
                         if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                         if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                         pt.mark(kPfGdnConv, cs);
@@ -8689,9 +9031,10 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                                               *wikn = need(v, "indexer.k_norm.weight", err);
                         if (!wq || !wk || !wv || !wo || !wik || !wiq || !wqn || !wkn || !wiqn || !wikn) return false;
                         pt.mark(kPfQsa, cs);
-                        if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
-                        if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err)) return false;
-                        if (!native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
+                        PrefillFp8Activation fp8_act;
+                        if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err, 0, 0, pfa ? m.amax_mixed : nullptr, false, &fp8_act)) return false;
+                        if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err, 0, 0, pfa ? m.amax_mixed : nullptr, false, &fp8_act)) return false;
+                        if (!native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err, 0, 0, pfa ? m.amax_mixed : nullptr, false, &fp8_act)) return false;
                         if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                         if (!bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                         if (qsa_fuse_nr()) {
@@ -8701,12 +9044,24 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                             rope(m.Kc, T, 2, 256, 512, p0, strata::kernels::rope_scaling(), cs);
                         }
                         const bool staged = st.kv_mode == 1;
-                        if (staged) {
+                        static const bool small_t_resident = [] {
+                            const char* v = std::getenv("STRATA_PREFILL_SMALL_T_RESIDENT");
+                            return v != nullptr && v[0] == '1' && v[1] == '\0';
+                        }();
+                        const bool staged_selected = small_t_resident && staged && T <= 256 &&
+                                                     p0 > st.n_slots * s.page_size;
+                        if (staged && !staged_selected) {
                             pt.mark(kPfKvStage, cs);
                             strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), st.host,
                                                                 core::qsa_kv_format(st),
                                                                 (p0 + s.page_size - 1) / s.page_size, s, cs);
                             pt.mark(kPfQsa, cs);
+                        } else if (staged_selected && (p0 % s.page_size) != 0) {
+                            // Stage ONLY the partial tail block that kv_append will update (preserving selected-block PCIe savings)
+                            const int64_t tail_blk = p0 / s.page_size;
+                            strata::kernels::kv_stage_block_from_host(pools_of(m.stage, m.ident_table), st.host,
+                                                                      core::qsa_kv_format(st),
+                                                                      tail_blk, s, cs);
                         }
 #if defined(STRATA_USE_HIP)
                         static const bool kv_host_dma = [] { const char* e = std::getenv("STRATA_KV_HOST_DMA"); return e && e[0] == '1'; }();
@@ -8790,6 +9145,13 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                             strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
                                                             m.sel_ids + q0 * m.cap, cs, active);
                         }
+                        if (staged_selected) {
+                            pt.mark(kPfKvStage, cs);
+                            strata::kernels::kv_stage_selected_from_host(pools_of(m.stage, m.ident_table), st.host,
+                                                                         core::qsa_kv_format(st), m.sel_ids, T * m.cap,
+                                                                         p0 / s.page_size, s, cs);
+                            pt.mark(kPfQsa, cs);
+                        }
                         const strata::kernels::QsaAttnPools pools = staged ? pools_of(m.stage, m.ident_table)
                                                                            : core::qsa_attn_pools(st);
                         pt.mark(kPfQsaAttn, cs);
@@ -8821,8 +9183,9 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                         pt.mark(kPfRouter, cs);
                         if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
                         route(m.logits, lb.ids + t0 * K, lb.w + t0 * K, T, m.g->n_expert, cs);
-                        if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
-                        if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
+                        PrefillFp8Activation fp8_act;
+                        if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err, 0, 0, pfa ? m.amax_mixed : nullptr, false, &fp8_act)) return false;
+                        if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err, 0, 0, pfa ? m.amax_mixed : nullptr, false, &fp8_act)) return false;
                         swiglu_pair(m.sgate, m.sup, m.sh_h, T, cs);
                         if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
                         if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }

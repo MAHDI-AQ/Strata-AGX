@@ -4,14 +4,22 @@
 #include "strata/core/progress.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <cstddef>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
+#include <iostream>
 #include <memory>
 #include <new>
 #include <utility>
 #include <vector>
+
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 
 namespace strata::core {
 
@@ -149,14 +157,56 @@ public:
 
 private:
     // value-initializes only when asked (resize's explicit fill value): resize_for_overwrite leaves the bytes alone
+    // Pins allocated Segment buffers with mlock() on Linux (LAB-R17) to prevent host swap under memory pressure.
     template<class T> struct DefaultInit : std::allocator<T> {
         template<class U> struct rebind { using other = DefaultInit<U>; };
         DefaultInit() = default;
         template<class U> DefaultInit(const DefaultInit<U>&) noexcept {}
-        T* allocate(size_t n) { return static_cast<T*>(conversation_buffer_detail::segment_alloc(n * sizeof(T))); }
-        void deallocate(T* p, size_t n) noexcept { conversation_buffer_detail::segment_free(p, n * sizeof(T)); }
         template<class U> void construct(U* p) { ::new ((void*) p) U; }
         template<class U, class... A> void construct(U* p, A&&... a) { ::new ((void*) p) U(std::forward<A>(a)...); }
+
+        T* allocate(std::size_t n) {
+            T* p = static_cast<T*>(conversation_buffer_detail::segment_alloc(n * sizeof(T)));
+#if defined(__linux__)
+            static const bool conv_no_mlock = [] {
+                const char* v = std::getenv("STRATA_CONV_NO_MLOCK");
+                return v != nullptr && v[0] == '1';
+            }();
+            if (p && n > 0 && !conv_no_mlock) {
+                if (::mlock(p, n * sizeof(T)) != 0) {
+                    static std::atomic<bool> warned{false};
+                    if (!warned.exchange(true)) {
+                        std::cerr << "[strata] warning: mlock failed for conversation segment ("
+                                  << (n * sizeof(T)) << " bytes): " << std::strerror(errno)
+                                  << " (check RLIMIT_MEMLOCK)" << std::endl;
+                    }
+                }
+            }
+#endif
+            return p;
+        }
+
+        void deallocate(T* p, std::size_t n) noexcept {
+#if defined(__linux__)
+            if (p && n > 0) {
+                static const bool conv_no_mlock = [] {
+                    const char* v = std::getenv("STRATA_CONV_NO_MLOCK");
+                    return v != nullptr && v[0] == '1';
+                }();
+                if (!conv_no_mlock) {
+                    ::munlock(p, n * sizeof(T));
+                }
+                static const bool madv_dontneed = [] {
+                    const char* v = std::getenv("STRATA_CONV_MADV_DONTNEED");
+                    return v != nullptr && v[0] == '1';
+                }();
+                if (madv_dontneed) {
+                    ::madvise(p, n * sizeof(T), MADV_DONTNEED);
+                }
+            }
+#endif
+            conversation_buffer_detail::segment_free(p, n * sizeof(T));
+        }
     };
     using Segment = std::vector<uint8_t, DefaultInit<uint8_t>>;
     // A fresh capture allocates exactly its payload. Later appends reserve

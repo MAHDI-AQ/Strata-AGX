@@ -13,31 +13,40 @@
 namespace strata::prefill {
 
 // ---- hyper-connection (n_embd 2560, hc 4, hc_lr 320)
+/// PF-1a (STRATA_PF_FP8_FUSED_AMAX=1): reduces an activation producer's per-block amax array (d_block_max, one float
+/// per block, written by gr_norm / gr_mix and the other norm/mix producers) to the scalar `d_amax`; launched after the
+/// producer on the same stream.  The scalar is what Gemm::fp8 would compute with x16_amax_kernel.
+void reduce_block_max(const float* block_max, int n, float* d_amax, void* stream);
 /// xn[t, c*2560 + d] = R[t,c,d] * rsqrt(mean_d R[t,c,:]^2 + eps) * w_norm[c*2560 + d]; also its BF16 image.
 /// `xn16_lo` (null: none) takes bf16(x - xn16): W.xn16 + W.xn16_lo is the product with ~16 mantissa bits of x.
+/// `d_amax`/`d_block_max`: the fused FP8 amax (null: not asked for); d_block_max is one float per launched block.
 void gr_norm(const float* R, const float* w_norm, float eps, float* xn, uint16_t* xn16, int64_t T, void* stream,
-             uint16_t* xn16_lo = nullptr, bool f16img = false);
+             uint16_t* xn16_lo = nullptr, bool f16img = false, float* d_amax = nullptr, float* d_block_max = nullptr);
 /// F-1: gr_norm without its FP32 output: the row scales rs[t*4 + c] and the BF16 image; gr_mix_r then reads R.
 void gr_norm_rs(const float* R, const float* w_norm, float eps, float* rs, uint16_t* xn16, int64_t T, void* stream,
-                uint16_t* xn16_lo = nullptr, int64_t ldx = 0, bool f16img = false);   // ldx: xn16's token stride (0 = 10240)
+                uint16_t* xn16_lo = nullptr, int64_t ldx = 0, bool f16img = false, float* d_amax = nullptr,
+                float* d_block_max = nullptr);   // ldx: xn16's token stride (0 = 10240)
 /// gr_mix with xn recomputed from R, rs and w_norm exactly as gr_norm computes it (the same bits).
 void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float* gated, float* mixed, uint16_t* mixed16,
-              int64_t T, void* stream, uint16_t* mixed_h = nullptr, uint16_t* mixed16_lo = nullptr);
+              int64_t T, void* stream, uint16_t* mixed_h = nullptr, uint16_t* mixed16_lo = nullptr,
+              float* d_amax = nullptr, float* d_block_max = nullptr);
 /// F-2: gr_write, then gr_norm_rs of the next half (its norm weights) over the rows just written - the same bits as
 /// the two calls, without reading R back.
 /// S23 (opt-in STRATA_HC_UPMIX=1): the up projection (lo16 x w_up^T, BF16, FP32 accumulate) with gr_mix_r as its
 /// epilogue - `gated` is never written.  gfx11 and CUDA sm_80+; false (nothing launched) elsewhere.
 bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const float* rs, const float* w_norm,
-              float* mixed, uint16_t* mixed16, uint16_t* mixed_h, int64_t T, void* stream);
+              float* mixed, uint16_t* mixed16, uint16_t* mixed_h, int64_t T, void* stream, float* d_amax = nullptr,
+              float* d_block_max = nullptr);
 void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
                       float* rs, uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo = nullptr,
-                      int64_t ldx = 0, bool f16img = false);
+                      int64_t ldx = 0, bool f16img = false, float* d_amax = nullptr, float* d_block_max = nullptr);
 /// S23 (STRATA_CVEC_FUSE=1): gr_write, then the control vector (v_l = layer l's direction row, *s_l its scale,
 /// *on the request flag, mode 0 project / 1 add; cvec_kernel's arithmetic), then gr_norm_rs with the next half's
 /// norm - one pass over R, the same bits as the three kernels.
 void gr_write_cvec_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* v_l,
                            const float* s_l, const int* on, int mode, const float* w_norm_next, float eps, float* rs,
-                           uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo = nullptr, int64_t ldx = 0, bool f16img = false);
+                           uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo = nullptr, int64_t ldx = 0,
+                           bool f16img = false, float* d_amax = nullptr, float* d_block_max = nullptr);
 /// lo16[t, k] = bf16(silu(lo[t, k] / hc))
 void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream, uint16_t* lo16_lo = nullptr);
 /// The BF16-weight GEMMs' activation image (gr_* kernels, to_bf16) in FP16 instead of BF16, on the current device.
@@ -49,7 +58,8 @@ void set_f16_range(bool on);
 bool f16_range_read(float& max_abs, unsigned long long& over, bool reset);
 /// mixed[t, d] = mean_c xn[t, c, d] * sigmoid(gated[t, c, d]); FP32, BF16 and FP16 (either image may be null).
 void gr_mix(const float* xn, const float* gated, float* mixed, uint16_t* mixed16, int64_t T, void* stream,
-            uint16_t* mixed_h = nullptr, uint16_t* mixed16_lo = nullptr);
+            uint16_t* mixed_h = nullptr, uint16_t* mixed16_lo = nullptr, float* d_amax = nullptr,
+            float* d_block_max = nullptr);
 /// R[t, c, d] += bo[t, d] * 2 sigmoid(inj[t, c] / hc)   (inj has row stride inj_ld)
 void gr_write(float* R, const float* bo, const float* inj, int64_t inj_ld, int64_t T, void* stream);
 /// R[t, c, :] = e[t, :] for all four streams (the embedding broadcast).

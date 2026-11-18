@@ -2230,14 +2230,20 @@ int il_pf_for(int type, int ncols, int n_out, int* rows) {
 template <typename I, int NC, int R, int NOUT = NC>
 void launch_il_one(unsigned blocks, const typename I::F::Block* w, const int* xq, const float* xd, float* y, int n_in, int n_out,
                    cudaStream_t s, int pf) {
-    if constexpr (I::HAS_PF && NOUT == NC) {
-        switch (pf) {
-        case 6: native_mmvq_il_pf_kernel<I, NC, R, 0, 4, false><<<blocks, 4 * WARP, 0, s>>>(w, xq, xd, y, n_in, n_out); return;
-        case 2: native_mmvq_il_pf_kernel<I, NC, R, 2, 4, true><<<blocks, 4 * WARP, 0, s>>>(w, xq, xd, y, n_in, n_out); return;
-        case 3: native_mmvq_il_pf_kernel<I, NC, R, 0, 4, true><<<blocks, 4 * WARP, 0, s>>>(w, xq, xd, y, n_in, n_out); return;
-        case 4: native_mmvq_il_pf_kernel<I, NC, R, 0, 5, true><<<blocks, 4 * WARP, 0, s>>>(w, xq, xd, y, n_in, n_out); return;
-        case 5: native_mmvq_il_pf_kernel<I, NC, R, 2, 5, true><<<blocks, 4 * WARP, 0, s>>>(w, xq, xd, y, n_in, n_out); return;
-        default: break;
+    if constexpr (I::HAS_PF && NOUT == NC && !(std::is_same_v<I, IlQ6K> && (NC >= 7 || (NC >= 5 && R > 1)))) {
+        if constexpr (std::is_same_v<I, IlQ6K> && NC >= 5) {
+            // IlQ6K at NC=5..6: R=1, DB=0, MINB=4 (STACK=0 on sm_89); NC>=7 use native_mmvq_il_kernel (STACK=0)
+            if (pf == 6) { native_mmvq_il_pf_kernel<I, NC, R, 0, 4, false><<<blocks, 4 * WARP, 0, s>>>(w, xq, xd, y, n_in, n_out); return; }
+            if (pf != 0) { native_mmvq_il_pf_kernel<I, NC, R, 0, 4, true><<<blocks, 4 * WARP, 0, s>>>(w, xq, xd, y, n_in, n_out); return; }
+        } else {
+            switch (pf) {
+            case 6: native_mmvq_il_pf_kernel<I, NC, R, 0, 4, false><<<blocks, 4 * WARP, 0, s>>>(w, xq, xd, y, n_in, n_out); return;
+            case 2: native_mmvq_il_pf_kernel<I, NC, R, 2, 4, true><<<blocks, 4 * WARP, 0, s>>>(w, xq, xd, y, n_in, n_out); return;
+            case 3: native_mmvq_il_pf_kernel<I, NC, R, 0, 4, true><<<blocks, 4 * WARP, 0, s>>>(w, xq, xd, y, n_in, n_out); return;
+            case 4: native_mmvq_il_pf_kernel<I, NC, R, 0, 5, true><<<blocks, 4 * WARP, 0, s>>>(w, xq, xd, y, n_in, n_out); return;
+            case 5: native_mmvq_il_pf_kernel<I, NC, R, 2, 5, true><<<blocks, 4 * WARP, 0, s>>>(w, xq, xd, y, n_in, n_out); return;
+            default: break;
+            }
         }
     }
     native_mmvq_il_kernel<I, NC, R, NOUT><<<blocks, 4 * WARP, 0, s>>>(w, xq, xd, y, n_in, n_out);
@@ -2286,6 +2292,9 @@ void launch_il_rows(int r, const void* weights, const void* x_il, float* y, int 
     const int pf = il_pf_for(I::F::TYPE, ncols, n_out, &pf_rows);
     if (pf_rows != 0) r = pf_rows;   // the pf table measured its rows with its kernel
     if (ncols > 4 && r == 4) r = 2;   // 5..8 columns: 1 or 2 rows a warp
+    if constexpr (std::is_same_v<I, IlQ6K>) {
+        if (ncols >= 5) r = 1;        // IlQ6K at NC >= 5: R=1 avoids register spills
+    }
     switch (r) {
     case 1: launch_il<I, 1>(weights, x_il, y, n_in, n_out, ncols, s, pf); break;
     case 4: launch_il<I, 4>(weights, x_il, y, n_in, n_out, ncols, s, pf); break;

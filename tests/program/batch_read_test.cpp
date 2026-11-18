@@ -11,6 +11,7 @@ using strata::program::ConcurrentReadSetup;
 using strata::program::piped_decode_budget_ms;
 using strata::program::piped_read_lead_in;
 using strata::program::piped_read_piece;
+using strata::program::dynamic_piped_read_piece;
 
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { std::printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
@@ -57,6 +58,16 @@ int main() {
         for (size_t j = i; j < std::size(each); ++j) s.*each[j] = true;
         CHECK(same(concurrent_read_off(s), named[i]));
     }
+    // resident_experts_only bypasses staged_source and other_source blocks, keeps others
+    {
+        ConcurrentReadSetup s;
+        s.staged_source = true;
+        s.other_source = true;
+        s.resident_experts_only = true;
+        CHECK(concurrent_read_off(s) == nullptr);
+        s.prefill_help = true;
+        CHECK(same(concurrent_read_off(s), "STRATA_PREFILL_HELP"));
+    }
     // piped_read_piece (#1906): off -> one run; whole chunks, at least one, at most 32
     CHECK(piped_read_piece(0, 8192) == 0);
     CHECK(piped_read_piece(-5, 8192) == 0);
@@ -80,6 +91,15 @@ int main() {
     CHECK(!piped_read_lead_in(true, true, -1.0, 400.0));
     CHECK(!piped_read_lead_in(false, true, 0.0, 400.0));
     CHECK(!piped_read_lead_in(true, false, 0.0, 400.0));
+        // dynamic_piped_read_piece verification
+    CHECK(dynamic_piped_read_piece(4096, 512, 0, 1000) == 0);
+    CHECK(dynamic_piped_read_piece(4096, 512, 1, 1000) == 0);
+    CHECK(dynamic_piped_read_piece(4096, 512, 2, 2048) == 0);
+    CHECK(dynamic_piped_read_piece(4096, 512, 0, 10000) == 0);
+    CHECK(dynamic_piped_read_piece(4096, 512, 1, 10000) == 2048);
+    CHECK(dynamic_piped_read_piece(4096, 512, 2, 10000) == 1024);
+    CHECK(dynamic_piped_read_piece(4096, 512, 3, 10000) == 1024);
+    CHECK(dynamic_piped_read_piece(1024, 512, 1, 10000) == 1024);
     if (fails == 0) std::printf("batch_read_test: ok\n");
     return fails == 0 ? 0 : 1;
 }

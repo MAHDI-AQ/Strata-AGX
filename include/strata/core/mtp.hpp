@@ -248,12 +248,14 @@ private:
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
     bool capture_round(int T, bool coupled, std::string& err);
     bool capture_step(int j, bool coupled, std::string& err);
+    bool capture_chain(int T, int n_out, bool coupled, std::string& err);
     cudaGraphExec_t step_exec_[9] = {};
     // coupled draft sampling: its own round/step graphs (the argmax ones stay as they were), the request's
     // parameters and the penalty ring (mapped staging + device copies), the split scratch, token id -> subset index
     bool setup_coupled(std::string& err);
     cudaGraphExec_t round_exec_c_[9] = {};
     cudaGraphExec_t step_exec_c_[9] = {};
+    cudaGraphExec_t chain_exec_c_[9] = {};
     bool coupled_ok_ = false, coupled_active_ = false;
     bool coupled_rec_ = false;   ///< record_forward: the full layer ends in the coupled sampler (draft coupled_j_)
     int coupled_j_ = 0;
@@ -309,6 +311,7 @@ private:
     cudaStream_t side_ = nullptr;                    // the shared expert's branch of the draft graphs (CUDA)
     cudaEvent_t sh_fork_ = nullptr, sh_join_ = nullptr;
     cudaGraphExec_t round_exec_[9] = {};
+    cudaGraphExec_t chain_exec_[9] = {};
 
     struct Tensor { std::string name, kind; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };
     std::vector<Tensor> tensors_;

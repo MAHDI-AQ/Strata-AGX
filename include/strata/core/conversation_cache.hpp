@@ -538,6 +538,20 @@ public:
         }
         return longest;
     }
+    size_t parked_covered_tokens(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
+                                 const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) const {
+        size_t longest = parked_prefix_tokens(ids, images, checkpoints, cvec);
+        for (const auto& e : entries_) {
+            if (e.cvec != cvec || e.live.ids.empty() || e.live.ids.size() > ids.size()) continue;
+            if (!std::equal(e.live.ids.begin(), e.live.ids.end(), ids.begin())) continue;
+            if (e.live.imgs.size() > images.size()) continue;
+            if (!std::equal(e.live.imgs.begin(), e.live.imgs.end(), images.begin())) continue;
+            if (e.live.imgs.size() < images.size() && images[e.live.imgs.size()].start < (int64_t) e.live.ids.size())
+                continue;
+            longest = std::max(longest, e.live.ids.size());
+        }
+        return longest;
+    }
 
     bool put(SavedConversation&& image, size_t held = 0) {
         const size_t n = image.bytes();

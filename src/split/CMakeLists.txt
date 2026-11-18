@@ -229,3 +229,10 @@ if(STRATA_BUILD_TESTS)
   target_link_libraries(split_fnx_run PRIVATE CUDA::cublas CUDA::cublasLt CUDA::cuda_driver Threads::Threads)
   set_target_properties(split_fnx_run PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
 endif()
+
+
+if(NOT TARGET strata_split)
+  if(TARGET strata-split-2)
+    add_custom_target(strata_split DEPENDS strata-split-2)
+  endif()
+endif()

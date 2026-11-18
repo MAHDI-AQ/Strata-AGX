@@ -20,6 +20,7 @@ NativeHead::~NativeHead() {
 }
 
 void NativeHead::unload() {
+    free_native_head_fp8(fp8_);
     if (weights_) strata::kernels::native_q6_k_unpack(weights_);
     if (weights_) strata::kernels::native_q8_0_sm60_release(weights_);
     if (scratch_) cudaFree(scratch_);
@@ -117,6 +118,16 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
                                     (type_ == 14 && strata::kernels::native_q6_k_packed_enabled() ? ", repacked (STRATA_Q6_PACKED)" : "") +
                                     (type_ == 8 && std::getenv("STRATA_Q8_SM60") != nullptr ? ", repacked (STRATA_Q8_SM60)" : ""));
         }
+        const bool ask_fp8 = native_head_fp8_enabled() ||
+            (std::getenv("STRATA_LM_HEAD_FP8") != nullptr && std::getenv("STRATA_LM_HEAD_FP8")[0] != '0') ||
+            (std::getenv("STRATA_NATIVE_HEAD_FP8") != nullptr && std::getenv("STRATA_NATIVE_HEAD_FP8")[0] != '0');
+        if (ask_fp8) {
+            std::string fp8_err;
+            if (!init_native_head_fp8(fp8_, gguf.tensor_data(*tensor), (int) tensor->type, (int) n_in, (int) n_out, device_, fp8_err)) {
+                std::fprintf(stderr, "strata head: FP8 acceleration initialization warning: %s (falling back to native MMVQ)\n", fp8_err.c_str());
+            }
+        }
+
         return true;
     } catch (const std::exception& error) {
         err = std::string("native head: ") + error.what();
@@ -147,6 +158,9 @@ bool NativeHead::to_host(std::string& err) {
 }
 
 bool NativeHead::run(const float* mixed, float* logits, void* stream, std::string& err) const {
+    if (fp8_.enabled) {
+        return run_native_head_fp8(fp8_, mixed, logits, nullptr, 1, stream, err);
+    }
     if (!loaded() || !mixed || !logits || !stream) {
         err = "native head requires loaded weights, device buffers and an explicit stream";
         return false;
@@ -170,6 +184,15 @@ bool NativeHead::run(const float* mixed, float* logits, void* stream, std::strin
     return true;
 }
 
+bool NativeHead::run_fp8(const float* mixed, float* logits, int32_t* out_tokens, int T, void* stream, std::string& err,
+                         float temperature, bool spec_gumbel, uint64_t seed, uint64_t counter) const {
+    if (!fp8_.enabled) {
+        err = "NativeHead::run_fp8: FP8 head is not enabled";
+        return false;
+    }
+    return run_native_head_fp8(fp8_, mixed, logits, out_tokens, T, stream, err, temperature, spec_gumbel, seed, counter);
+}
+
 // ================================ plan v0.3 P6: THE NATIVE EMBEDDING ================================
 
 namespace {
@@ -179,8 +202,24 @@ void set_native_embed(const NativeEmbed* e) { g_embed = e; }
 const NativeEmbed* native_embed() { return g_embed; }
 
 NativeEmbed::~NativeEmbed() {
-    if (host_) cudaFreeHost(host_);
-    else if (dev_) cudaFree(const_cast<void*>(dev_));   // the VRAM fallback below
+    free_native_embed_fp8(fp8_);
+    if (host_) {
+        cudaFreeHost(host_);
+    } else {
+        bool freed_primary = false;
+        for (int d = 0; d < kMaxDevices; ++d) {
+            if (dev_weights_[d] != nullptr) {
+                if (dev_weights_[d] == dev_) freed_primary = true;
+                int prev = 0;
+                cudaGetDevice(&prev);
+                cudaSetDevice(d);
+                cudaFree(const_cast<void*>(dev_weights_[d]));
+                cudaSetDevice(prev);
+                dev_weights_[d] = nullptr;
+            }
+        }
+        if (dev_ && !freed_primary) cudaFree(const_cast<void*>(dev_));
+    }
 }
 
 bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, int64_t n_vocab, std::string& err) {
@@ -224,7 +263,11 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
                     std::fprintf(stderr, "strata: native embedding: STRATA_EMBED_VRAM=1: %llu MiB placed in VRAM "
                                          "(%llu MiB were free)\n",
                                  (unsigned long long) (bytes_ >> 20), (unsigned long long) (free_b >> 20));
-                    dev_ = d;   // host_ stays null: the destructor frees dev_
+                    int cur_dev = 0;
+                    cudaGetDevice(&cur_dev);
+                    primary_dev_ = cur_dev;
+                    if (cur_dev >= 0 && cur_dev < kMaxDevices) dev_weights_[cur_dev] = d;
+                    dev_ = d;   // host_ stays null: the destructor frees dev_weights_
                     type_ = (int) t->type;
                     n_embd_ = n_embd;
                     n_vocab_ = n_vocab;
@@ -255,6 +298,10 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
             }
             std::fprintf(stderr, "strata: native embedding: cannot pin %llu MiB, kept in VRAM instead\n",
                          (unsigned long long) (bytes_ >> 20));
+            int cur_dev = 0;
+            cudaGetDevice(&cur_dev);
+            primary_dev_ = cur_dev;
+            if (cur_dev >= 0 && cur_dev < kMaxDevices) dev_weights_[cur_dev] = d;
             dev_ = d;
         } else {
             std::memcpy(host_, gguf.tensor_data(*t), bytes_);
@@ -289,6 +336,18 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
         type_ = (int) t->type;
         n_embd_ = n_embd;
         n_vocab_ = n_vocab;
+
+        const bool ask_fp8 = native_embed_fp8_enabled() ||
+            (std::getenv("STRATA_NATIVE_EMBED_FP8") != nullptr && std::getenv("STRATA_NATIVE_EMBED_FP8")[0] != '0');
+        if (ask_fp8) {
+            std::string fp8_err;
+            int cur_dev = 0;
+            cudaGetDevice(&cur_dev);
+            if (!init_native_embed_fp8(fp8_, gguf.tensor_data(*t), (int) t->type, (int) n_embd, (int) n_vocab, nullptr, cur_dev, fp8_err)) {
+                std::fprintf(stderr, "strata embed: FP8 acceleration initialization warning: %s (falling back to native IQ)\n", fp8_err.c_str());
+            }
+        }
+
         return true;
     } catch (const std::exception& e) {
         err = std::string("native embedding: ") + e.what();
@@ -296,12 +355,80 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
     }
 }
 
+const void* NativeEmbed::device_ptr(int dev) const {
+    if (host_ != nullptr) return dev_;
+    if (dev >= 0 && dev < kMaxDevices && dev_weights_[dev] != nullptr) return dev_weights_[dev];
+    return dev_;
+}
+
+bool NativeEmbed::ensure_device(int dev, std::string& err) const {
+    if (host_ != nullptr || dev_ == nullptr) return true;
+    if (dev < 0 || dev >= kMaxDevices) {
+        err = "native embedding: device index out of range (" + std::to_string(dev) + ")";
+        return false;
+    }
+    if (dev_weights_[dev] != nullptr) return true;
+    if (primary_dev_ < 0 || primary_dev_ >= kMaxDevices || dev_weights_[primary_dev_] == nullptr) {
+        err = "native embedding: primary device replica missing";
+        return false;
+    }
+    int prev_dev = 0;
+    cudaGetDevice(&prev_dev);
+    cudaSetDevice(dev);
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess ||
+        (uint64_t) free_b <= bytes_ + ((uint64_t) 512 << 20)) {
+        cudaGetLastError();
+        cudaSetDevice(prev_dev);
+        err = "native embedding: insufficient VRAM on CUDA" + std::to_string(dev) + " to replicate " +
+              std::to_string(bytes_ >> 20) + " MiB";
+        return false;
+    }
+    std::vector<uint8_t> staging((size_t) bytes_);
+    cudaSetDevice(primary_dev_);
+    if (cudaMemcpy(staging.data(), dev_weights_[primary_dev_], bytes_, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        cudaGetLastError();
+        cudaSetDevice(prev_dev);
+        err = "native embedding: D2H staging from CUDA" + std::to_string(primary_dev_) + " failed";
+        return false;
+    }
+    cudaSetDevice(dev);
+    void* d_new = nullptr;
+    if (cudaMalloc(&d_new, bytes_) != cudaSuccess ||
+        cudaMemcpy(d_new, staging.data(), bytes_, cudaMemcpyHostToDevice) != cudaSuccess) {
+        if (d_new) cudaFree(d_new);
+        cudaGetLastError();
+        cudaSetDevice(prev_dev);
+        err = "native embedding: H2D replication to CUDA" + std::to_string(dev) + " failed";
+        return false;
+    }
+    dev_weights_[dev] = d_new;
+    std::fprintf(stderr, "strata: native embedding: STRATA_EMBED_VRAM=1 replicated %llu MiB to CUDA%d (%llu MiB free)\n",
+                 (unsigned long long) (bytes_ >> 20), dev, (unsigned long long) ((free_b - bytes_) >> 20));
+    cudaSetDevice(prev_dev);
+    return true;
+}
+
 void NativeEmbed::gather_dev(const int32_t* tokens, int64_t n_tok, float* out, void* stream) const {
-    strata::kernels::iq_embed_rows(type_, dev_, row_, tokens, n_tok, n_embd_, out, stream);
+    int dev = 0;
+    if (host_ == nullptr) cudaGetDevice(&dev);
+    const void* ptr = device_ptr(dev);
+    strata::kernels::iq_embed_rows(type_, ptr, row_, tokens, n_tok, n_embd_, out, stream);
 }
 
 void NativeEmbed::gather_one(int64_t token, float* out, void* stream) const {
-    strata::kernels::iq_dequant_f32(type_, (const uint8_t*) dev_ + (size_t) token * row_, n_embd_, out, stream);
+    int dev = 0;
+    if (host_ == nullptr) cudaGetDevice(&dev);
+    const void* ptr = device_ptr(dev);
+    strata::kernels::iq_dequant_f32(type_, (const uint8_t*) ptr + (size_t) token * row_, n_embd_, out, stream);
+}
+
+bool NativeEmbed::run_fused_hc(const int32_t* tokens, int32_t num_tokens, void* out_main, void* out_res, void* out_hc, void* stream, std::string& err) const {
+    if (!fp8_.enabled) {
+        err = "NativeEmbed::run_fused_hc: FP8 embedding is not enabled";
+        return false;
+    }
+    return run_native_embed_fp8(fp8_, tokens, num_tokens, out_main, out_res, out_hc, stream, err);
 }
 
 }  // namespace strata::core

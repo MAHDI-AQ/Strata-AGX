@@ -63,12 +63,26 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_kernel(const fl
     }
 }
 
+// Lever 2: Dynamic Tau-Pruning environment configuration
+inline float qsa_tau_prune() {
+    static const float val = [] {
+        const char* v = std::getenv("STRATA_QSA_TAU_PRUNE");
+        if (v == nullptr || *v == '\0') return 0.05f;   // default enabled: 0.05
+        if (std::strcmp(v, "0") == 0 || std::strcmp(v, "off") == 0 || std::strcmp(v, "false") == 0) return 0.0f;
+        if (std::strcmp(v, "1") == 0 || std::strcmp(v, "on") == 0 || std::strcmp(v, "true") == 0) return 0.05f;
+        return (float) std::atof(v);
+    }();
+    return val;
+}
+
 __global__ void __launch_bounds__(TOPK_T) block_topk_kernel(const float* __restrict__ scores,
                                                             const int32_t* __restrict__ steps, int64_t max_blocks,
-                                                            int64_t cap, int32_t* __restrict__ ids) {
+                                                            int64_t cap, int32_t* __restrict__ ids,
+                                                            float tau_prune = 0.05f) {
     __shared__ int hist[256];
     __shared__ int s_a[TOPK_T], s_b[TOPK_T];
     __shared__ int s_digit, s_above;
+    __shared__ float s_max_score;
     const int64_t qi = blockIdx.x;
     const int32_t* st = steps + qi * kStepCount;
     const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid], width = st[kStepWidth];
@@ -82,7 +96,44 @@ __global__ void __launch_bounds__(TOPK_T) block_topk_kernel(const float* __restr
     const int64_t nb = n_bid + 1;                      // blocks 0..n_bid, the last possibly empty
     const int64_t per = (nb + TOPK_T - 1) / TOPK_T;
     const int64_t b0 = (int64_t) t * per, b1 = (b0 + per < nb) ? b0 + per : nb;
-    auto weight = [&](int64_t b) -> int { return b < n_bid ? R : (int) (n_kv - n_bid * R); };
+
+    // Lever 2: Dynamic Tau-Pruning: identify max score across non-tail blocks
+    if (tau_prune > 0.0f) {
+        float my_max = 0.0f;
+        for (int64_t b = b0; b < b1 && b < n_bid; ++b) {
+            const float s = sc[b];
+            if (s > my_max) my_max = s;
+        }
+        for (int off = 16; off > 0; off >>= 1) {
+            const float o = __shfl_xor_sync(0xffffffffu, my_max, off);
+            if (o > my_max) my_max = o;
+        }
+        if ((t & 31) == 0) s_a[t >> 5] = __float_as_int(my_max);
+        __syncthreads();
+        if (t < 32) {
+            float gm = (t < (TOPK_T >> 5)) ? __int_as_float(s_a[t]) : 0.0f;
+            for (int off = 16; off > 0; off >>= 1) {
+                const float o = __shfl_xor_sync(0xffffffffu, gm, off);
+                if (o > gm) gm = o;
+            }
+            if (t == 0) s_max_score = gm;
+        }
+        __syncthreads();
+    } else {
+        if (t == 0) s_max_score = 0.0f;
+        __syncthreads();
+    }
+    const float tau_cut = (tau_prune > 0.0f && s_max_score > 0.0f) ? (s_max_score * tau_prune) : -1.0f;
+
+    auto is_cold = [&](int64_t b) -> bool {
+        if (tau_cut <= 0.0f || b >= n_bid) return false;
+        if (b < 256) return false; // Attention sinks 0..1023 are always kept
+        return sc[b] < tau_cut;
+    };
+    auto weight = [&](int64_t b) -> int {
+        if (is_cold(b)) return 0;
+        return b < n_bid ? R : (int) (n_kv - n_bid * R);
+    };
     // ---- radix select: the largest key thr with (cells with key >= thr) >= width, 8 bits at a time
     uint32_t prefix = 0;
     int above = 0;                                     // cells strictly above the digits fixed so far
@@ -145,8 +196,10 @@ __global__ void __launch_bounds__(TOPK_T) block_topk_kernel(const float* __restr
     if (t == 0) {
         int a = 0;
         for (int i = 0; i < TOPK_T; ++i) { const int c = s_a[i]; s_a[i] = a; a += c; }
+        s_b[0] = a;
     }
     __syncthreads();
+    const int total_sel = s_b[0];
     int64_t wpos = s_a[t];
     int64_t eq_left = my_eq;
     for (int64_t b = b0; b < b1; ++b) {
@@ -157,6 +210,13 @@ __global__ void __launch_bounds__(TOPK_T) block_topk_kernel(const float* __restr
             for (int c = 0; c < w; ++c) out[wpos++] = (int32_t) (b * R + c);
         } else if (k == thr) {
             for (int c = 0; c < w && eq_left > 0; ++c, --eq_left) out[wpos++] = (int32_t) (b * R + c);
+        }
+    }
+    __syncthreads();
+    if (total_sel < width) {
+        const int32_t pad_val = (total_sel > 0) ? out[total_sel - 1] : 0;
+        for (int64_t j = total_sel + t; j < width; j += TOPK_T) {
+            out[j] = pad_val;
         }
     }
 }
@@ -741,10 +801,12 @@ __device__ __forceinline__ int block_excl_scan(int v, int* s_warp, int& total) {
 template <int PER>
 __global__ void __launch_bounds__(TK_T) block_topk_reg_kernel(const float* __restrict__ scores,
                                                               const int32_t* __restrict__ steps, int64_t max_blocks,
-                                                              int64_t cap, int32_t* __restrict__ ids) {
+                                                              int64_t cap, int32_t* __restrict__ ids,
+                                                              float tau_prune = 0.05f) {
     __shared__ int hist[TK_T / 32][256];
     __shared__ int s_warp[33];
     __shared__ int s_digit, s_above;
+    __shared__ float s_max_score;
     const int64_t qi = blockIdx.x;
     const int32_t* st = steps + qi * kStepCount;
     const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid], width = st[kStepWidth];
@@ -761,7 +823,49 @@ __global__ void __launch_bounds__(TK_T) block_topk_reg_kernel(const float* __res
     uint32_t key[PER];
 #pragma unroll
     for (int j = 0; j < PER; ++j) key[j] = (b0 + j < b1) ? order_key(sc[b0 + j]) : 0u;
-    auto weight = [&](int64_t b) -> int { return b < n_bid ? R : (int) (n_kv - n_bid * R); };
+
+    if (tau_prune > 0.0f) {
+        float my_max = 0.0f;
+#pragma unroll
+        for (int j = 0; j < PER; ++j) {
+            const int64_t b = b0 + j;
+            if (b < b1 && b < n_bid) {
+                const float s = sc[b];
+                if (s > my_max) my_max = s;
+            }
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            const float other = __shfl_xor_sync(0xffffffffu, my_max, o);
+            if (other > my_max) my_max = other;
+        }
+        if (lane == 0) hist[warp][0] = __float_as_int(my_max);
+        __syncthreads();
+        if (t < 32) {
+            float wm = (t < TK_T / 32) ? __int_as_float(hist[t][0]) : 0.0f;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                const float other = __shfl_xor_sync(0xffffffffu, wm, o);
+                if (other > wm) wm = other;
+            }
+            if (t == 0) s_max_score = wm;
+        }
+        __syncthreads();
+    } else {
+        if (t == 0) s_max_score = 0.0f;
+        __syncthreads();
+    }
+    const float tau_cut = (tau_prune > 0.0f && s_max_score > 0.0f) ? (s_max_score * tau_prune) : -1.0f;
+
+    auto is_cold = [&](int64_t b) -> bool {
+        if (tau_cut <= 0.0f || b >= n_bid) return false;
+        if (b < 256) return false;
+        return sc[b] < tau_cut;
+    };
+    auto weight = [&](int64_t b) -> int {
+        if (is_cold(b)) return 0;
+        return b < n_bid ? R : (int) (n_kv - n_bid * R);
+    };
     uint32_t prefix = 0;
     int above = 0;
     for (int shift = 24; shift >= 0; shift -= 8) {
@@ -844,6 +948,14 @@ __global__ void __launch_bounds__(TK_T) block_topk_reg_kernel(const float* __res
             for (int c = 0; c < w && eq_left > 0; ++c, --eq_left) out[wpos++] = (int32_t) (b * R + c);
         }
     }
+    __syncthreads();
+    const int actual_sel = tot;
+    if (actual_sel < width) {
+        const int32_t pad_val = (actual_sel > 0) ? out[actual_sel - 1] : 0;
+        for (int64_t j = actual_sel + t; j < width; j += TK_T) {
+            out[j] = pad_val;
+        }
+    }
 }
 
 // ---- a query with more blocks than the register kernel holds (contexts past 4 * 1024 * TK_PER cells): the register
@@ -859,11 +971,14 @@ __device__ int g_tk_fail[TS_MAXQ];   // block_topk_sample_kernel: 1 = the query 
 template <bool ONLY_FAILED = false>
 __global__ void __launch_bounds__(TK_T) block_topk_wide_kernel(const float* __restrict__ scores,
                                                                const int32_t* __restrict__ steps, int64_t max_blocks,
-                                                               int64_t cap, int32_t* __restrict__ ids) {
+                                                               int64_t cap, int32_t* __restrict__ ids,
+                                                               float tau_prune = 0.05f) {
     if (ONLY_FAILED && !g_tk_fail[blockIdx.x]) return;
     __shared__ int hist[TK_T / 32][256];
     __shared__ int s_gt[TK_T / 32], s_eq[TK_T / 32];
     __shared__ int s_digit, s_above;
+    __shared__ float s_max_score;
+    __shared__ int s_total_sel;
     const int64_t qi = blockIdx.x;
     const int32_t* st = steps + qi * kStepCount;
     const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid], width = st[kStepWidth];
@@ -876,7 +991,46 @@ __global__ void __launch_bounds__(TK_T) block_topk_wide_kernel(const float* __re
     const float* sc = scores + qi * max_blocks;
     const int64_t nb = n_bid + 1;
     const int64_t per = (nb + TK_T - 1) / TK_T;       // rows of 32 blocks per warp
-    auto weight = [&](int64_t b) -> int { return b < n_bid ? R : (int) (n_kv - n_bid * R); };
+
+    // Lever 2: Dynamic Tau-Pruning: find max score across non-tail blocks
+    if (tau_prune > 0.0f) {
+        float my_max = 0.0f;
+        for (int64_t b = t; b < n_bid; b += TK_T) {
+            const float s = sc[b];
+            if (s > my_max) my_max = s;
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            const float other = __shfl_xor_sync(0xffffffffu, my_max, o);
+            if (other > my_max) my_max = other;
+        }
+        if (lane == 0) hist[warp][0] = __float_as_int(my_max);
+        __syncthreads();
+        if (t < 32) {
+            float wm = (t < TK_T / 32) ? __int_as_float(hist[t][0]) : 0.0f;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                const float other = __shfl_xor_sync(0xffffffffu, wm, o);
+                if (other > wm) wm = other;
+            }
+            if (t == 0) s_max_score = wm;
+        }
+        __syncthreads();
+    } else {
+        if (t == 0) s_max_score = 0.0f;
+        __syncthreads();
+    }
+    const float tau_cut = (tau_prune > 0.0f && s_max_score > 0.0f) ? (s_max_score * tau_prune) : -1.0f;
+
+    auto is_cold = [&](int64_t b) -> bool {
+        if (tau_cut <= 0.0f || b >= n_bid) return false;
+        if (b < 256) return false; // Attention sinks 0..1023 are always kept
+        return sc[b] < tau_cut;
+    };
+    auto weight = [&](int64_t b) -> int {
+        if (is_cold(b)) return 0;
+        return b < n_bid ? R : (int) (n_kv - n_bid * R);
+    };
     uint32_t prefix = 0;
     int above = 0;
     for (int shift = 24; shift >= 0; shift -= 8) {
@@ -966,6 +1120,15 @@ __global__ void __launch_bounds__(TK_T) block_topk_wide_kernel(const float* __re
         for (int c = 0; c < my_sel; ++c) dst[c] = (int32_t) (b * R + c);
         run_eq += __shfl_sync(0xffffffffu, pe, 31);
         run_sel += __shfl_sync(0xffffffffu, ps, 31);
+    }
+    if (warp == (TK_T / 32 - 1) && lane == 31) s_total_sel = run_sel;
+    __syncthreads();
+    const int actual_sel = s_total_sel;
+    if (actual_sel < width) {
+        const int32_t pad_val = (actual_sel > 0) ? out[actual_sel - 1] : 0;
+        for (int64_t j = actual_sel + t; j < width; j += TK_T) {
+            out[j] = pad_val;
+        }
     }
 }
 
@@ -2083,7 +2246,9 @@ bool scores_halve_on() {
         int major = 0, minor = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
-        ok[dev] = strata::sm75_default(major, minor) ? 1 : 2;   // Turing, STRATA_SM75_PERF=1
+        const char* sm89_env = std::getenv("STRATA_QSA_HALVE_SM89");
+        const bool sm89_ok = (major == 8 && minor == 9 && sm89_env != nullptr && sm89_env[0] == '1' && sm89_env[1] == '\0');
+        ok[dev] = (strata::sm75_default(major, minor) || sm89_ok) ? 1 : 2;   // Turing or opt-in SM89
     }
     return ok[dev] == 1;
 }
@@ -2350,7 +2515,8 @@ void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, i
         std::fprintf(stderr, "qsa_block_topk: unsupported geometry or cap\n");
         std::exit(1);
     }
-    block_topk_kernel<<<(unsigned) nq, TOPK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
+    const float tau_prune = qsa_tau_prune();
+    block_topk_kernel<<<(unsigned) nq, TOPK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids, tau_prune);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_topk: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }
@@ -2456,8 +2622,6 @@ __device__ int g_sp_cnt[SP_MAXQ][SP_MAXCH][2];     // per chunk: cells above the
 __device__ void sp_digit(const int* __restrict__ h, int width, int above, int& digit, int& above_out, int* s_buf) {
     const int t = threadIdx.x;
     // s_buf[d] = sum of h[d'] for d' > d (exclusive suffix), d in 0..255
-    const int v = h[t];
-    int x = v;                                     // inclusive suffix scan over t = 255..0: reverse index r = 255 - t
     const int lane = t & 31, w = t >> 5;
     __shared__ int s_w[SP_W];
     // scan in reverse order: thread t holds element r = 255 - t
@@ -2468,7 +2632,6 @@ __device__ void sp_digit(const int* __restrict__ h, int width, int above, int& d
     int add = 0;
     for (int i = 0; i < w; ++i) add += s_w[i];
     e += add;                                      // inclusive suffix sum of h from 255 down to r = 255 - t
-    (void) x; (void) v;
     s_buf[255 - t] = e;                            // s_buf[r] = sum_{d >= r} h[d]
     __syncthreads();
     // the scan picks the largest d in 1..255 with above + sum_{d' >= d} h >= width, else 0
@@ -2508,7 +2671,7 @@ __global__ void __launch_bounds__(SP_T) topk_split_hist_kernel(const float* __re
     }
     if (P == 4 || b0 >= nb) return;
     constexpr int shift = 24 - 8 * (P < 4 ? P : 0);
-    const uint32_t hi_mask = P == 0 ? 0u : (0xffffffffu << (shift + 8));
+    const uint32_t hi_mask = P == 0 ? 0u : (0xffffffffu << (P == 0 ? 0 : shift + 8));
     for (int i = lane; i < 256; i += 32) hist[warp][i] = 0;
     __syncwarp();
     const float* sc = scores + (int64_t) q * max_blocks;
@@ -2979,19 +3142,20 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
         const char* v = std::getenv("STRATA_TOPK_STREAM");
         return v == nullptr || v[0] != '0';
     }();
+    const float tau_prune = qsa_tau_prune();
     if (reach > fit || (turing_wide && counted && reach > 22528)) {   // past the register kernel's reach, or Turing's band
 #if !defined(__HIPCC__)
         if (counted && nq <= TS_MAXQ && reach > 28672 && topk_sample_on()) {   // one read of the scores (below ~115K cells the wide kernel is as fast)
             block_topk_sample_kernel<<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
-            block_topk_wide_kernel<true><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
+            block_topk_wide_kernel<true><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids, tau_prune);
         } else
 #endif
-        block_topk_wide_kernel<false><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
+        block_topk_wide_kernel<false><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids, tau_prune);
     } else
     if (reach <= (int64_t) TK_T * TK_PER)
-        block_topk_reg_kernel<TK_PER><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
+        block_topk_reg_kernel<TK_PER><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids, tau_prune);
     else
-        block_topk_reg_kernel<TK_PER_MAX><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
+        block_topk_reg_kernel<TK_PER_MAX><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids, tau_prune);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_topk: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }

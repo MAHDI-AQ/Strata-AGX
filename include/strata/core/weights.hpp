@@ -147,8 +147,14 @@ public:
     static void hc_q8_names(int64_t n_layers, std::set<std::string>& out);
     const std::map<std::string, WeightRef>& all() const { return table_; }
     const LoadReport& report() const { return report_; }
+    ~WeightTable();
+    bool pack_l2_persist(int dev, std::string& err);
+    void* l2_persist_slab() const { return l2_slab_; }
+    size_t l2_persist_bytes() const { return l2_bytes_; }
 
 private:
+    void* l2_slab_ = nullptr;
+    size_t l2_bytes_ = 0;
     friend class NativeDense;
     std::map<std::string, WeightRef> table_;
     LoadReport report_;

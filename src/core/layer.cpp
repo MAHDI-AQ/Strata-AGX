@@ -1274,44 +1274,61 @@ int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
     }
     // KV streaming: every block the selection names is made resident before anything reads it
     qsa_kv_resolve(st, g, b.ids, st.step, 1, cap, stream);
-    if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(b.qcur, g.n_head, stream);   // <Hq, Hk> = <q, k>
-    if (g_fast_attn && !native_flash_attn_short && dump == nullptr) {
+    static const bool env_fused_attn = [] {
+        const char* e = std::getenv("STRATA_FUSED_ATTN");
+        return e == nullptr || (e[0] != '0' && e[0] != '\0');
+    }();
+    const bool can_fuse_attn = env_fused_attn && g_fast_attn && !native_flash_attn_short && dump == nullptr &&
+                               native_qsa_enabled() && (st.kv_rot || st.kv_hybrid);
+    if (can_fuse_attn) {
+        // Lever B3: Fused FWHT prologue (in chunk kernel sq load), 128-SM saturation,
+        // merge v2, inverse FWHT epilogue, and fused sigmoid gating directly into b.attn32.
         const strata::kernels::QsaAttnPools pools = qsa_attn_pools(st);
-        strata::kernels::qsa_decode_attn_step(b.qcur, pools, b.ids, st.step, cap, s, b.attn_scratch, b.attn, stream);
+        strata::kernels::qsa_decode_attn_step(b.qcur, pools, b.ids, st.step, cap, s,
+                                              b.attn_scratch, b.attn, stream,
+                                              b.q_full, b.attn32,
+                                              /*rot_q=*/st.kv_rot,
+                                              /*rot_out=*/(st.kv_rot || st.kv_hybrid));
     } else {
-    if (st.kv_hybrid) {
-        kv_gather_q8_step(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, b.ids, st.step, cap, s,
-                          b.k_scratch, b.k_scratch, stream);
-        strata::kernels::kv_gather_q4_step(st.v_q4, st.v_q4, st.page_table, b.ids, st.step, cap, s,
-                                           b.v_scratch, b.v_scratch, stream);
-    }
-    else if (st.kv_q4) strata::kernels::kv_gather_q4_step(st.k_q4, st.v_q4, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch, stream);
-    else if (st.kv_int8) kv_gather_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, b.ids, st.step, cap, s,                                 b.k_scratch, b.v_scratch, stream);
-    else kv_gather_step(st.k_pool, st.v_pool, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch,                   stream);
-    if (native_flash_attn_short) {
-    if (st.max_cells < 1 || st.max_cells > 256 || !st.attention_status || !st.host_step) {
-        err = v.name("native_flash_attn") + ": short adapter requires context <=256 and persistent status storage";
-        return false;
-    }
-    try {
-        native_flash_attn_short_step(b.qcur, b.k_scratch, b.v_scratch, st.step, cap,
-            (int) st.max_cells, s, b.attn, st.attention_status, nullptr, stream);
-    } catch (const std::exception& error) { err = v.name("native_flash_attn") + ": " + error.what(); return false; }
-    if (cudaMemcpyAsync(st.host_step + kStepCount, st.attention_status, sizeof(int32_t),
-                        cudaMemcpyDeviceToHost, (cudaStream_t) stream) != cudaSuccess) {
-        err = v.name("native_flash_attn") + ": status readback failed"; return false;
-    }
-} else qsa_attend_step(b.qcur, b.k_scratch, b.v_scratch, st.step, cap, s, b.attn, nullptr, stream);
-    }
-    if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(b.attn, g.n_head, stream);   // the output back: H is self-inverse
-    dump_slot(dump, g, layer, b.attn, (uint64_t) 2 * g.n_embd + 2 * g.hc,                            (uint64_t) g.n_head * g.head_dim, stream);    {        const uint64_t vs = (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim +                            (uint64_t) 2 * g.n_head_kv * g.head_dim;        dump_slot(dump, g, layer, (const float*) b.v_scratch, vs,                            (uint64_t) g.n_head_kv * g.head_dim / 2, stream);        dump_slot(dump, g, layer, (const float*) b.ids, vs + (uint64_t) g.n_head_kv * g.head_dim / 2, 4, stream);        dump_slot(dump, g, layer, (const float*) st.step,                            vs + (uint64_t) g.n_head_kv * g.head_dim / 2 + 4, 4, stream);    }
+        if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(b.qcur, g.n_head, stream);   // <Hq, Hk> = <q, k>
+        if (g_fast_attn && !native_flash_attn_short && dump == nullptr) {
+            const strata::kernels::QsaAttnPools pools = qsa_attn_pools(st);
+            strata::kernels::qsa_decode_attn_step(b.qcur, pools, b.ids, st.step, cap, s, b.attn_scratch, b.attn, stream);
+        } else {
+            if (st.kv_hybrid) {
+                kv_gather_q8_step(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, b.ids, st.step, cap, s,
+                                  b.k_scratch, b.k_scratch, stream);
+                strata::kernels::kv_gather_q4_step(st.v_q4, st.v_q4, st.page_table, b.ids, st.step, cap, s,
+                                                   b.v_scratch, b.v_scratch, stream);
+            }
+            else if (st.kv_q4) strata::kernels::kv_gather_q4_step(st.k_q4, st.v_q4, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch, stream);
+            else if (st.kv_int8) kv_gather_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, b.ids, st.step, cap, s,                                 b.k_scratch, b.v_scratch, stream);
+            else kv_gather_step(st.k_pool, st.v_pool, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch,                   stream);
+            if (native_flash_attn_short) {
+                if (st.max_cells < 1 || st.max_cells > 256 || !st.attention_status || !st.host_step) {
+                    err = v.name("native_flash_attn") + ": short adapter requires context <=256 and persistent status storage";
+                    return false;
+                }
+                try {
+                    native_flash_attn_short_step(b.qcur, b.k_scratch, b.v_scratch, st.step, cap,
+                        (int) st.max_cells, s, b.attn, st.attention_status, nullptr, stream);
+                } catch (const std::exception& error) { err = v.name("native_flash_attn") + ": " + error.what(); return false; }
+                if (cudaMemcpyAsync(st.host_step + kStepCount, st.attention_status, sizeof(int32_t),
+                                    cudaMemcpyDeviceToHost, (cudaStream_t) stream) != cudaSuccess) {
+                    err = v.name("native_flash_attn") + ": status readback failed"; return false;
+                }
+            } else qsa_attend_step(b.qcur, b.k_scratch, b.v_scratch, st.step, cap, s, b.attn, nullptr, stream);
+        }
+        if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(b.attn, g.n_head, stream);   // the output back: H is self-inverse
+        dump_slot(dump, g, layer, b.attn, (uint64_t) 2 * g.n_embd + 2 * g.hc,                            (uint64_t) g.n_head * g.head_dim, stream);    {        const uint64_t vs = (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim +                            (uint64_t) 2 * g.n_head_kv * g.head_dim;        dump_slot(dump, g, layer, (const float*) b.v_scratch, vs,                            (uint64_t) g.n_head_kv * g.head_dim / 2, stream);        dump_slot(dump, g, layer, (const float*) b.ids, vs + (uint64_t) g.n_head_kv * g.head_dim / 2, 4, stream);        dump_slot(dump, g, layer, (const float*) st.step,                            vs + (uint64_t) g.n_head_kv * g.head_dim / 2 + 4, 4, stream);    }
 // ---- 9. Gate the attention output before its projection. Native CUDA keeps F32
 // sigmoid/multiply arithmetic and uses Q8_1 for the native quantized projection.
 // The canonical fallback retains its prior FP64 gate and Q8_K projection.
-try {
-    if (native_qsa_enabled()) native_qsa_gate_apply(b.attn, b.q_full, b.attn32, (int) g.n_head, (int) g.head_dim, stream);
-    else qsa_gate_apply_f32(b.attn, b.q_full, s, b.attn32, stream);
-} catch (const std::exception& error) { err = v.name("qsa_gate") + ": " + error.what(); return false; }
+        try {
+            if (native_qsa_enabled()) native_qsa_gate_apply(b.attn, b.q_full, b.attn32, (int) g.n_head, (int) g.head_dim, stream);
+            else qsa_gate_apply_f32(b.attn, b.q_full, s, b.attn32, stream);
+        } catch (const std::exception& error) { err = v.name("qsa_gate") + ": " + error.what(); return false; }
+    }
     if (!w_attno->native_data) quantize_q8_K(b.attn32, b.attn_q8k, g.n_head * g.head_dim, stream);
     if (w_attno->native_data) {
     if (!gemv_quantized(*w_attno, p_o, f_o, nullptr, b.attn_q8k, out,
