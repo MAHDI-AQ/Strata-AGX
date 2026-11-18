@@ -11,6 +11,7 @@
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -269,6 +270,62 @@ int main() {
     gdn_case({1}, true);
     gdn_case({1, 1, 1, 1}, true);
     gdn_case({1, 1, 1, 1, 1, 1, 1, 1}, true);
+    {
+        // K15: gdn_conv_l2_groups & gdn_step_norm_groups qfuse parity
+        const int S = 128, h_k = 16, h_v = 48;
+        const int qk = S * h_k, C = 2 * qk + S * h_v, vd = S * h_v;
+        const float eps = 1e-6f;
+        const std::vector<int> ntok = {2, 2, 1, 3};
+        const int G = (int) ntok.size();
+        int T = 0; for (int n : ntok) T += n;
+        std::mt19937 rng(991);
+        std::normal_distribution<float> nd(0.f, 1.f);
+        std::vector<float> qkv((size_t) T * C), wc(C * 4), h((size_t) T * C), gate((size_t) T * h_v), beta((size_t) T * h_v), z((size_t) T * vd), gm(S);
+        for (auto& v : qkv) v = nd(rng) * 0.1f;
+        for (auto& v : wc) v = nd(rng) * 0.1f;
+        for (auto& v : gate) v = -1.0f;
+        for (auto& v : beta) v = 0.5f;
+        for (auto& v : z) v = nd(rng);
+        for (auto& v : gm) v = 1.0f + 0.1f * nd(rng);
+        const float *d_qkv = up(qkv), *d_wc = up(wc), *d_gate = up(gate), *d_beta = up(beta), *d_z = up(z), *d_gm = up(gm);
+        float *d_hg = nullptr, *d_hr = nullptr, *d_y = nullptr;
+        ck(cudaMalloc(&d_hg, (size_t) T * C * 4), "malloc");
+        ck(cudaMalloc(&d_hr, (size_t) T * C * 4), "malloc");
+        ck(cudaMalloc(&d_y, (size_t) T * vd * 4), "malloc");
+        std::vector<float*> h_g(G), h_r(G), st_g(G), st_r(G);
+        k::GdnConvGroups cg; cg.n = G;
+        k::GdnGroups gg; gg.n = G;
+        int first = 0;
+        for (int i = 0; i < G; ++i) {
+            std::vector<float> hist((size_t) C * 3); for (auto& v : hist) v = nd(rng) * 0.1f;
+            std::vector<float> st((size_t) S * h_v * S); for (auto& v : st) v = nd(rng) * 0.1f;
+            h_g[i] = up(hist); h_r[i] = up(hist);
+            st_g[i] = up(st); st_r[i] = up(st);
+            cg.hist[i] = h_g[i]; cg.first[i] = first; cg.ntok[i] = ntok[i];
+            gg.state[i] = st_g[i]; gg.first[i] = first; gg.ntok[i] = ntok[i];
+            first += ntok[i];
+        }
+        k::gdn_conv_l2_groups(cg, d_qkv, d_wc, d_hg, C, 2 * h_k, eps, false, nullptr);
+        for (int i = 0; i < G; ++i)
+            k::gdn_conv_l2_multi(h_r[i], d_qkv + (size_t) cg.first[i] * C, d_wc, d_hr + (size_t) cg.first[i] * C, C, 2 * h_k, eps, ntok[i], nullptr, 0, false);
+        const std::vector<float> ag = down(d_hg, (size_t) T * C), ar = down(d_hr, (size_t) T * C);
+        report("gdn_conv_l2_groups parity", std::memcmp(ag.data(), ar.data(), ag.size() * 4) == 0);
+
+        const size_t q8_bytes = (size_t) T * (vd / 32) * 36;
+        void *d_xq_g = nullptr, *d_xq_r = nullptr;
+        ck(cudaMalloc(&d_xq_g, q8_bytes), "malloc");
+        ck(cudaMalloc(&d_xq_r, q8_bytes), "malloc");
+        cudaStream_t qcs = nullptr;
+        ck(cudaStreamCreate(&qcs), "stream");
+        k::gdn_step_norm_groups(gg, d_hg, C, d_gate, d_beta, d_z, d_gm, eps, d_y, h_k, h_v, false, qcs, d_xq_g, 0);
+        k::native_quantize_q8_1(d_y, d_xq_r, vd, T, qcs);
+        ck(cudaStreamSynchronize(qcs), "sync");
+        ck(cudaStreamDestroy(qcs), "destroy");
+        std::vector<uint8_t> qg(q8_bytes), qr(q8_bytes);
+        ck(cudaMemcpy(qg.data(), d_xq_g, q8_bytes, cudaMemcpyDeviceToHost), "d2h");
+        ck(cudaMemcpy(qr.data(), d_xq_r, q8_bytes, cudaMemcpyDeviceToHost), "d2h");
+        report("gdn_step_norm_groups qfuse parity", std::memcmp(qg.data(), qr.data(), q8_bytes) == 0);
+    }
     std::printf("%s\n", bad ? "batch_rows_parity: FAILED" : "batch_rows_parity: ok");
     return bad ? 1 : 0;
 }

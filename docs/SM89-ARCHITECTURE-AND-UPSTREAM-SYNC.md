@@ -83,6 +83,19 @@ Keep `STRATA_READ_WIN_MAX_T=0` (upstream default) whenever `ver.max_t() > S` (fo
 - `SD_r512_c8`: `653.91 -> 677.53 tok/s` (+3.6%)
 - `SD_r65536_c4`: `393.91 -> 417.74 tok/s` (+6.0%)
 - `SD_r65536_c8`: `608.71 -> 615.03 tok/s` (+1.0%)
+
+### Wave K15 Measured Gains (4x RTX 4090 `sm_89`, `8x512k @ 128k`, vs Wave K14)
+
+- **Opt-in controls:** `STRATA_KV_STAGE_SEL_GPU=1`, `STRATA_SAMPLER_ASYNC=1`, `STRATA_GDN_NORM_QFUSE=1`, `STRATA_GDN_CONV_GROUPS=1`, `STRATA_CONC_SUBCHUNK=512`, `STRATA_PREFILL_LOW_PRIO=1`, `STRATA_PARK_STAGE_POOL=1`, `STRATA_MLOCK_CODE=1`, `STRATA_DROP_STARTUP_MMAP=1`, plus group-spread `pick_slot`, zero-copy `memoryview` IPC, `PromptEncoder` singleflight, and `qsa_decode_attn` stack-spill elimination (`384–400 B -> 0–8 B`).
+- `SD_r512_c1`: `176.24 -> 185.62 tok/s` (+5.3%)
+- `SD_r512_c4`: `414.53 -> 444.40 tok/s` (+7.2%)
+- `SD_r512_c8`: `677.53 -> 684.45 tok/s` (+1.0%)
+- `SD_r65536_c1`: `149.87 -> 163.44 tok/s` (+9.1%)
+- `SD_r131072_c1`: `159.69 -> 166.21 tok/s` (+4.1%)
+- `SD_r131072_c4`: `382.69 -> 388.79 tok/s` (+1.6%)
+- `SD_r262144_c8`: `637.71 -> 671.77 tok/s` (+5.3%)
+- `MPD_a65536_4D_4P`: `dec_during_pf 283.15 -> 286.35 tok/s` (+1.1%)
+- `max_expert_reads`: `50301.1 MB -> 0.0 MB`, `NEEDLE_GATE 8/8`, `leaks=0`, `new_xids=0`, 4-slot smoke `100.0% / 0.0% / 100.0%`.
 - `MPD_a65536_4D_4P`: `ret=176.38% -> 188.93%` (+12.55 pp)
 - `SD_r131072_c1`: `154.05 -> 159.69 tok/s` (+3.7%)
 - `SD_r131072_c8`: `598.78 -> 602.08 tok/s` (+0.6%)

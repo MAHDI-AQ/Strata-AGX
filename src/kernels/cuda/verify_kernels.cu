@@ -81,6 +81,18 @@ __global__ void __launch_bounds__(S) gdn_conv_l2_multi_kernel(float* hist, const
     gdn_conv_l2_body(blockIdx.x, blockIdx.y, hist, qkv, w, h, C, qk_heads, eps, t_begin, commit);
 }
 
+__global__ void __launch_bounds__(S) gdn_conv_l2_groups_kernel(GdnConvGroups grp, const float* __restrict__ qkv,
+                                                               const float* __restrict__ w, float* __restrict__ h,
+                                                               int C, int qk_heads, float eps, bool commit) {
+    const int gi = blockIdx.z;
+    if (gi >= grp.n) return;
+    const int t = blockIdx.y;
+    if (t >= grp.ntok[gi]) return;
+    const int f = grp.first[gi];
+    gdn_conv_l2_body(blockIdx.x, t, const_cast<float*>(grp.hist[gi]), qkv + (size_t) f * C, w, h + (size_t) f * C,
+                     C, qk_heads, eps, 0, commit);
+}
+
 __global__ void gdn_conv_commit_kernel(float* __restrict__ hist, const float* __restrict__ qkv, int C,
                                        const int32_t* __restrict__ n_keep) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -335,6 +347,7 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
         beta += (size_t) f * h_v;
         z += (size_t) f * S * h_v;
         y += (size_t) f * S * h_v;
+        if constexpr (Q) xq += (size_t) (f - t_out_begin) * (S * h_v / 32);
         T = grp.ntok[gi];
         n_keep = grp.keep[gi];
     }
@@ -1157,6 +1170,25 @@ void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream) {
     check("dense_steps");
 }
 
+void gdn_conv_l2_groups(const GdnConvGroups& groups, const float* qkv, const float* conv_w, float* h, int channels,
+                        int qk_heads, float eps, bool commit, void* stream) {
+    if (groups.n < 1 || groups.n > 8 || !qkv || !conv_w || !h || channels <= 0 || channels % S) {
+        std::fprintf(stderr, "gdn_conv_l2_groups: invalid arguments\n");
+        std::exit(1);
+    }
+    int max_t = 0;
+    for (int i = 0; i < groups.n; ++i) {
+        if (!groups.hist[i] || groups.ntok[i] < 1) {
+            std::fprintf(stderr, "gdn_conv_l2_groups: invalid group %d\n", i);
+            std::exit(1);
+        }
+        if (groups.ntok[i] > max_t) max_t = groups.ntok[i];
+    }
+    gdn_conv_l2_groups_kernel<<<dim3((unsigned) (channels / S), (unsigned) max_t, (unsigned) groups.n), S, 0, (cudaStream_t) stream>>>(
+        groups, qkv, conv_w, h, channels, qk_heads, eps, commit);
+    check("gdn_conv_l2_groups");
+}
+
 void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv_w, float* h, int channels,
                        int qk_heads, float eps, int n_tok, void* stream, int t_begin, bool commit) {
     if (!history || !qkv || !conv_w || !h || channels % S != 0 || n_tok < 1 || n_tok > kVerifyMaxT ||
@@ -1268,7 +1300,7 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
 
 void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_channels, const float* gate, const float* beta,
                           const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, bool commit,
-                          void* stream) {
+                          void* stream, void* xq_out, int t_out_begin) {
     if (groups.n < 1 || groups.n > 8 || !h || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v % h_k) {
         std::fprintf(stderr, "gdn_step_norm_groups: invalid arguments\n");
         std::exit(1);
@@ -1278,15 +1310,23 @@ void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_chan
             std::fprintf(stderr, "gdn_step_norm_groups: invalid group %d\n", i);
             std::exit(1);
         }
+    GdnQ81* const xq = static_cast<GdnQ81*>(xq_out);
     const dim3 g1((unsigned) h_v, (unsigned) groups.n), b1(S, RG);
-    // the kernel gdn_step_norm_multi picks for these calls: a window's rows (all outputs, no keep) or a commit of
-    // one-row groups (keep, t_out_begin 0)
-    if (commit)
-        gdn_step_norm_multi_kernel<false, false><<<g1, b1, 0, (cudaStream_t) stream>>>(
-            nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 0, nullptr, 0, nullptr, groups);
-    else
-        gdn_step_norm_multi_kernel<true, false><<<g1, b1, 0, (cudaStream_t) stream>>>(
-            nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 0, nullptr, 0, nullptr, groups);
+    if (xq) {
+        if (commit)
+            gdn_step_norm_multi_kernel<false, true><<<g1, b1, 0, (cudaStream_t) stream>>>(
+                nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 0, nullptr, t_out_begin, xq, groups);
+        else
+            gdn_step_norm_multi_kernel<true, true><<<g1, b1, 0, (cudaStream_t) stream>>>(
+                nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 0, nullptr, t_out_begin, xq, groups);
+    } else {
+        if (commit)
+            gdn_step_norm_multi_kernel<false, false><<<g1, b1, 0, (cudaStream_t) stream>>>(
+                nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 0, nullptr, 0, nullptr, groups);
+        else
+            gdn_step_norm_multi_kernel<true, false><<<g1, b1, 0, (cudaStream_t) stream>>>(
+                nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 0, nullptr, 0, nullptr, groups);
+    }
     check("gdn_step_norm_groups");
 }
 

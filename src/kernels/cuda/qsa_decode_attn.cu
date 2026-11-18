@@ -265,7 +265,8 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
 #pragma unroll
             for (int j = 0; j < HPT; ++j) sp[h0 + j][c] = -FLT_MAX;
         } else {
-            float a[HPT][32];
+            float tree[HPT][5];
+            float res[HPT];
 #pragma unroll
             for (int l = 0; l < 32; ++l) {
                 float k8[8];
@@ -274,18 +275,28 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
                 for (int j = 0; j < HPT; ++j) {
                     const float4 qa = *reinterpret_cast<const float4*>(&sq[h0 + j][l * 8]);
                     const float4 qb = *reinterpret_cast<const float4*>(&sq[h0 + j][l * 8 + 4]);
-                    float s = k8[0] * qa.x + k8[1] * qa.y + k8[2] * qa.z + k8[3] * qa.w +
-                              k8[4] * qb.x + k8[5] * qb.y + k8[6] * qb.z + k8[7] * qb.w;
-                    a[j][l] = s;
+                    float cur = k8[0] * qa.x + k8[1] * qa.y + k8[2] * qa.z + k8[3] * qa.w +
+                                k8[4] * qb.x + k8[5] * qb.y + k8[6] * qb.z + k8[7] * qb.w;
+                    int m = l;
+                    bool stored = false;
+#pragma unroll
+                    for (int bit = 0; bit < 5; ++bit) {
+                        if (!stored) {
+                            if ((m & 1) == 0) {
+                                tree[j][bit] = cur;
+                                stored = true;
+                            } else {
+                                cur = tree[j][bit] + cur;
+                                m >>= 1;
+                            }
+                        }
+                    }
+                    if (l == 31) res[j] = cur;
                 }
             }
 #pragma unroll
             for (int j = 0; j < HPT; ++j) {
-#pragma unroll
-                for (int o = 16; o > 0; o >>= 1)
-#pragma unroll
-                    for (int l = 0; l < o; ++l) a[j][l] = a[j][l] + a[j][l + o];
-                sp[h0 + j][c] = a[j][0] * scale;
+                sp[h0 + j][c] = res[j] * scale;
             }
         }
     } else

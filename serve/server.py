@@ -2045,7 +2045,7 @@ class StrataEngine:
                         pass
                 self.proc.stdin.flush()
                 self.proc.stdin.buffer.write(hdr)
-                self.proc.stdin.buffer.write(arr.tobytes())
+                self.proc.stdin.buffer.write(memoryview(arr))
                 self.proc.stdin.buffer.flush()
         except (OSError, AttributeError):
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
@@ -2978,6 +2978,11 @@ class StrataEngine:
             # If project slot is busy, wait for it! (Do not steal another project's slot)
             return None
 
+        busy_in = {}
+        for b in range(self.batch):
+            if self.slot_busy[b]:
+                busy_in[self.slot_group[b]] = busy_in.get(self.slot_group[b], 0) + 1
+
         # 1. Direct session lease affinity: if session_id has an active VRAM lease on slot b and slot b is free, claim it immediately!
         if session_id and hasattr(self, "session_leases"):
             leased_b = self.session_leases.get_slot(session_id)
@@ -2989,7 +2994,7 @@ class StrataEngine:
             # Check Tier 2 (RAM) or Tier 3 (NVMe)
             tier, sdata = self.session_leases.get_session_tier(session_id)
             if tier == "nvme":
-                candidate_slot = min(free, key=lambda b: (bool(self.slot_held[b]), self.slot_used[b]))
+                candidate_slot = min(free, key=lambda b: (busy_in.get(self.slot_group[b], 0) if self.slot_groups > 1 else 0, bool(self.slot_held[b]), self.slot_used[b]))
                 print(f"[strata 3-tier] Tier 3 (NVMe) hit for session={session_id}. Promoting to slot {candidate_slot}...", flush=True)
                 self.session_leases.promote_from_nvme(session_id, candidate_slot, self)
                 return candidate_slot
@@ -3010,18 +3015,16 @@ class StrataEngine:
             k = len(h) - 1 - h[::-1].index(self.TURN_ID) if self.TURN_ID in h else 0
             return k if 0 < k < len(prompt) and prompt[:k] == h[:k] else 0
 
-        # Prioritize matching held prefix across pool to achieve 0ms GPU VRAM residency reuse
+        # Prioritize matching held prefix across pool to achieve 0ms GPU VRAM residency reuse,
+        # spreading concurrent slots across distinct pipeline groups first when slot_groups > 1.
         matching = [b for b in pool if held_prefix(b) >= (self.SLOT_PREFIX_MIN if self.slot_groups > 1 else 1)]
         if matching:
+            if self.slot_groups > 1:
+                return max(matching, key=lambda b: (-busy_in.get(self.slot_group[b], 0), held_prefix(b)))
             return max(matching, key=held_prefix)
         best = max(pool, key=held_prefix)
         if held_prefix(best) >= (self.SLOT_PREFIX_MIN if self.slot_groups > 1 else 1):
             return best
-
-        busy_in = {}
-        for b in range(self.batch):
-            if self.slot_busy[b]:
-                busy_in[self.slot_group[b]] = busy_in.get(self.slot_group[b], 0) + 1
 
         gs = getattr(self, "slot_gs", 0)
         if gs > 1:
@@ -8036,8 +8039,10 @@ class BadBody(Exception):
 
 
 def make_handler(svc: Service):
+    _http_keepalive = os.environ.get("STRATA_HTTP_KEEPALIVE", "0") == "1"
+
     class Handler(BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
+        protocol_version = "HTTP/1.1" if _http_keepalive else "HTTP/1.0"   # opt-in keep-alive for JSON; SSE still closes
 
         record = None                                       # #332: this request's monitor record, if kept
         watch_done = None                                   # #430 #431: stops this request's disconnect watcher
@@ -8201,7 +8206,8 @@ def make_handler(svc: Service):
             # client that pools connections (.NET's SocketsHttpHandler) can put its next request on this socket
             # before the close reaches it, and that request fails with "response ended prematurely" without the
             # server ever reading it (a .NET agent app, 2026-10-03: 25 of ~1000 requests, 1-24 ms after the previous answer).
-            self.send_header("Connection", "close")
+            if not _http_keepalive:
+                self.send_header("Connection", "close")
             super().end_headers()
 
         def _watch_client(self, cancel: threading.Event) -> None:
@@ -9219,6 +9225,9 @@ def make_handler(svc: Service):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("X-Accel-Buffering", "no")   # nginx and similar proxies pass each event at once
+            if _http_keepalive:
+                self.send_header("Connection", "close")
+                self.close_connection = True
             self._cors()
             self.end_headers()
 

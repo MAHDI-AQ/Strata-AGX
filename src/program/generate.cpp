@@ -206,6 +206,11 @@ bool draft_vocab_whole_head();       // STRATA_METAL_DRAFT_VOCAB=full
 #include <cmath>
 #include <limits>
 #include <cstdio>
+#if !defined(_WIN32)
+#include <link.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -5900,7 +5905,19 @@ int main(int argc, char** argv) {
     // `bench/micro/graph_node_cost.cu` measures the same kernels on a real stream at 3.63 us ungrapped and
     // 0.805 us inside a graph.  **That is an ~8x penalty on every launch in the engine.**
     cudaStream_t main_stream = nullptr;
-    if (cudaStreamCreateWithFlags(&main_stream, cudaStreamNonBlocking) != cudaSuccess) {
+    static const bool prefill_low_prio = [] {
+        const char* v = std::getenv("STRATA_PREFILL_LOW_PRIO");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    auto create_main_stream = [&]() -> cudaError_t {
+        if (prefill_low_prio) {
+            int lo = 0, hi = 0;
+            if (cudaDeviceGetStreamPriorityRange(&lo, &hi) == cudaSuccess && lo != hi)
+                return cudaStreamCreateWithPriority(&main_stream, cudaStreamNonBlocking, lo);
+        }
+        return cudaStreamCreateWithFlags(&main_stream, cudaStreamNonBlocking);
+    };
+    if (create_main_stream() != cudaSuccess) {
         std::fprintf(stderr, "strata generate: cannot create the main stream\n");
         return 1;
     }
@@ -13607,12 +13624,22 @@ int main(int argc, char** argv) {
                 size_t reused_bytes = 0;
                 // STRATA_CKPT_POOL: the running state and the checkpoint copies go into dropped checkpoints' vectors
                 // (the ones this request drops refill the pool right after); what is left goes back
+                static const bool park_stage_pool_on = [] {
+                    const char* v = std::getenv("STRATA_PARK_STAGE_POOL");
+                    return v != nullptr && std::atoi(v) != 0;
+                }();
                 std::vector<ConvCheckpoint> storage;
-                if (ckpt_pool.on() && n_st == 0)
+                std::vector<std::vector<ConvCheckpoint>> stage_storage(n_st);
+                if (ckpt_pool.on() && (n_st == 0 || park_stage_pool_on))
                     for (size_t k = 0; k <= view.checkpoints.size(); ++k) {
                         ConvCheckpoint c = ckpt_pool.take();
                         if (c.gdn.empty()) break;
                         ++ck_from_pool;
+                        if (n_st > 0 && park_stage_pool_on && c.stage_parts.size() == n_st) {
+                            for (size_t si = 0; si < n_st; ++si)
+                                stage_storage[si].push_back(std::move(c.stage_parts[si]));
+                            c.stage_parts.clear();
+                        }
                         storage.push_back(std::move(c));
                     }
                 std::vector<ConvCheckpoint> moved;   // STRATA_PARK_ASYNC: the ones this request drops (view: the rest)
@@ -13628,9 +13655,10 @@ int main(int argc, char** argv) {
                 const bool saved = strata::core::conversation_snapshot_save(image, view, src.session, g, draft0, err,
                         std::move(reuse), &reused_bytes, storage.empty() ? nullptr : &storage,
                         moved.empty() ? nullptr : &moved);
-                for (ConvCheckpoint& c : storage) ckpt_pool.give(std::move(c));
-                if (!saved) return false;
-                pool_topup();   // what the park took (and what moved out) is allocated again, in the background
+                if (!saved) {
+                    for (ConvCheckpoint& c : storage) ckpt_pool.give(std::move(c));
+                    return false;
+                }
                 static const bool park_stage_threads = [] {
                     const char* v = std::getenv("STRATA_PARK_STAGE_THREADS");
                     return v != nullptr && v[0] != '\0' && v[0] != '0';
@@ -13646,28 +13674,55 @@ int main(int argc, char** argv) {
                         const strata::core::OnDevice on(st->dev);
                         if (cudaDeviceSynchronize() != cudaSuccess) { stage_errs[k] = "stage sync failed"; return; }
                         const strata::core::ConversationView view_k{src.ids, src.imgs, cs.parts[k], src.cvec};
+                        std::vector<ConvCheckpoint>* st_stor = (park_stage_pool_on && !stage_storage[k].empty()) ? &stage_storage[k] : nullptr;
                         stage_ok[k] = strata::core::conversation_snapshot_save(
                             parts[k], view_k, *src.stage_sessions[k], g, draft_of(k), stage_errs[k],
-                            std::move(stage_reuse[k]), &stage_reused[k]) ? 1 : 0;
+                            std::move(stage_reuse[k]), &stage_reused[k], st_stor, nullptr) ? 1 : 0;
                     });
                     for (size_t k = 0; k < n_st; ++k) {
                         reused_bytes += stage_reused[k];
-                        if (!stage_ok[k]) { err = stage_errs[k]; return false; }
+                        if (!stage_ok[k]) {
+                            for (ConvCheckpoint& c : storage) ckpt_pool.give(std::move(c));
+                            err = stage_errs[k];
+                            return false;
+                        }
                         image.stage_images.push_back(std::move(parts[k]));
                     }
                 } else {
                     for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
                         auto& st = stages[k];
                         const strata::core::OnDevice on(st->dev);
-                        if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
+                        if (cudaDeviceSynchronize() != cudaSuccess) {
+                            for (ConvCheckpoint& c : storage) ckpt_pool.give(std::move(c));
+                            err = "stage sync failed";
+                            return false;
+                        }
                         const strata::core::ConversationView view_k{src.ids, src.imgs, cs.parts[k], src.cvec};
                         strata::core::SavedConversation part;
+                        std::vector<ConvCheckpoint>* st_stor = (park_stage_pool_on && !stage_storage[k].empty()) ? &stage_storage[k] : nullptr;
                         if (!strata::core::conversation_snapshot_save(part, view_k, *src.stage_sessions[k], g, draft_of(k), err,
-                                std::move(stage_reuse[k]), &reused_bytes))
+                                std::move(stage_reuse[k]), &reused_bytes, st_stor, nullptr)) {
+                            for (ConvCheckpoint& c : storage) ckpt_pool.give(std::move(c));
                             return false;
+                        }
                         image.stage_images.push_back(std::move(part));
                     }
                 }
+                if (park_stage_pool_on && n_st > 0 && !storage.empty()) {
+                    for (size_t i = 0; i < storage.size(); ++i) {
+                        bool have_all = true;
+                        for (size_t k = 0; k < n_st; ++k) {
+                            if (i >= stage_storage[k].size()) { have_all = false; break; }
+                        }
+                        if (have_all) {
+                            storage[i].stage_parts.resize(n_st);
+                            for (size_t k = 0; k < n_st; ++k)
+                                storage[i].stage_parts[k] = std::move(stage_storage[k][i]);
+                        }
+                    }
+                }
+                for (ConvCheckpoint& c : storage) ckpt_pool.give(std::move(c));
+                pool_topup();   // what the park took (and what moved out) is allocated again, in the background
                 auto mem_after = strata::core::sample_host_memory();
                 // (the park pools' idle memory is the first RAM to go back here too: a park the check refuses with the pools held would pass without them)
                 if (!strata::core::conversation_memory_admit(
@@ -15547,6 +15602,69 @@ int main(int argc, char** argv) {
             }
         }
         g_gpu_pause_idle.idle(gpu_pause_now());   // AMD on Linux: the gap before the first request starts here (the start-up's own pauses are not a "between")
+#if !defined(_WIN32)
+        static const bool mlock_code_on = [] {
+            const char* v = std::getenv("STRATA_MLOCK_CODE");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        if (mlock_code_on) {
+            struct MlockStats { size_t bytes = 0; size_t segs = 0; } st;
+            const long pg = sysconf(_SC_PAGESIZE);
+            dl_iterate_phdr([](struct dl_phdr_info* info, size_t, void* data) -> int {
+                auto* s = static_cast<MlockStats*>(data);
+                const long page = sysconf(_SC_PAGESIZE);
+                for (int i = 0; i < info->dlpi_phnum; ++i) {
+                    const auto& ph = info->dlpi_phdr[i];
+                    if (ph.p_type == PT_LOAD && (ph.p_flags & PF_R) && !(ph.p_flags & PF_W) && ph.p_memsz > 0) {
+                        const uintptr_t a0 = (uintptr_t) info->dlpi_addr + (uintptr_t) ph.p_vaddr;
+                        const uintptr_t p0 = a0 & ~(uintptr_t) (page - 1);
+                        const uintptr_t p1 = (a0 + (uintptr_t) ph.p_memsz + (uintptr_t) (page - 1)) & ~(uintptr_t) (page - 1);
+                        if (p1 > p0 && ::mlock((const void*) p0, p1 - p0) == 0) {
+                            s->bytes += (size_t) (p1 - p0);
+                            ++s->segs;
+                        }
+                    }
+                }
+                return 0;
+            }, &st);
+            (void) pg;
+            std::fprintf(stderr, "strata serve: STRATA_MLOCK_CODE=1 locked %.1f MiB across %zu read-only PT_LOAD segments\n",
+                         (double) st.bytes / (1024.0 * 1024.0), st.segs);
+        }
+        static const bool drop_startup_mmap_on = [] {
+            const char* v = std::getenv("STRATA_DROP_STARTUP_MMAP");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        if (drop_startup_mmap_on && strata::prefill::Prefill::resident_experts_only()) {
+            std::FILE* mf = std::fopen("/proc/self/maps", "r");
+            if (mf) {
+                char line[1024];
+                size_t dropped_bytes = 0, dropped_segs = 0;
+                const std::string ple_base = o.ple_gguf.empty() ? std::string() : std::filesystem::path(o.ple_gguf).filename().string();
+                while (std::fgets(line, sizeof(line), mf)) {
+                    unsigned long long s_addr = 0, e_addr = 0;
+                    char perms[8] = {};
+                    char path[512] = {};
+                    if (std::sscanf(line, "%llx-%llx %7s %*s %*s %*s %511s", &s_addr, &e_addr, perms, path) == 4) {
+                        if (perms[0] == 'r' && perms[1] == '-' && e_addr > s_addr) {
+                            const std::string p(path);
+                            if (!ple_base.empty() && p.find(ple_base) != std::string::npos) continue;
+                            const bool is_model = (p.size() >= 5 && p.compare(p.size() - 5, 5, ".gguf") == 0) ||
+                                                  (p.size() >= 10 && p.compare(p.size() - 10, 10, "/dense.bin") == 0) ||
+                                                  (p.size() >= 12 && p.compare(p.size() - 12, 12, "/experts.bin") == 0);
+                            if (is_model && ::madvise((void*) (uintptr_t) s_addr, (size_t) (e_addr - s_addr), MADV_DONTNEED) == 0) {
+                                dropped_bytes += (size_t) (e_addr - s_addr);
+                                ++dropped_segs;
+                            }
+                        }
+                    }
+                }
+                std::fclose(mf);
+                std::fprintf(stderr, "strata serve: STRATA_DROP_STARTUP_MMAP=1 advised MADV_DONTNEED on %.1f MiB (%zu startup model mappings)\n",
+                             (double) dropped_bytes / (1024.0 * 1024.0), dropped_segs);
+            }
+        }
+#endif
         std::printf("READY %lld stop hold holdb\n", (long long) o.max_context);   // "stop": this engine honours STOP; "hold": GEN hold=N:ID; "holdb": the --batch slots end at the hold too (BDONE hold)
         std::fflush(stdout);
         std::string line;
@@ -19676,7 +19794,12 @@ int main(int argc, char** argv) {
                         bool read_ok = true;
                         std::string read_err;
                         in_prompt_read = true;
-                        sp.stop_at_chunk = [&] { return want_yield.load(std::memory_order_acquire) >= 0; };
+                        static const int64_t conc_subchunk_cfg = [] {
+                            const char* v = std::getenv("STRATA_CONC_SUBCHUNK");
+                            return v != nullptr ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 0;
+                        }();
+                        if (conc_subchunk_cfg <= 0 || b0 - q0 > conc_subchunk_cfg)
+                            sp.stop_at_chunk = [&] { return want_yield.load(std::memory_order_acquire) >= 0; };
                         share_gate();   // on this thread, before the reader starts
                         std::thread reader([&] {
                             conc_thread_cpus();
@@ -19846,10 +19969,22 @@ int main(int argc, char** argv) {
                                      std::chrono::duration<double, std::milli>(Clock::now() - tl).count());
                     }
                 }
+                static const int64_t conc_subchunk = [] {
+                    const char* v = std::getenv("STRATA_CONC_SUBCHUNK");
+                    return v != nullptr ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 0;
+                }();
+                auto conc_subchunk_active = [&]() -> bool {
+                    if (conc_subchunk <= 0 || !pr_conc) return false;
+                    if (batch_on()) return true;
+                    std::lock_guard<std::mutex> lk(in_mu);
+                    return !in_lines.empty();
+                };
                 int64_t piece = piece_now(b0 - a0);
-                if (piece <= 0) return run(a0, b0);
+                if (piece <= 0 && !conc_subchunk_active()) return run(a0, b0);
                 for (int64_t q = a0; q < b0;) {
                     int64_t cur_piece = piece_now(b0 - q);
+                    if (conc_subchunk_active() && (cur_piece <= 0 || cur_piece > conc_subchunk))
+                        cur_piece = conc_subchunk;
                     if (byield_subchunk > 0 && (cur_piece <= 0 || cur_piece > byield_subchunk)) {
                         std::lock_guard<std::mutex> lk(in_mu);
                         for (const auto& il : in_lines) {

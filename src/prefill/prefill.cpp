@@ -285,6 +285,18 @@ bool ple_copy_stream_on() {
 }
 }  // namespace
 namespace strata::prefill {
+
+static cudaError_t create_prefill_stream(cudaStream_t* s) {
+    static const bool low_prio = [] {
+        const char* v = std::getenv("STRATA_PREFILL_LOW_PRIO");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    if (!low_prio) return cudaStreamCreateWithFlags(s, cudaStreamNonBlocking);
+    int lo = 0, hi = 0;
+    if (cudaDeviceGetStreamPriorityRange(&lo, &hi) == cudaSuccess && lo != hi)
+        return cudaStreamCreateWithPriority(s, cudaStreamNonBlocking, lo);
+    return cudaStreamCreateWithFlags(s, cudaStreamNonBlocking);
+}
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -2539,7 +2551,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         m.tok_host.resize((size_t) chunk);
         m.tok_up.init((size_t) chunk);
     }
-    if (cudaStreamCreateWithFlags(&m.copy, cudaStreamNonBlocking) != cudaSuccess) { err = "prefill: copy stream"; return false; }
+    if (create_prefill_stream(&m.copy) != cudaSuccess) { err = "prefill: copy stream"; return false; }
     const size_t T = (size_t) chunk;
     m.T_max = chunk;
     m.borrowed = borrow != nullptr;
@@ -2644,7 +2656,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     // STRATA_PLE_COPY_STREAM: a stream of its own, not the expert copy stream - that one may hold a ring of blobs and
     // waits on their slots' release, so a wait on it could idle the compute stream for longer than the DMA itself
     if (ple_copy_stream_on() && m.ple_raw_dev != nullptr &&
-        ((!m.ple_copy && cudaStreamCreateWithFlags(&m.ple_copy, cudaStreamNonBlocking) != cudaSuccess) ||
+        ((!m.ple_copy && create_prefill_stream(&m.ple_copy) != cudaSuccess) ||
          (!m.ple_raw_free && cudaEventCreateWithFlags(&m.ple_raw_free, cudaEventDisableTiming) != cudaSuccess))) {
         // an optional optimization: the raw rows go up on the compute stream as with STRATA_PLE_COMPACT alone
         if (m.ple_copy) { (void) cudaStreamDestroy(m.ple_copy); m.ple_copy = nullptr; }
@@ -2675,7 +2687,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             (void) cudaGetLastError();
         }
         if (const char* kp = std::getenv("STRATA_KV_PREFETCH"); kp != nullptr && std::atoi(kp) != 0) {
-            if ((!m.kv_copy && cudaStreamCreateWithFlags(&m.kv_copy, cudaStreamNonBlocking) != cudaSuccess) ||
+            if ((!m.kv_copy && create_prefill_stream(&m.kv_copy) != cudaSuccess) ||
                 (!m.kv_released && cudaEventCreateWithFlags(&m.kv_released, cudaEventDisableTiming) != cudaSuccess) ||
                 (!m.kv_ready && cudaEventCreateWithFlags(&m.kv_ready, cudaEventDisableTiming) != cudaSuccess))
                 (void) cudaGetLastError();   // the request makes what is missing, and says so if it cannot
@@ -3259,9 +3271,9 @@ bool Prefill::set_stage_helper(Prefill* helper, std::string& err) {
     cudaGetDevice(&prev);
     pp->dev = h.device;
     cudaSetDevice(pp->dev);
-    ok = ok && cudaStreamCreateWithFlags(&pp->s, cudaStreamNonBlocking) == cudaSuccess &&
-         cudaStreamCreateWithFlags(&pp->s_out, cudaStreamNonBlocking) == cudaSuccess &&
-         cudaStreamCreateWithFlags(&pp->s_cp, cudaStreamNonBlocking) == cudaSuccess &&
+    ok = ok && create_prefill_stream(&pp->s) == cudaSuccess &&
+         create_prefill_stream(&pp->s_out) == cudaSuccess &&
+         create_prefill_stream(&pp->s_cp) == cudaSuccess &&
          cudaEventCreateWithFlags(&pp->ev_done, cudaEventDisableTiming) == cudaSuccess;
     for (int i = 0; ok && i < PeerPrefill::kGrpEv; ++i)
         ok = cudaEventCreateWithFlags(&pp->ev_grp[i], cudaEventDisableTiming) == cudaSuccess;
@@ -3378,7 +3390,7 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
     if (!pp->p2p) {   // the host route's copies on a stream of their own (STRATA_PF_PEER_XSTREAM=0: the compute stream)
         const char* xv = std::getenv("STRATA_PF_PEER_XSTREAM");
         if ((xv == nullptr || std::atoi(xv) != 0) &&
-            (cudaStreamCreateWithFlags(&pp->x_stream, cudaStreamNonBlocking) != cudaSuccess ||
+            (create_prefill_stream(&pp->x_stream) != cudaSuccess ||
              cudaEventCreateWithFlags(&pp->ev_x, cudaEventDisableTiming) != cudaSuccess)) {
             err = "prefill peer: copy stream";
             return false;
@@ -3388,14 +3400,14 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
     cudaGetDevice(&prev);
     pp->dev = peer->device();
     cudaSetDevice(pp->dev);
-    bool ok = cudaStreamCreateWithFlags(&pp->s, cudaStreamNonBlocking) == cudaSuccess &&
+    bool ok = create_prefill_stream(&pp->s) == cudaSuccess &&
               cudaEventCreateWithFlags(&pp->ev_done, cudaEventDisableTiming) == cudaSuccess;
     {
         const char* v = std::getenv("STRATA_PF_PEER_OUT_PIPE");   // =0: one copy after the last group (the A/B)
         pp->out_pipe = (v == nullptr || std::atoi(v) != 0) || pp->compact;   // compact always pipes
     }
     if (ok && pp->out_pipe) {
-        ok = cudaStreamCreateWithFlags(&pp->s_out, cudaStreamNonBlocking) == cudaSuccess;
+        ok = create_prefill_stream(&pp->s_out) == cudaSuccess;
         for (int i = 0; ok && i < PeerPrefill::kGrpEv; ++i)
             ok = cudaEventCreateWithFlags(&pp->ev_grp[i], cudaEventDisableTiming) == cudaSuccess;
     }
@@ -3430,7 +3442,7 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
             pp->pcopied.assign((size_t) pp->RP, nullptr);
             pp->pused.assign((size_t) pp->RP, nullptr);
             pp->plive.assign((size_t) pp->RP, 0);
-            ok = ok && cudaStreamCreateWithFlags(&pp->s_cp, cudaStreamNonBlocking) == cudaSuccess;
+            ok = ok && create_prefill_stream(&pp->s_cp) == cudaSuccess;
             for (int i = 0; ok && i < pp->RP; ++i) {
                 pp->pstage[(size_t) i] = (uint8_t*) take((size_t) MAXBLOB());
                 ok = ok && cudaEventCreateWithFlags(&pp->pcopied[(size_t) i], cudaEventDisableTiming) == cudaSuccess &&
@@ -4146,7 +4158,7 @@ bool Prefill::open_fp8_side(Prefill::Impl& m) {
     if (m.fp8_side != nullptr && m.fp8_pack_done != nullptr && m.fp8_ready[0] != nullptr && m.fp8_ready[1] != nullptr)
         return true;
     if (m.fp8_side == nullptr &&
-        cudaStreamCreateWithFlags(&m.fp8_side, cudaStreamNonBlocking) != cudaSuccess) {
+        create_prefill_stream(&m.fp8_side) != cudaSuccess) {
         m.fp8_side = nullptr;
         (void) cudaGetLastError();
         return false;
@@ -4220,7 +4232,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     }();
     const bool kv_prefetch = kv_prefetch_on;
     if (kv_prefetch) {
-        if ((!m.kv_copy && cudaStreamCreateWithFlags(&m.kv_copy, cudaStreamNonBlocking) != cudaSuccess) ||
+        if ((!m.kv_copy && create_prefill_stream(&m.kv_copy) != cudaSuccess) ||
             (!m.kv_released && cudaEventCreateWithFlags(&m.kv_released, cudaEventDisableTiming) != cudaSuccess) ||
             (!m.kv_ready && cudaEventCreateWithFlags(&m.kv_ready, cudaEventDisableTiming) != cudaSuccess)) {
             err = "prefill: KV prefetch stream/events";

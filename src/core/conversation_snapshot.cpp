@@ -227,7 +227,21 @@ struct ParkAsync {
     VramKvSlot* slot = nullptr;   // STRATA_PARK_VRAM_MIB: the begun park's slot (the stage is not used then)
     uint64_t slot_tag = 0;        // its tag, kept past launch for the image's and its layers' tokens
 };
-ParkAsync& park_async() { static ParkAsync a; return a; }
+ParkAsync& park_async() {
+    static const bool per_dev = [] {
+        const char* v = std::getenv("STRATA_PARK_STAGE_POOL");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    static ParkAsync a[16];
+    if (!per_dev) return a[0];
+#if defined(STRATA_GPU_METAL)
+    return a[0];
+#else
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) dev = 0;
+    return a[dev];
+#endif
+}
 constexpr size_t kParkPiece = (size_t) 4 << 20;
 bool park_async_on() {
 #if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)

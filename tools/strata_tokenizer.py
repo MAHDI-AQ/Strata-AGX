@@ -447,6 +447,7 @@ class PromptEncoder:
         self.entries: list[tuple[str, tuple, list[int], list[int], list[int]]] = []
         self.lock = threading.Lock()
         self.last_reused = 0                            # characters taken from an earlier prompt (for tests)
+        self._inflight: dict[tuple[str, tuple], list] = {}  # [event, result_tuple_or_None, exc_or_None]
 
     def encode(self, text: str, plain=(), store: bool = True) -> list[int]:
         plain = tuple(sorted(plain))
@@ -460,10 +461,34 @@ class PromptEncoder:
             if k >= 0 and (src is None or e[3][k] > src[3][cut_k]):
                 src, cut_k = e, k
         if src is None:
-            ids, marks = self.tok.encode_marked(text, parse_special=True, plain=plain)
-            ends, counts = [m[0] for m in marks], [m[1] for m in marks]
+            key = (text, plain)
+            leader = False
             with self.lock:
-                self.last_reused = 0
+                flight = self._inflight.get(key)
+                if flight is None:
+                    flight = [threading.Event(), None, None]
+                    self._inflight[key] = flight
+                    leader = True
+            if not leader:
+                flight[0].wait()
+                if flight[2] is not None:
+                    raise flight[2]
+                ids, ends, counts = flight[1]
+                return list(ids)
+            try:
+                ids, marks = self.tok.encode_marked(text, parse_special=True, plain=plain)
+                ends, counts = [m[0] for m in marks], [m[1] for m in marks]
+                with self.lock:
+                    self.last_reused = 0
+                    flight[1] = (ids, ends, counts)
+                    self._inflight.pop(key, None)
+                    flight[0].set()
+            except BaseException as exc:
+                with self.lock:
+                    flight[2] = exc
+                    self._inflight.pop(key, None)
+                    flight[0].set()
+                raise
         else:
             c, n = src[3][cut_k], src[4][cut_k]
             rest = tuple((max(x - c, 0), y - c) for x, y in plain if y > c)

@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <mutex>
 #include <vector>
 #include <cstdlib>
 
@@ -350,11 +352,89 @@ void kv_stage_block_from_host(const QsaAttnPools& stage, const KvHostPools& host
             check("stage_block");
 }
 
+__global__ void __launch_bounds__(256) stage_mark_selected_kernel(
+    const int32_t* __restrict__ sel_ids, int64_t n_sel, int64_t n_prefix_blocks, uint8_t* __restrict__ d_want) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_sel) {
+        const int32_t b = sel_ids[i];
+        if (b >= 0 && (int64_t) b < n_prefix_blocks) d_want[b] = 1;
+    }
+}
+
+__global__ void __launch_bounds__(256) stage_copy_selected_runs_kernel(
+    const uint8_t* __restrict__ d_want, int64_t n_prefix_blocks, Runs r) {
+    for (int64_t b = blockIdx.x; b < n_prefix_blocks; b += gridDim.x) {
+        if (!d_want[b]) continue;
+        if (b > 0 && d_want[b - 1]) continue;
+        int64_t run_len = 1;
+        while (b + run_len < n_prefix_blocks && d_want[b + run_len]) ++run_len;
+        #pragma unroll
+        for (int a = 0; a < 4; ++a) {
+            if (a >= r.n) break;
+            const size_t total_u4 = (size_t) run_len * (r.len[a] / 16);
+            const uint4* src = reinterpret_cast<const uint4*>(r.src[a] + b * r.len[a]);
+            uint4* dst = reinterpret_cast<uint4*>(r.dst[a] + b * r.len[a]);
+            const size_t stride = (size_t) blockDim.x * 4;
+            size_t base = 0;
+            for (; base + stride <= total_u4; base += stride) {
+                uint4 v0 = src[base + 0 * blockDim.x + threadIdx.x];
+                uint4 v1 = src[base + 1 * blockDim.x + threadIdx.x];
+                uint4 v2 = src[base + 2 * blockDim.x + threadIdx.x];
+                uint4 v3 = src[base + 3 * blockDim.x + threadIdx.x];
+                dst[base + 0 * blockDim.x + threadIdx.x] = v0;
+                dst[base + 1 * blockDim.x + threadIdx.x] = v1;
+                dst[base + 2 * blockDim.x + threadIdx.x] = v2;
+                dst[base + 3 * blockDim.x + threadIdx.x] = v3;
+            }
+            for (size_t i = base + threadIdx.x; i < total_u4; i += blockDim.x) {
+                dst[i] = src[i];
+            }
+        }
+    }
+}
+
+static uint8_t* kv_stage_want_buf(int dev, int64_t need) {
+    struct Entry { uint8_t* ptr = nullptr; int64_t cap = 0; };
+    static std::mutex mu;
+    static Entry entries[16];
+    if (dev < 0 || dev >= 16) return nullptr;
+    std::lock_guard<std::mutex> lk(mu);
+    Entry& e = entries[dev];
+    if (e.cap < need) {
+        if (e.ptr) { cudaFree(e.ptr); e.ptr = nullptr; e.cap = 0; }
+        if (cudaMalloc((void**) &e.ptr, (size_t) need) != cudaSuccess) return nullptr;
+        e.cap = need;
+    }
+    return e.ptr;
+}
+
 void kv_stage_selected_from_host(const QsaAttnPools& stage, const KvHostPools& host, int fmt,
                                  const int32_t* sel_ids_dev, int64_t n_sel, int64_t n_prefix_blocks,
                                  const QsaShapes& s, void* stream) {
     if (n_prefix_blocks <= 0 || n_sel <= 0 || sel_ids_dev == nullptr) return;
     cudaStream_t cs = (cudaStream_t) stream;
+    static const bool gpu_sel = [] {
+        const char* v = std::getenv("STRATA_KV_STAGE_SEL_GPU");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    if (gpu_sel) {
+        int dev = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess) {
+            uint8_t* d_want = kv_stage_want_buf(dev, n_prefix_blocks);
+            if (d_want != nullptr) {
+                if (cudaMemsetAsync(d_want, 0, (size_t) n_prefix_blocks, cs) != cudaSuccess) {
+                    check("stage_selected_zero");
+                    return;
+                }
+                const int blocks = (int) ((n_sel + 255) / 256);
+                stage_mark_selected_kernel<<<blocks, 256, 0, cs>>>(sel_ids_dev, n_sel, n_prefix_blocks, d_want);
+                const Runs r = runs_of(stage, host, fmt, s);
+                stage_copy_selected_runs_kernel<<<96, 256, 0, cs>>>(d_want, n_prefix_blocks, r);
+                check("stage_selected_gpu");
+                return;
+            }
+        }
+    }
     std::vector<int32_t> h_ids((size_t) n_sel);
     if (cudaMemcpyAsync(h_ids.data(), sel_ids_dev, (size_t) n_sel * sizeof(int32_t),
                         cudaMemcpyDeviceToHost, cs) != cudaSuccess ||

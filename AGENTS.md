@@ -113,3 +113,7 @@ follow it whether a person or an agent writes the text. The short version:
 ## Wave K14 Opt-In Controls
 
 - `STRATA_SAMPLER_BATCH_ROWS=1`, `STRATA_PARK_STAGE_THREADS=1`, `STRATA_TOPK_ACTIVE_SM89=1`, `STRATA_KV_STREAM_WIDE=1` (registered in `data/settings-register.json` as `opt-in`; default paths remain bitwise identical).
+
+## Wave K15 Opt-In Controls
+
+- `STRATA_KV_STAGE_SEL_GPU=1`, `STRATA_SAMPLER_ASYNC=1`, `STRATA_GDN_NORM_QFUSE=1`, `STRATA_GDN_CONV_GROUPS=1`, `STRATA_CONC_SUBCHUNK=512`, `STRATA_PREFILL_LOW_PRIO=1`, `STRATA_PARK_STAGE_POOL=1`, `STRATA_MLOCK_CODE=1`, `STRATA_DROP_STARTUP_MMAP=1`, `STRATA_HTTP_KEEPALIVE` (registered in `data/settings-register.json` as `opt-in`; default paths remain bitwise identical).
