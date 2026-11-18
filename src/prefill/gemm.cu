@@ -1700,11 +1700,20 @@ __global__ void __launch_bounds__(256) y32_per_token_accum_epilogue_kernel(
 }
 
 inline int64_t get_t_bucket(int64_t T) {
-    static constexpr int64_t kBuckets[] = {128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096};
+    static constexpr int64_t kBuckets[] = {16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096};
     for (int64_t b : kBuckets) {
         if (T <= b) return b;
     }
     return ((T + 1023) / 1024) * 1024;
+}
+
+inline int64_t pf_fp8_min_t() {
+    const char* v = std::getenv("STRATA_PF_FP8_MIN_T");
+    if (v != nullptr && v[0] != '\0') {
+        const int64_t n = std::atoll(v);
+        if (n >= 1) return n;
+    }
+    return 128;
 }
 
 bool env_is_1(const char* name) {
@@ -1891,7 +1900,7 @@ bool Gemm::fp8(const uint16_t* X, const uint8_t* W8, const float* d_inv_scale_w,
     }();
     // Real prompt shapes only (the FP8 gate is T >= 128). Once per cache key, on the first call outside capture.
     // Timing during capture is illegal; beta != 0 would accumulate into Y across the timed runs.
-    const bool tune = !force_no_algo && beta == 0.0f && T >= 128 && env_is_1("STRATA_PF_FP8_AUTOTUNE") &&
+    const bool tune = !force_no_algo && beta == 0.0f && T >= pf_fp8_min_t() && env_is_1("STRATA_PF_FP8_AUTOTUNE") &&
                       !stream_capturing(stream_);
     if (tune && it != algo_cache_.end() && it->second.tuned && !it->second.valid) return false;
     if (it != algo_cache_.end() && it->second.valid && (!tune || it->second.tuned)) {
@@ -2365,7 +2374,7 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
                 }
             }
         }
-        if (cw8 != nullptr && T >= 128) {
+        if (cw8 != nullptr && T >= pf_fp8_min_t()) {
             if (fp8(X, cw8, d_scale_w, Y, T, N, K, ldy, beta, ldx, act_amax, reuse_x8, act_ticket)) return;
         }
     }

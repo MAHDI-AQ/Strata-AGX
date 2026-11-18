@@ -83,6 +83,12 @@ Keep `STRATA_READ_WIN_MAX_T=0` (upstream default) whenever `ver.max_t() > S` (fo
 - `SD_r512_c8`: `653.91 -> 677.53 tok/s` (+3.6%)
 - `SD_r65536_c4`: `393.91 -> 417.74 tok/s` (+6.0%)
 - `SD_r65536_c8`: `608.71 -> 615.03 tok/s` (+1.0%)
+- `MPD_a65536_4D_4P`: `ret=176.38% -> 188.93%` (+12.55 pp)
+- `SD_r131072_c1`: `154.05 -> 159.69 tok/s` (+3.7%)
+- `SD_r131072_c8`: `598.78 -> 602.08 tok/s` (+0.6%)
+- `SD_r262144_c1`: `147.61 -> 150.69 tok/s` (+2.1%)
+- `SD_r262144_c4`: `404.52 -> 409.35 tok/s` (+1.2%)
+- `--smoke` (5k/slot, 4-slot): `100.0% / 0.0% / 100.0%`, `105.8 -> 125.0 tok/s` (+18.1%), `NEEDLE_GATE 8/8`, `leaks=0`, `0` spills, `0` Xids
 
 ### Wave K15 Measured Gains (4x RTX 4090 `sm_89`, `8x512k @ 128k`, vs Wave K14)
 
@@ -96,9 +102,11 @@ Keep `STRATA_READ_WIN_MAX_T=0` (upstream default) whenever `ver.max_t() > S` (fo
 - `SD_r262144_c8`: `637.71 -> 671.77 tok/s` (+5.3%)
 - `MPD_a65536_4D_4P`: `dec_during_pf 283.15 -> 286.35 tok/s` (+1.1%)
 - `max_expert_reads`: `50301.1 MB -> 0.0 MB`, `NEEDLE_GATE 8/8`, `leaks=0`, `new_xids=0`, 4-slot smoke `100.0% / 0.0% / 100.0%`.
-- `MPD_a65536_4D_4P`: `ret=176.38% -> 188.93%` (+12.55 pp)
-- `SD_r131072_c1`: `154.05 -> 159.69 tok/s` (+3.7%)
-- `SD_r131072_c8`: `598.78 -> 602.08 tok/s` (+0.6%)
-- `SD_r262144_c1`: `147.61 -> 150.69 tok/s` (+2.1%)
-- `SD_r262144_c4`: `404.52 -> 409.35 tok/s` (+1.2%)
-- `--smoke` (5k/slot, 4-slot): `100.0% / 0.0% / 100.0%`, `105.8 -> 125.0 tok/s` (+18.1%), `NEEDLE_GATE 8/8`, `leaks=0`, `0` spills, `0` Xids
+
+### Wave K16 Measured Gains (4x RTX 4090 `sm_89`, `8x512k @ 208k` resident, vs Wave K15)
+
+- **Opt-in controls:** `STRATA_PF_FP8_MIN_T=32` (default `128`; sub-128 `kBuckets[]` `16, 32, 48, 64, 96` in `src/prefill/gemm.cu`), plus `--kv-resident 212992` (`208k` resident KV, preserving `>= 600 MiB` free VRAM floor across all 4 GPUs).
+- **8-Agent Short-Burst (65k ctx, 6 turns, deltas 64..512):** `turns/min` `215.95 -> 234.08` (+8.4%), `ttft_p50` `1191.4 -> 718.21 ms` (-39.7%), `agg_decode` `178.23 -> 181.09 tok/s`, `needles=8/8`, `leaks=0`, `min_vram_free=858 MiB`.
+- **8-Agent Short-Burst (192k ctx, 4 turns, deltas 64..512):** `turns/min` `123.34 -> 137.42` (+11.4%), `ttft_p50` `2164.54 -> 1912.92 ms` (-11.6%), `needles=8/8`, `leaks=0`, `min_vram_free=842 MiB`.
+- **`512..262144` Fast Gate:** `SD_r512_c1` `185.62 -> 202.79 tok/s` (+9.3%), `SD_r512_c8` `684.45 -> 706.91 tok/s` (+3.3%), `NEEDLE_GATE 8/8`, `leaks=0`, `min_vram_free=642 MiB`, `new_xids=0`, `max_expert_reads=0.0 MB`.
+- **4-Slot Smoke (5k/slot):** `100.0% / 0.0% / 100.0%`, `Mean TTFT 690.0 ms`, `0` spills.

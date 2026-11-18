@@ -26248,6 +26248,38 @@
       "retired_in": ""
     },
     {
+      "name": "STRATA_PF_FP8_MIN_T",
+      "backends": [
+        "cuda-hip"
+      ],
+      "reads": [
+        {
+          "file": "src/prefill/gemm.cu",
+          "line": 1712,
+          "backend": "cuda-hip",
+          "fn": "getenv"
+        }
+      ],
+      "parse": "int",
+      "default_state": null,
+      "code_default": "128",
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_defaults": [],
+      "since": null,
+      "first_commit": "06d2148f8e",
+      "first_date": "2026-11-18",
+      "last_commit": "06d2148f8e",
+      "last_date": "2026-11-18",
+      "status": "opt-in",
+      "owner": "",
+      "note": "Wave K16",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
       "name": "STRATA_PF_FP8_PAIR_TICKET",
       "backends": [
         "cuda-hip"

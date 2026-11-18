@@ -117,3 +117,8 @@ follow it whether a person or an agent writes the text. The short version:
 ## Wave K15 Opt-In Controls
 
 - `STRATA_KV_STAGE_SEL_GPU=1`, `STRATA_SAMPLER_ASYNC=1`, `STRATA_GDN_NORM_QFUSE=1`, `STRATA_GDN_CONV_GROUPS=1`, `STRATA_CONC_SUBCHUNK=512`, `STRATA_PREFILL_LOW_PRIO=1`, `STRATA_PARK_STAGE_POOL=1`, `STRATA_MLOCK_CODE=1`, `STRATA_DROP_STARTUP_MMAP=1`, `STRATA_HTTP_KEEPALIVE` (registered in `data/settings-register.json` as `opt-in`; default paths remain bitwise identical).
+
+## Wave K16 Opt-In Controls
+
+- `STRATA_PF_FP8_MIN_T=32` (default `128`; lowers the SM89 FP8 prefill GEMM token threshold with sub-128 bucket sizing `16, 32, 48, 64, 96` in `src/prefill/gemm.cu`, registered in `data/settings-register.json` as `opt-in`; default path remains bitwise identical).
+- Production `8x512k` resident KV headroom: `--kv-resident 212992` (`208k`), maintaining `>= 600 MiB` free VRAM floor across all 4 GPUs (`min_vram_free=642 MiB` under `8x262k` load).

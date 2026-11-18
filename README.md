@@ -94,7 +94,7 @@ Strata-AGX supports homogeneous 1×, 2×, and 4× 24 GiB Ada Lovelace (`sm_89`) 
 
 ---
 
-## Wave K1–K15 `sm_89` Optimizations
+## Wave K1–K16 `sm_89` Optimizations
 
 Strata-AGX adds targeted Ada Lovelace (`sm_89`) optimizations while keeping `--vanilla-defaults` available to restore upstream defaults:
 

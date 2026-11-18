@@ -105,7 +105,9 @@ int main() {
         if (s.N > max_n) max_n = s.N;
     }
 
-    const int64_t Ts[] = {16, 64, 128, 512, 2048};
+    const char* min_t_env = std::getenv("STRATA_PF_FP8_MIN_T");
+    const int64_t active_min_t = (min_t_env && min_t_env[0] && std::atoll(min_t_env) >= 1) ? std::atoll(min_t_env) : 128;
+    const int64_t Ts[] = {16, 32, 48, 64, 82, 96, 112, 128, 512, 2048};
     const int64_t Tmax = 2048;
 
     uint16_t* X = nullptr;
@@ -130,62 +132,72 @@ int main() {
     printf("gemm_fp8_parity: qualifying Surgical FP8 Prefill Weight Cache (w8_)\n");
     printf("========================================================================\n");
 
+    const float betas[] = {0.0f, 1.0f};
     for (const Weight& w : ws) {
         for (const int64_t T : Ts) {
-            std::vector<float> out[2];
-            for (int on = 0; on < 2; ++on) {
-                // on = 0: FP16 baseline (w8 disabled)
-                // on = 1: FP8 cache active (w8 auto)
-                setenv("STRATA_PF_W8_CACHE", on ? "1" : "0", 1);
-                setenv("STRATA_PF_W16_CACHE_MIB", "0", 1); // ensure w16 does not interfere
+            for (const float beta : betas) {
+                // Only test beta=1.0f when active_min_t < 128 or on representative Ts to keep runtime fast
+                if (beta != 0.0f && active_min_t >= 128 && T != 64 && T != 128) continue;
+                std::vector<float> out[2];
+                for (int on = 0; on < 2; ++on) {
+                    setenv("STRATA_PF_W8_CACHE", on ? "1" : "0", 1);
+                    setenv("STRATA_PF_W16_CACHE_MIB", "0", 1);
 
-                strata::prefill::Gemm gemm;
-                std::string err;
-                if (!gemm.init(st, scratch_elems, err)) {
-                    std::printf("FAIL: gemm.init: %s\n", err.c_str());
-                    return 1;
-                }
-
-                cudaMemset(Y[on], 0, (size_t) T * max_n * 4);
-
-                // Run twice when on=1: first call caches in w8_, second call hits w8_
-                for (int rep = 0; rep < (on ? 2 : 1); ++rep) {
-                    gemm.native(X, qts[w.s.qt].type, w.dev, Y[on], T, w.s.N, w.s.K, max_n, 0.0f);
-                }
-                if (!ok(cudaStreamSynchronize(st), "run")) return 1;
-
-                out[on].resize((size_t) T * max_n);
-                cudaMemcpy(out[on].data(), Y[on], (size_t) T * max_n * 4, cudaMemcpyDeviceToHost);
-            }
-
-            total_checked++;
-
-            double dot = 0.0, norm0 = 0.0, norm1 = 0.0, diff_sq = 0.0;
-            bool has_nan = false;
-
-            for (int64_t r = 0; r < T; ++r) {
-                for (int64_t c = 0; c < w.s.N; ++c) {
-                    float v0 = out[0][(size_t) r * max_n + c];
-                    float v1 = out[1][(size_t) r * max_n + c];
-
-                    if (std::isnan(v0) || std::isnan(v1) || std::isinf(v0) || std::isinf(v1)) {
-                        has_nan = true;
-                        break;
+                    strata::prefill::Gemm gemm;
+                    std::string err;
+                    if (!gemm.init(st, scratch_elems, err)) {
+                        std::printf("FAIL: gemm.init: %s\n", err.c_str());
+                        return 1;
                     }
 
-                    dot += (double)v0 * (double)v1;
-                    norm0 += (double)v0 * (double)v0;
-                    norm1 += (double)v1 * (double)v1;
-                    double diff = (double)v0 - (double)v1;
-                    diff_sq += diff * diff;
+                    if (beta != 0.0f) {
+                        cudaMemset(Y[on], 0x3e, (size_t) T * max_n * 4);
+                    } else {
+                        cudaMemset(Y[on], 0, (size_t) T * max_n * 4);
+                    }
+
+                    // Run twice when on=1: first call caches in w8_, second call hits w8_ (use beta=0 on warmup rep if beta!=0)
+                    if (on) {
+                        gemm.native(X, qts[w.s.qt].type, w.dev, Y[on], T, w.s.N, w.s.K, max_n, 0.0f);
+                        if (beta != 0.0f) cudaMemset(Y[on], 0x3e, (size_t) T * max_n * 4);
+                        gemm.native(X, qts[w.s.qt].type, w.dev, Y[on], T, w.s.N, w.s.K, max_n, beta);
+                    } else {
+                        gemm.native(X, qts[w.s.qt].type, w.dev, Y[on], T, w.s.N, w.s.K, max_n, beta);
+                    }
+                    if (!ok(cudaStreamSynchronize(st), "run")) return 1;
+
+                    out[on].resize((size_t) T * max_n);
+                    cudaMemcpy(out[on].data(), Y[on], (size_t) T * max_n * 4, cudaMemcpyDeviceToHost);
                 }
-                if (has_nan) break;
-            }
 
-            double cos_sim = (norm0 > 0.0 && norm1 > 0.0) ? (dot / (std::sqrt(norm0) * std::sqrt(norm1))) : 0.0;
-            double rel_l2_err = (norm0 > 0.0) ? (std::sqrt(diff_sq) / std::sqrt(norm0)) : 1.0;
+                total_checked++;
 
-            if (T < 128) {
+                double dot = 0.0, norm0 = 0.0, norm1 = 0.0, diff_sq = 0.0;
+                bool has_nan = false;
+
+                for (int64_t r = 0; r < T; ++r) {
+                    for (int64_t c = 0; c < w.s.N; ++c) {
+                        float v0 = out[0][(size_t) r * max_n + c];
+                        float v1 = out[1][(size_t) r * max_n + c];
+
+                        if (std::isnan(v0) || std::isnan(v1) || std::isinf(v0) || std::isinf(v1)) {
+                            has_nan = true;
+                            break;
+                        }
+
+                        dot += (double)v0 * (double)v1;
+                        norm0 += (double)v0 * (double)v0;
+                        norm1 += (double)v1 * (double)v1;
+                        double diff = (double)v0 - (double)v1;
+                        diff_sq += diff * diff;
+                    }
+                    if (has_nan) break;
+                }
+
+                double cos_sim = (norm0 > 0.0 && norm1 > 0.0) ? (dot / (std::sqrt(norm0) * std::sqrt(norm1))) : 0.0;
+                double rel_l2_err = (norm0 > 0.0) ? (std::sqrt(diff_sq) / std::sqrt(norm0)) : 1.0;
+
+                if (T < active_min_t) {
                 // Assert exact fallback to standard FP16 GEMM (cosine similarity > 0.99999 or diff_sq == 0)
                 bool pass = (!has_nan && (cos_sim > 0.99999 || diff_sq == 0.0));
                 if (pass) {
@@ -206,6 +218,7 @@ int main() {
                            (long long)T, qts[w.s.qt].name, w.s.what, cos_sim, rel_l2_err * 100.0, has_nan);
                     failed++;
                 }
+            }
             }
         }
     }
