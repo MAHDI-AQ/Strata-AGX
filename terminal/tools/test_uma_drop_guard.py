@@ -38,7 +38,7 @@ class UmaDropGuard(unittest.TestCase):
 
     def test_call_and_line_inside_the_guard(self):
         first, last = guarded_span(self.lines)
-        for needle in ("drop_cached_pages(", "holds every expert, so the", "getenv(\"STRATA_UMA_DROP_PAGES\")"):
+        for needle in ("freed = src.drop_cached_pages(", "holds every expert, so the", "getenv(\"STRATA_UMA_DROP_PAGES\")"):
             at = [i for i, l in enumerate(self.lines) if needle in l]
             self.assertTrue(at, needle)
             for i in at:
