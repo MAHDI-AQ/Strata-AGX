@@ -692,7 +692,17 @@ private:
     // (per window size T = 1..kVerifyLongT: a solo window is at most 8 rows (16 with --lookup-max-t), but a merge window of a wide batch is not)
     cudaGraphExec_t exec_[2][strata::kernels::kVerifyLongT + 1] = {};
     cudaGraphExec_t exec_nr_[2][strata::kernels::kVerifyLongT + 1] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
+    cudaGraphExec_t exec_no_head_[2][strata::kernels::kVerifyLongT + 1] = {};   // STRATA_READ_WIN_NO_HEAD=1
     bool launched_[2][strata::kernels::kVerifyLongT + 1] = {}, launched_nr_[2][strata::kernels::kVerifyLongT + 1] = {};   ///< this graph has been launched once (early_ple_flag: a cold first launch raises the PLE flag first)
+    bool launched_no_head_[2][strata::kernels::kVerifyLongT + 1] = {};
+    static bool read_win_no_head_on() {
+        static const bool on = [] {
+            const char* v = std::getenv("STRATA_READ_WIN_NO_HEAD");
+            return v != nullptr && v[0] == '1' && v[1] == '\0';
+        }();
+        return on;
+    }
+    bool use_no_head_graph() const { return !head_sampling_ && !batch_rec_ && !ar_off_ && read_win_no_head_on(); }
     int sel_long_ = 0;
     // fork 34a35db (STRATA_SIDE_MIXER=1): the GDN gates and the QSA indexer on a branch of the window's graph beside the
     // mixer's projections, joined before the recurrence / the attention

@@ -1883,7 +1883,11 @@ bool Gemm::fp8(const uint16_t* X, const uint8_t* W8, const float* d_inv_scale_w,
     const bool bufs_ok = x8_ != nullptr && x8_bytes_ >= want_bytes &&
                          (per_token ? (d_inv_scale_tok_ != nullptr && inv_scale_tok_cap_ >= (size_t) T)
                                     : (d_inv_scale_x_ != nullptr));
-    const bool gdn_reuse = !pad_small_t && reuse_x8 && x8_key_valid_ && x8_key_x_ == X && x8_key_amax_ == act_amax &&
+    static const bool allow_pad_reuse = [] {
+        const char* v = std::getenv("STRATA_PF_FP8_SMALL_T_REUSE");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    const bool gdn_reuse = (allow_pad_reuse || !pad_small_t) && reuse_x8 && x8_key_valid_ && x8_key_x_ == X && x8_key_amax_ == act_amax &&
                            x8_key_t_ == T && x8_key_k_ == K && x8_key_ldx_ == ldx &&
                            x8_key_per_token_ == per_token && bufs_ok;
     const bool ticket_reuse = !gdn_reuse && pf_fp8_pair_ticket_on() && act_ticket != nullptr &&
@@ -1919,10 +1923,10 @@ bool Gemm::fp8(const uint16_t* X, const uint8_t* W8, const float* d_inv_scale_w,
     if (!ticket_reuse && act_ticket != nullptr && pf_fp8_pair_ticket_on()) {
         *act_ticket = {X, T, K, ldx, act_amax, per_token, x8_gen_, true};
     }
-    if (pad_small_t && T_pad > T) {
+    if ((allow_pad_reuse ? (!gdn_reuse && !ticket_reuse) : true) && pad_small_t && T_pad > T) {
         cudaMemsetAsync(x8_ + T * K, 0, (size_t) (T_pad - T) * (size_t) K, (cudaStream_t) stream_);
     }
-    if (gdn_qkvz_on() && !pad_small_t) {
+    if (gdn_qkvz_on() && (allow_pad_reuse || !pad_small_t)) {
         x8_key_valid_ = true;
         x8_key_x_ = X;
         x8_key_amax_ = act_amax;

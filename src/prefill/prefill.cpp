@@ -4603,7 +4603,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const char* v = std::getenv("STRATA_PF_SMALL_T_RUN");
                     return v != nullptr && v[0] == '1' && v[1] == '\0';
                 }();
-                const bool pref_tail_only = small_t_run && T <= 256 && p0 > state.n_slots * s.page_size;
+                static const bool small_t_resident_staged = [] {
+                    const char* v = std::getenv("STRATA_PF_SMALL_T_RESIDENT_STAGED");
+                    return v != nullptr && v[0] == '1' && v[1] == '\0';
+                }();
+                const bool pref_tail_only = (small_t_run || small_t_resident_staged) && T <= 256 &&
+                                            (small_t_resident_staged ? p0 > 0 : p0 > state.n_slots * s.page_size);
                 if (pref_tail_only) {
                     if ((p0 % s.page_size) != 0) {
                         strata::kernels::kv_stage_block_from_host(pools_of(m.stage, m.ident_table), state.host,
@@ -4631,7 +4636,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         const strata::kernels::cpu::ExpertLayout& lay0 = strata::kernels::cpu::expert_layout();
         const bool res_only = Prefill::resident_experts_only();
         const bool stream_all = !res_only && m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
-        const bool known_all = stream_all || (res_only && (int64_t) T >= stream_all_min());
+        static const int64_t resident_small_t = [] {
+            const char* v = std::getenv("STRATA_PF_RESIDENT_SMALL_T");
+            return v != nullptr ? std::atoll(v) : 0;
+        }();
+        const bool known_all = stream_all || (res_only && (int64_t) T >= (resident_small_t > 0 ? std::min<int64_t>(stream_all_min(), resident_small_t) : stream_all_min()));
         // the CPU share: this chunk takes the pool if no other stage of a layer split has it now (released at the end
         // of the chunk, after the last layer's CPU thread is joined)
         struct PoolHold {
@@ -5245,7 +5254,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const char* v = std::getenv("STRATA_PF_SMALL_T_RUN");
                         return v != nullptr && v[0] == '1' && v[1] == '\0';
                     }();
-                    const bool staged_selected = small_t_run && staged && T <= 256 && p0 > st.n_slots * s.page_size;
+                    static const bool small_t_resident_staged = [] {
+                        const char* v = std::getenv("STRATA_PF_SMALL_T_RESIDENT_STAGED");
+                        return v != nullptr && v[0] == '1' && v[1] == '\0';
+                    }();
+                    const bool staged_selected = (small_t_run || small_t_resident_staged) && staged && T <= 256 &&
+                                                 (small_t_resident_staged ? p0 > 0 : p0 > st.n_slots * s.page_size);
                     if (staged && !staged_selected) {
                         pt.mark(kPfKvStage, cs);
                         if (kv_pending == qsa_index) {
@@ -9098,8 +9112,12 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                             const char* v = std::getenv("STRATA_PREFILL_SMALL_T_RESIDENT");
                             return v != nullptr && v[0] == '1' && v[1] == '\0';
                         }();
-                        const bool staged_selected = small_t_resident && staged && T <= 256 &&
-                                                     p0 > st.n_slots * s.page_size;
+                        static const bool small_t_resident_staged = [] {
+                            const char* v = std::getenv("STRATA_PF_SMALL_T_RESIDENT_STAGED");
+                            return v != nullptr && v[0] == '1' && v[1] == '\0';
+                        }();
+                        const bool staged_selected = (small_t_resident || small_t_resident_staged) && staged && T <= 256 &&
+                                                     (small_t_resident_staged ? p0 > 0 : p0 > st.n_slots * s.page_size);
                         if (staged && !staged_selected) {
                             pt.mark(kPfKvStage, cs);
                             strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), st.host,

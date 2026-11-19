@@ -13845,6 +13845,24 @@ int main(int argc, char** argv) {
                     if (!as_tail && L == tail_ckpt_len) tail_ckpt_len = -1;   // a periodic one lands here: a normal item now
                     return true;
                 }
+            static const bool conv_mem_floor = [] {
+                const char* v = std::getenv("STRATA_CONV_CACHE_MEM_FLOOR");
+                return v != nullptr && v[0] == '1' && v[1] == '\0';
+            }();
+            if (conv_mem_floor && o.conversation_cache_min_free_mib > 0 && conversations.size() > 0) {
+                const uint64_t floor_bytes = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
+                auto mem = strata::core::sample_host_memory();
+                if (mem && mem->available < floor_bytes) {
+                    (void) strata::core::release_free_heap();
+                    mem = strata::core::sample_host_memory();
+                    size_t ev = 0;
+                    while (mem && mem->available < floor_bytes && conversations.size() > 0 &&
+                           ev < conversations.slots() && conversations.evict_oldest()) {
+                        ++ev;
+                        mem = strata::core::sample_host_memory();
+                    }
+                }
+            }
             ConvCheckpoint c = parts == nullptr ? ckpt_pool.take() : ConvCheckpoint{};   // (STRATA_CKPT_POOL)
             if (parts == nullptr && ckpt_pool.on()) (c.gdn.empty() ? ck_fresh : ck_from_pool)++;
             if (parts == nullptr) pool_topup();   // the next save finds one ready (between requests only)
@@ -13967,7 +13985,12 @@ int main(int argc, char** argv) {
             checks.push_back(std::move(c));
             const Clock::time_point te0 = Clock::now();
             const size_t before_evict = checks.size();
-            while ((int) checks.size() > o.prompt_cache) {
+            static const int slot_ckpt_cap = [] {
+                const char* v = std::getenv("STRATA_SLOT_PROMPT_CACHE");
+                return v != nullptr ? std::atoi(v) : 0;
+            }();
+            const int max_slot_ckpts = slot_ckpt_cap > 0 ? std::min(o.prompt_cache, slot_ckpt_cap) : o.prompt_cache;
+            while ((int) checks.size() > max_slot_ckpts) {
                 std::vector<uint64_t> stamps;
                 std::vector<char> is_tail;
                 stamps.reserve(checks.size());
@@ -13990,8 +14013,8 @@ int main(int argc, char** argv) {
                 for (const ConvCheckpoint& k : checks) lens.push_back((int64_t) k.ids.size());
                 const size_t victim = o.prompt_cache_spread
                     ? strata::program::conv_cache::spread_victim(lens.data(), stamps.data(), stamps.size(),
-                                                                 o.prompt_cache, tail_flags.get(), pin_flags.get())
-                    : strata::program::conv_cache::eviction_victim(stamps.data(), stamps.size(), o.prompt_cache,
+                                                                 max_slot_ckpts, tail_flags.get(), pin_flags.get())
+                    : strata::program::conv_cache::eviction_victim(stamps.data(), stamps.size(), max_slot_ckpts,
                                                                    tail_flags.get(), pin_flags.get());
                 ckpt_pool.give(std::move(checks[victim]));   // (STRATA_CKPT_POOL; else nothing)
                 checks.erase(checks.begin() + (std::ptrdiff_t) victim);

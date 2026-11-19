@@ -3819,6 +3819,36 @@
       "retired_in": ""
     },
     {
+      "name": "STRATA_CONV_CACHE_MEM_FLOOR",
+      "reads": [
+        {
+          "file": "src/program/generate.cpp",
+          "line": 13849,
+          "backend": "cuda-hip",
+          "fn": "getenv"
+        }
+      ],
+      "parse": "flag",
+      "default_state": "off",
+      "code_default": null,
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "first_commit": "lever/wave-k18-ttft-prefill-qsa-swap",
+      "first_date": "2026-11-19",
+      "since": null,
+      "last_commit": "lever/wave-k18-ttft-prefill-qsa-swap",
+      "last_date": "2026-11-19",
+      "status": "opt-in",
+      "owner": "",
+      "note": "Check MemAvailable vs conversation_cache_min_free_mib and evict oldest parked conversations before growing slot checkpoints.",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
       "name": "STRATA_CONV_JEMALLOC_PURGE",
       "reads": [
         {
@@ -26482,6 +26512,36 @@
       "retired_in": ""
     },
     {
+      "name": "STRATA_PF_FP8_SMALL_T_REUSE",
+      "reads": [
+        {
+          "file": "src/prefill/gemm.cu",
+          "line": 1887,
+          "backend": "cuda-hip",
+          "fn": "getenv"
+        }
+      ],
+      "parse": "flag",
+      "default_state": "off",
+      "code_default": null,
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "first_commit": "lever/wave-k18-ttft-prefill-qsa-swap",
+      "first_date": "2026-11-19",
+      "since": null,
+      "last_commit": "lever/wave-k18-ttft-prefill-qsa-swap",
+      "last_date": "2026-11-19",
+      "status": "opt-in",
+      "owner": "",
+      "note": "Allow gdn_reuse and x8_key_valid_ caching when pad_small_t is true.",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
       "name": "STRATA_PF_FUSED",
       "backends": [
         "cuda",
@@ -28470,6 +28530,36 @@
       "retired_in": ""
     },
     {
+      "name": "STRATA_PF_RESIDENT_SMALL_T",
+      "reads": [
+        {
+          "file": "src/prefill/prefill.cpp",
+          "line": 4635,
+          "backend": "cuda-hip",
+          "fn": "getenv"
+        }
+      ],
+      "parse": "int",
+      "default_state": "off",
+      "code_default": 0,
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "first_commit": "lever/wave-k18-ttft-prefill-qsa-swap",
+      "first_date": "2026-11-19",
+      "since": null,
+      "last_commit": "lever/wave-k18-ttft-prefill-qsa-swap",
+      "last_date": "2026-11-19",
+      "status": "opt-in",
+      "owner": "",
+      "note": "Run fused resident expert kernels for T >= min(stream_all_min(), N) when --resident-experts-only is active.",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
       "name": "STRATA_PF_SHARE_OWN",
       "backends": [
         "cuda-hip"
@@ -28571,6 +28661,36 @@
       "status": "rollback",
       "owner": "program",
       "note": "Way back for the small-card prompt path (CUDA, one card, native pack, default chunk under 8,192 tokens): unset, the native fused expert kernels run inside the path's MMQ buffer layout (the layer-major walk's groups and the streamed chunks); 0: MMQ's kernels there, as before. STRATA_PF_SMALL=0 turns the whole rule off; STRATA_PF_FUSED named by hand still wins over both.",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
+      "name": "STRATA_PF_SMALL_T_RESIDENT_STAGED",
+      "reads": [
+        {
+          "file": "src/prefill/prefill.cpp",
+          "line": 4607,
+          "backend": "cuda-hip",
+          "fn": "getenv"
+        }
+      ],
+      "parse": "flag",
+      "default_state": "off",
+      "code_default": null,
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "first_commit": "lever/wave-k18-ttft-prefill-qsa-swap",
+      "first_date": "2026-11-19",
+      "since": null,
+      "last_commit": "lever/wave-k18-ttft-prefill-qsa-swap",
+      "last_date": "2026-11-19",
+      "status": "opt-in",
+      "owner": "",
+      "note": "Relax p0 > n_slots * page_size to p0 > 0 in pref_tail_only and staged_selected for T <= 256.",
       "retire_after": "",
       "retired_in": ""
     },
@@ -36648,6 +36768,36 @@
       "retired_in": ""
     },
     {
+      "name": "STRATA_READ_WIN_NO_HEAD",
+      "reads": [
+        {
+          "file": "include/strata/core/verify.hpp",
+          "line": 700,
+          "backend": "cuda-hip",
+          "fn": "getenv"
+        }
+      ],
+      "parse": "flag",
+      "default_state": "off",
+      "code_default": null,
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "first_commit": "lever/wave-k18-ttft-prefill-qsa-swap",
+      "first_date": "2026-11-19",
+      "since": null,
+      "last_commit": "lever/wave-k18-ttft-prefill-qsa-swap",
+      "last_date": "2026-11-19",
+      "status": "opt-in",
+      "owner": "",
+      "note": "Skip output_hc_*, LM head, and sampling in read_windows graphs when !head_sampling_ && !batch_rec_.",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
       "name": "STRATA_REFILL_BLOCKING",
       "backends": [
         "cuda-hip",
@@ -39561,6 +39711,36 @@
       "status": "opt-in",
       "owner": "",
       "note": "",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
+      "name": "STRATA_SLOT_PROMPT_CACHE",
+      "reads": [
+        {
+          "file": "src/program/generate.cpp",
+          "line": 13987,
+          "backend": "cuda-hip",
+          "fn": "getenv"
+        }
+      ],
+      "parse": "int",
+      "default_state": "off",
+      "code_default": 0,
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "first_commit": "lever/wave-k18-ttft-prefill-qsa-swap",
+      "first_date": "2026-11-19",
+      "since": null,
+      "last_commit": "lever/wave-k18-ttft-prefill-qsa-swap",
+      "last_date": "2026-11-19",
+      "status": "opt-in",
+      "owner": "",
+      "note": "Cap retained checkpoints per slot to min(o.prompt_cache, N).",
       "retire_after": "",
       "retired_in": ""
     },

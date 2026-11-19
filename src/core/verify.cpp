@@ -757,6 +757,9 @@ Verifier::~Verifier() {
     for (auto& row : exec_nr_)
         for (auto& e : row)
             if (e) cudaGraphExecDestroy(e);
+    for (auto& row : exec_no_head_)
+        for (auto& e : row)
+            if (e) cudaGraphExecDestroy(e);
     if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
     for (auto& kv : exec_bm_)
         if (kv.second) cudaGraphExecDestroy(kv.second);
@@ -2675,7 +2678,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     // kFusedGrMaxT columns a launch: a longer window (--lookup-max-t) runs them in chunks of that many columns (one
     // chunk - the same launches as before - for every window up to kFusedGrMaxT tokens)
     stamp(g.n_layers, 0, 0);
-    {
+    if (head_sampling_ || batch_rec_ || !read_win_no_head_on()) {
         const WeightRef *hn = wt.find("output_hc_norm.weight"), *hd = wt.find("output_hc_down.weight"),
                         *hu = wt.find("output_hc_up.weight");
         if (!hn || !hd || !hu) { err = "verify: an output_hc_* weight is missing"; return false; }
@@ -2922,7 +2925,8 @@ void Verifier::refresh_ar() {
 
 bool Verifier::capture(int T, std::string& err) {
     const auto cap_t0 = std::chrono::steady_clock::now();
-    cudaGraphExec_t& exec_t = ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T];
+    cudaGraphExec_t& exec_t = use_no_head_graph() ? exec_no_head_[sel_long_][T]
+                                                  : (ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T]);
     if (exec_t != nullptr) return true;
     {   // said before the capture: a process that exits inside it (#1275: Windows, 313 MiB free) leaves this line as the trace
         size_t free_b = 0, total_b = 0;
@@ -3376,7 +3380,8 @@ bool Verifier::prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string
     const OnDevice on_device(device_);
     prelaunched_ = 0;
     sel_long_ = select_long_on() && pos0 + T >= select_long_at() ? 1 : 0;   // the variant the previous stage captured
-    cudaGraphExec_t exec_t = ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T];   // #871: the variant the previous stage refreshed
+    cudaGraphExec_t exec_t = use_no_head_graph() ? exec_no_head_[sel_long_][T]
+                                                 : (ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T]);   // #871: the variant the previous stage refreshed
     if (T < 1 || T > max_t_ || exec_t == nullptr) { err = "verify: prelaunch before the window was captured"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
     if (pos0 + T > ss_->qsa_states[ss_->qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
@@ -3480,7 +3485,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
 #endif
     const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;   // #267 test hook (off: false)
     bool flag_raised = false;   // the PLE flag went up before the launch (early_ple_flag_mode)
-    bool& graph_launched = ar_off_ ? launched_nr_[sel_long_][T] : launched_[sel_long_][T];
+    bool& graph_launched = use_no_head_graph() ? launched_no_head_[sel_long_][T]
+                                               : (ar_off_ ? launched_nr_[sel_long_][T] : launched_[sel_long_][T]);
     if (!pre && ar_on() && !test_stall && (early_ple_flag_mode() == 1 || (early_ple_flag_mode() == 2 && !graph_launched))) {
         if (do_ple) {
             const Clock::time_point tp = Clock::now();
@@ -3539,7 +3545,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                 }
             });
         }
-        launch_o.emplace(ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T], cs_, device_, threaded_launch,
+        launch_o.emplace(use_no_head_graph() ? exec_no_head_[sel_long_][T] : (ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T]), cs_, device_, threaded_launch,
                          [this] { (void) release_gpu_waits(5000); });
         const cudaError_t le = launch_o->status();
         if (probe_this) {
@@ -3551,7 +3557,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         }
 #else
         strata::dispatch::Stats::get().graph_launch(T, ar_on() ? 0 : 1);
-        const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T], cs_);
+        const cudaError_t le = cudaGraphLaunch(use_no_head_graph() ? exec_no_head_[sel_long_][T] : (ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T]), cs_);
 #endif
         trace_ev("LAUNCHED", -1, -1, (int64_t) le);
         graph_launched = true;
@@ -4771,17 +4777,17 @@ bool Verifier::evict_window_graph(int keep_t, bool& evicted, std::string& err) {
     if (no_window_eviction_ || keep_t < 1) return true;
     bool have[strata::kernels::kWindowMaxT + 1] = {};
     const int top = std::min<int>(max_t_, strata::kernels::kWindowMaxT);
-    for (int t = 1; t <= top; ++t) have[t] = (ar_off_ ? exec_nr_[sel_long_][t] : exec_[sel_long_][t]) != nullptr;
+    for (int t = 1; t <= top; ++t) have[t] = (use_no_head_graph() ? exec_no_head_[sel_long_][t] : (ar_off_ ? exec_nr_[sel_long_][t] : exec_[sel_long_][t])) != nullptr;
     const int victim = strata::core::pick_window_victim(have, top, keep_t, prelaunched_);
     if (victim == 0) return true;
     if (cudaStreamSynchronize(cs_) != cudaSuccess) {
         err = "verify: synchronizing before window graph eviction failed";
         return false;
     }
-    cudaGraphExec_t& e = ar_off_ ? exec_nr_[sel_long_][victim] : exec_[sel_long_][victim];
+    cudaGraphExec_t& e = use_no_head_graph() ? exec_no_head_[sel_long_][victim] : (ar_off_ ? exec_nr_[sel_long_][victim] : exec_[sel_long_][victim]);
     cudaGraphExecDestroy(e);
     e = nullptr;
-    (ar_off_ ? launched_nr_ : launched_)[sel_long_][victim] = false;   // the next graph of that size is a cold first launch again
+    (use_no_head_graph() ? launched_no_head_ : (ar_off_ ? launched_nr_ : launched_))[sel_long_][victim] = false;   // the next graph of that size is a cold first launch again
     evicted = true;
     return true;
 }
@@ -4940,7 +4946,7 @@ bool Verifier::prepare(int T, bool& no_vram, std::string& err) {
     if (next_ != nullptr || lb_ > 0) return true;
     const OnDevice on_device(device_);
     refresh_ar();
-    if ((ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T]) != nullptr) return true;
+    if ((use_no_head_graph() ? exec_no_head_[sel_long_][T] : (ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T])) != nullptr) return true;
     capture_oom_ = false;
     if (capture(T, err)) return true;
     no_vram = capture_oom_;

@@ -2395,7 +2395,9 @@ class StrataEngine:
                     continue
                 if getattr(rq, "_strata_co", False) or len(prompt) < 32 or total + len(prompt) > COALESCE_TOKENS:
                     continue
-                slot = self.pick_slot(prompt)
+                req_sid = getattr(rq, "_strata_session_id", None)
+                strict_lease = os.environ.get("STRATA_STRICT_SESSION_LEASE") == "1"
+                slot = self.pick_slot(prompt, session_id=req_sid, allow_lease_steal=not strict_lease)
                 if slot is None:
                     break
                 self.slot_busy[slot] = True
@@ -2524,6 +2526,8 @@ class StrataEngine:
         orig_len = len(prompt)  # a leg that continues (prompt + what it generated) names where the reply began: pen_from, the penalty window's start
         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
         carry = {}          # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
+        if session_id:
+            setattr(cancel, "_strata_session_id", session_id)
         eff_plen = self._estimate_uncached_len(prompt, session_id=session_id)
         ok = yield from self._take_control(cancel, eff_plen, new=True,
                                            prompt=prompt if (COALESCE_PREFILL > 1 and not embeddings) else None)
@@ -2632,8 +2636,10 @@ class StrataEngine:
                             deadline = getattr(cancel, "_strata_queue_deadline", None)
                             if deadline is not None and time.monotonic() >= deadline:
                                 raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
+                            strict_lease = os.environ.get("STRATA_STRICT_SESSION_LEASE") == "1"
+                            allow_steal = (not strict_lease) or (admit_wait and (time.monotonic() - admit_since >= 0.05))
                             with self.slot_cv:
-                                slot = self.pick_slot(prompt, session_id=session_id)
+                                slot = self.pick_slot(prompt, session_id=session_id, allow_lease_steal=allow_steal)
                                 if slot is not None:
                                     self.slot_busy[slot] = True
                                     self.slot_claims.add(slot)
@@ -2654,7 +2660,7 @@ class StrataEngine:
                                 self.ctl.release()
                                 holding = False
                             with self.slot_cv:
-                                if self.pick_slot(prompt, session_id=session_id) is None:
+                                if self.pick_slot(prompt, session_id=session_id, allow_lease_steal=allow_steal) is None:
                                     if (ENGINE_STALL_S or 0) > 0 and time.monotonic() - admit_since >= ENGINE_STALL_S:
                                         # the stall check of #1317 only watches a request on the control lines; one
                                         # waiting here is covered by looking for a slot nobody owns, and by saying so
@@ -2665,9 +2671,10 @@ class StrataEngine:
                                                   f"for a free slot (busy: {busy}, in use: {sorted(self.slot_claims)}, "
                                                   f"ending: {sorted(self.slot_releasing)}) (issue #1603)", flush=True)
                                     self._reap_orphan_slots()
-                                if self.pick_slot(prompt, session_id=session_id) is None:
+                                if self.pick_slot(prompt, session_id=session_id, allow_lease_steal=allow_steal) is None:
                                     wait_remaining = deadline - time.monotonic() if deadline is not None else 1.0
-                                    self.slot_cv.wait(timeout=min(1.0, max(0, wait_remaining)))
+                                    wait_cap = 0.02 if (strict_lease and not allow_steal) else 1.0
+                                    self.slot_cv.wait(timeout=min(wait_cap, max(0, wait_remaining)))
                             if cancel.is_set():
                                 return
                             if not holding:
@@ -2936,7 +2943,7 @@ class StrataEngine:
     SLOT_PREFIX_MIN = 512   # a held prefix shorter than this is not worth unbalancing the pipeline's groups
     TURN_ID = 248045        # <|im_start|>: the engine's default --turn-token (its turn checkpoint sits at the last one)
 
-    def pick_slot(self, prompt: list[int], session_id: str | None = None) -> int | None:
+    def pick_slot(self, prompt: list[int], session_id: str | None = None, allow_lease_steal: bool = True) -> int | None:
         """A free slot for `prompt` (the caller holds slot_cv): direct lease affinity if session_id is active,
         else unleased free slot, prioritizing longest held prefix. None: every slot is busy."""
         if hasattr(self, "session_leases"):
@@ -3006,6 +3013,8 @@ class StrataEngine:
         # 2. Protect leased slots from ephemeral/unleased requests:
         active_leases = self.session_leases.get_leased_slots() if hasattr(self, "session_leases") else {}
         unleased_free = [b for b in free if b not in active_leases or (session_id and active_leases[b] == session_id)]
+        if not unleased_free and not allow_lease_steal:
+            return None
         pool = unleased_free if unleased_free else free
 
         def held_prefix(b):
@@ -5330,6 +5339,7 @@ class Service:
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
         self.effort_end = False
         self._msg_prefix_cache = collections.OrderedDict()
+        self._dummy_prefix_cache = {}
         self._msg_prefix_lock = threading.Lock()
         self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
         self.config_path = None                         # #564: the run config the web page's Settings view edits
@@ -6364,14 +6374,19 @@ class Service:
         base_kw = {k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")} if self.effort_end else kwargs
         effort_key = None if self.effort_end else (kwargs.get("enable_thinking"), kwargs.get("reasoning_effort"))
         extra_kw = tuple(sorted((k, repr(v)) for k, v in base_kw.items()))
-        tools_json = json.dumps(tools or [], sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        fast_v2 = os.environ.get("STRATA_MSG_PREFIX_CACHE") == "2"
+        def _fast_dumps_bytes(obj) -> bytes:
+            if fast_v2 and _orjson is not None:
+                return _orjson.dumps(obj, option=_orjson.OPT_SORT_KEYS)
+            return json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
         h = hashlib.blake2b(digest_size=16)
         h.update(f"{id(self.template)}:{int(self.effort_end)}:{int(keep_empty)}:{effort_key!r}:{extra_kw!r}:".encode("utf-8"))
-        h.update(tools_json.encode("utf-8"))
+        h.update(_fast_dumps_bytes(tools or []))
         cum_hashes = [h.digest()]
         for m in filtered:
             h.update(b"\x00")
-            h.update(json.dumps(m, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            h.update(_fast_dumps_bytes(m))
             cum_hashes.append(h.digest())
 
         min_k = max(1, num_sys)
@@ -6398,7 +6413,14 @@ class Service:
             suffix = filtered[hit_k:]
             marked_suffix, _, suffix_changed = mark_think_literals(suffix, None, self.literals)
             dummy = {"role": "user", "content": "x"}
-            dummy_prefix = self.template.render([dummy], tools=None, add_generation_prompt=False, **base_kw)
+            if fast_v2:
+                dp_key = (id(self.template), extra_kw)
+                dummy_prefix = self._dummy_prefix_cache.get(dp_key)
+                if dummy_prefix is None:
+                    dummy_prefix = self.template.render([dummy], tools=None, add_generation_prompt=False, **base_kw)
+                    self._dummy_prefix_cache[dp_key] = dummy_prefix
+            else:
+                dummy_prefix = self.template.render([dummy], tools=None, add_generation_prompt=False, **base_kw)
             hist_both = self.template.render([dummy] + marked_suffix, tools=None, add_generation_prompt=False, **base_kw)
             full_both = self.render_prompt([dummy] + marked_suffix, None, kwargs)
             if hist_both.startswith(dummy_prefix) and full_both.startswith(dummy_prefix):
@@ -6462,7 +6484,7 @@ class Service:
         A control token's text (<|im_start|>, <|im_end|>, <|endoftext|>, ...) inside a message is text as well: only
         the control tokens the template writes are control tokens.  `store=False` (a token count) reuses the kept
         prompts without adding or replacing one."""
-        if (os.environ.get("STRATA_MSG_PREFIX_CACHE") == "1" and self.prompts is not None
+        if (os.environ.get("STRATA_MSG_PREFIX_CACHE") in ("1", "2") and self.prompts is not None
                 and messages and kwargs.get("preserve_thinking") is not False
                 and not kwargs.get("add_vision_id")):
             cached_ids = self._encode_prompt_msg_cache(messages, tools, kwargs, store)
