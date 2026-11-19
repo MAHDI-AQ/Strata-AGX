@@ -245,6 +245,7 @@ struct QsaState {
 
     float* idx_tail = nullptr;       ///< (idx_block - 1, idx_dim): the raw tail of the block being filled
     float* idx_dead = nullptr;       ///< (idx_dim,): the spare slot's key, CONSTANT for the sequence
+    bool idx_pooled_fp16 = false;    ///< STRATA_QSA_IDX_FP16=1: idx_pooled holds __half (2 B/elem)
     float* idx_pooled = nullptr;     ///< (max_cells/idx_block + 2, idx_dim)
     int32_t* idx_block_pos = nullptr;
 
@@ -332,6 +333,9 @@ void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* i
 /// Zeroes the pools AND the indexer, so a fresh sequence matches the reference's own `zeros()`.  The KV pool
 /// matters even for cells that are never attended, because `kv_gather` reads whatever the selection names.
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream);
+bool kv_host_lazy_enabled();
+struct SessionState;
+bool session_ensure_host(SessionState& ss, const ModelGeometry& g, int64_t upto, bool& allocated, std::string& error);
 
 // ================================ PER-STAGE TIMING, DEBUG ONLY ================================
 //

@@ -325,6 +325,34 @@ int main() {
         ck(cudaMemcpy(qg.data(), d_xq_g, q8_bytes, cudaMemcpyDeviceToHost), "d2h");
         ck(cudaMemcpy(qr.data(), d_xq_r, q8_bytes, cudaMemcpyDeviceToHost), "d2h");
         report("gdn_step_norm_groups qfuse parity", std::memcmp(qg.data(), qr.data(), q8_bytes) == 0);
+
+        // P0-2: t_out_begin = 4, grp.first = {4, 6}, grp.ntok = {2, 2} (tb > 0)
+        k::GdnGroups gg2; gg2.n = 2;
+        for (int i = 0; i < 2; ++i) {
+            std::vector<float> st((size_t) S * h_v * S); for (auto& v : st) v = nd(rng) * 0.1f;
+            gg2.state[i] = up(st);
+            gg2.first[i] = 4 + i * 2;
+            gg2.ntok[i] = 2;
+        }
+        const size_t q8_out_bytes = (size_t) 4 * (vd / 32) * 36;
+        void *d_xq_g2 = nullptr, *d_xq_r2 = nullptr;
+        float* d_y2 = nullptr;
+        ck(cudaMalloc(&d_xq_g2, q8_out_bytes), "malloc");
+        ck(cudaMalloc(&d_xq_r2, q8_out_bytes), "malloc");
+        ck(cudaMalloc(&d_y2, (size_t) T * vd * 4), "malloc");
+        cudaStream_t qcs2 = nullptr;
+        ck(cudaStreamCreate(&qcs2), "stream");
+        k::gdn_step_norm_groups(gg2, d_hg, C, d_gate, d_beta, d_z, d_gm, eps, d_y2, h_k, h_v, false, qcs2, d_xq_g2, 4);
+        k::native_quantize_q8_1(d_y2 + (size_t) 4 * vd, d_xq_r2, vd, 4, qcs2);
+        ck(cudaStreamSynchronize(qcs2), "sync");
+        ck(cudaStreamDestroy(qcs2), "destroy");
+        std::vector<uint8_t> qg2(q8_out_bytes), qr2(q8_out_bytes);
+        ck(cudaMemcpy(qg2.data(), d_xq_g2, q8_out_bytes, cudaMemcpyDeviceToHost), "d2h");
+        ck(cudaMemcpy(qr2.data(), d_xq_r2, q8_out_bytes, cudaMemcpyDeviceToHost), "d2h");
+        report("gdn_step_norm_groups qfuse t_out_begin=4 parity", std::memcmp(qg2.data(), qr2.data(), q8_out_bytes) == 0);
+        (void) cudaFree(d_xq_g2);
+        (void) cudaFree(d_xq_r2);
+        (void) cudaFree(d_y2);
     }
     std::printf("%s\n", bad ? "batch_rows_parity: FAILED" : "batch_rows_parity: ok");
     return bad ? 1 : 0;

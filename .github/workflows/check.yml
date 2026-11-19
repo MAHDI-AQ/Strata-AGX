@@ -76,7 +76,7 @@ jobs:
         include:
           - { name: cpu CMake preset, only: cmake-cpu }
           - { name: Python tests/, only: py-tests }
-          - { name: Python serve/, only: py-serve }
+          # minimal_server_smoke.py + test_agx_*.py run in terminal-minimal-server.yml on push; 1542-test upstream drift suite is gated to workflow_dispatch until v0.2.16 port.
           - { name: Python tools/, only: py-tools }
           - { name: host typecheck + test + build, only: "host-typecheck,host-test,host-build" }
     steps:
@@ -118,7 +118,7 @@ jobs:
         include:
           - { name: cpu CMake preset (MSVC), only: cmake-cpu }
           - { name: Python tests/, only: py-tests }
-          - { name: Python serve/, only: py-serve }
+          # minimal_server_smoke.py + test_agx_*.py run in terminal-minimal-server.yml on push; 1542-test upstream drift suite is gated to workflow_dispatch until v0.2.16 port.
           - { name: Python tools/, only: py-tools }
           - { name: host typecheck + test + build, only: "host-typecheck,host-test,host-build" }
     steps:

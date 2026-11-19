@@ -23,6 +23,7 @@
 #include "strata/kernels/mrope.hpp"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_fp16.h>
 #include <atomic>
 #include <cmath>
 #include <cstddef>
@@ -45,7 +46,18 @@ __device__ float warp_sum(float x) {
 // TAB (#280, STRATA_ROPE_TABLE=1): the angles from the session's float64 table.  The host launches <false> whenever
 // no table applies - the default - so the default kernel is 0.1.31's code exactly (the table read is not in it;
 // with it merely skipped at run time, the compiled default path changed its results).
-template <bool TAB>
+template <bool FP16>
+__device__ __forceinline__ void store_pooled(float* p, std::size_t idx, float v) {
+    if constexpr (!FP16) p[idx] = v;
+    else reinterpret_cast<__half*>(p)[idx] = __float2half_rn(v);
+}
+
+__global__ void copy_f32_to_f16_kernel(const float* __restrict__ src, __half* __restrict__ dst, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2half(src[i]);
+}
+
+template <bool TAB, bool FP16 = false>
 __device__ __forceinline__ void append_body(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
                         int pos_stride, int n_steps,
                         int pos_base, const float* __restrict__ gamma, float epsilon,
@@ -106,9 +118,9 @@ __device__ __forceinline__ void append_body(const float* __restrict__ raw, const
                         const float a = values[pair], z = values[pair + ROT / 2];
                         y = d < ROT / 2 ? a * c - z * s : a * s + z * c;
                     }
-                    pooled[std::size_t(b) * D + d] = y;
+                    store_pooled<FP16>(pooled, std::size_t(b) * D + d, y);
                     if (pos == 0) dead[d] = y;
-                    else pooled[std::size_t(b + 1) * D + d] = dead[d];
+                    else store_pooled<FP16>(pooled, std::size_t(b + 1) * D + d, dead[d]);
                     if (d == 0 && pos != 0) *block_pos = rope_pos;
                 }
             }
@@ -116,7 +128,7 @@ __device__ __forceinline__ void append_body(const float* __restrict__ raw, const
         if (n_steps > 1) __syncthreads();
     }
 }
-template <bool TAB>
+template <bool TAB, bool FP16 = false>
 __global__ void append(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
                         int pos_stride, int n_steps,
                         int pos_base, const float* __restrict__ gamma, float epsilon,
@@ -125,12 +137,12 @@ __global__ void append(const float* __restrict__ raw, const int32_t* __restrict_
                         int max_cells, float theta_scale, float freq_scale, float corr_low,
                         float corr_high, float ext_factor, float mscale,
                         const int32_t* __restrict__ mtab, RopeTab rt) {
-    append_body<TAB>(raw, pos_dev, pos_stride, n_steps, pos_base, gamma, epsilon, tail, dead, pooled, block_pos, max_cells,
+    append_body<TAB, FP16>(raw, pos_dev, pos_stride, n_steps, pos_base, gamma, epsilon, tail, dead, pooled, block_pos, max_cells,
                      theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale, mtab, rt);
 }
 // engine-latency: the commit's appends of several QSA layers in one launch, one block per layer (blockIdx.x); each block
 // first restores its layer's tail from the window's snapshot (the commit's copy_from_mapped), then runs append's body
-template <bool TAB>
+template <bool TAB, bool FP16 = false>
 __global__ void append_layers(const float* __restrict__ raw0, long long raw_stride, const int32_t* __restrict__ pos_dev,
                               int pos_stride, int n_steps, int pos_base, float epsilon, QsaIndexerLayers L, int max_cells,
                               float theta_scale, float freq_scale, float corr_low, float corr_high, float ext_factor,
@@ -141,7 +153,7 @@ __global__ void append_layers(const float* __restrict__ raw0, long long raw_stri
         for (int j = threadIdx.x; j < (R - 1) * D; j += blockDim.x) tail[j] = L.tail_src[i][j];
         __syncthreads();
     }
-    append_body<TAB>(raw0 + (long long) i * raw_stride, pos_dev, pos_stride, n_steps, pos_base, L.gamma[i], epsilon, tail,
+    append_body<TAB, FP16>(raw0 + (long long) i * raw_stride, pos_dev, pos_stride, n_steps, pos_base, L.gamma[i], epsilon, tail,
                      L.dead[i], L.pooled[i], L.block_pos[i], max_cells, theta_scale, freq_scale, corr_low, corr_high,
                      ext_factor, mscale, mtab, rt);
 }
@@ -182,7 +194,7 @@ __device__ __forceinline__ float norm_scale(float mean, float* partials, int d) 
     return square_sum;
 }
 // cell 0 of a sequence: the spare (every gather index names cell 0), written to pooled[0] and dead
-template <bool TAB>
+template <bool TAB, bool FP16 = false>
 __global__ void append_first(const float* __restrict__ raw, const float* __restrict__ gamma, float epsilon,
                              float* __restrict__ dead, float* __restrict__ pooled, float theta_scale,
                              float freq_scale, float corr_low, float corr_high, float ext_factor, float mscale,
@@ -205,10 +217,10 @@ __global__ void append_first(const float* __restrict__ raw, const float* __restr
     if (d >= D) return;
     const float y = pooled_value<TAB>(values, d, 0, theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale,
                                  mtab, true, rt);
-    pooled[d] = y;
+    store_pooled<FP16>(pooled, d, y);
     dead[d] = y;
 }
-template <bool TAB>
+template <bool TAB, bool FP16 = false>
 __global__ void append_blocks(const float* __restrict__ raw, int64_t n, int64_t p0, int pos_base,
                               const float* __restrict__ gamma, float epsilon, const float* __restrict__ tail,
                               const float* __restrict__ dead, float* __restrict__ pooled, int32_t* __restrict__ block_pos,
@@ -236,10 +248,11 @@ __global__ void append_blocks(const float* __restrict__ raw, int64_t n, int64_t 
     __syncthreads();
     if (d >= D) return;
     const int rope_pos = pos_base + R * (int) b;
-    pooled[std::size_t(b) * D + d] = pooled_value<TAB>(values, d, rope_pos, theta_scale, freq_scale, corr_low, corr_high,
-                                                  ext_factor, mscale, mtab, false, rt);
+    store_pooled<FP16>(pooled, std::size_t(b) * D + d,
+                       pooled_value<TAB>(values, d, rope_pos, theta_scale, freq_scale, corr_low, corr_high,
+                                         ext_factor, mscale, mtab, false, rt));
     if (b == last_block) {
-        pooled[std::size_t(b + 1) * D + d] = dead[d];
+        store_pooled<FP16>(pooled, std::size_t(b + 1) * D + d, dead[d]);
         if (d == 0) *block_pos = rope_pos;
     }
 }
@@ -277,22 +290,28 @@ void native_qsa_indexer_append_steps(const float* raw, const int32_t* relative_p
         rope_scaling_invalid(scaling) != nullptr)
         throw std::invalid_argument("native QSA indexer requires fixed geometry, aligned position base, positive capacity/epsilon, valid frequency/scaling and explicit stream");
     const std::size_t pos_span = (n_steps == 1 || pos_stride <= 0) ? 4 : (std::size_t(n_steps - 1) * pos_stride + 1) * 4;
+    const std::size_t p_eb = b.pooled_fp16 ? 2 : 4;
     const Span spans[] = {{raw,std::size_t(n_steps)*D*4},{relative_pos_device,pos_span},{gamma,D*4},{b.tail,(R-1)*D*4},
-        {b.dead,D*4},{b.pooled,std::size_t(max_cells/R+1)*D*4},{b.block_pos,4}};
+        {b.dead,D*4},{b.pooled,std::size_t(max_cells/R+1)*D*p_eb},{b.block_pos,4}};
     for (const auto& span : spans) validate(span);
     for (int i = 0; i < 7; ++i) for (int j = i + 1; j < 7; ++j)
         if (overlaps(spans[i], spans[j])) throw std::invalid_argument("native QSA indexer buffers overlap");
     const float theta_scale = powf((float) scaling.freq_base, -2.0f / ROT);
     const RopeKernelArgs k = scaling.kernel_args(ROT);   // none: the identity constants
     const RopeTab rt = rope_table_for(scaling);
-    if (rt.cos != nullptr)
-        append<true><<<1,THREADS,0,static_cast<cudaStream_t>(stream)>>>(raw,relative_pos_device,pos_stride,n_steps,pos_base,gamma,epsilon,
+    auto launch_app = [&](auto tag_tab, auto tag_fp16) {
+        append<decltype(tag_tab)::value, decltype(tag_fp16)::value><<<1,THREADS,0,static_cast<cudaStream_t>(stream)>>>(
+            raw,relative_pos_device,pos_stride,n_steps,pos_base,gamma,epsilon,
             b.tail,b.dead,b.pooled,b.block_pos,int(max_cells),theta_scale,k.freq_scale,
             k.corr_low,k.corr_high,k.ext_factor,k.attn_factor,mrope_table(),rt);
-    else
-        append<false><<<1,THREADS,0,static_cast<cudaStream_t>(stream)>>>(raw,relative_pos_device,pos_stride,n_steps,pos_base,gamma,epsilon,
-            b.tail,b.dead,b.pooled,b.block_pos,int(max_cells),theta_scale,k.freq_scale,
-            k.corr_low,k.corr_high,k.ext_factor,k.attn_factor,mrope_table(),rt);
+    };
+    if (rt.cos != nullptr) {
+        if (b.pooled_fp16) launch_app(std::true_type{}, std::true_type{});
+        else launch_app(std::true_type{}, std::false_type{});
+    } else {
+        if (b.pooled_fp16) launch_app(std::false_type{}, std::true_type{});
+        else launch_app(std::false_type{}, std::false_type{});
+    }
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
@@ -309,9 +328,10 @@ void native_qsa_indexer_append_steps_layers(const float* raw0, int64_t raw_strid
         throw std::invalid_argument("native QSA indexer (layers): bad geometry, layer count or parameters");
     for (int i = 0; i < n_layers; ++i) {   // the per-layer append's span checks, layer by layer
         const std::size_t pos_span = (n_steps == 1 || pos_stride <= 0) ? 4 : (std::size_t(n_steps - 1) * pos_stride + 1) * 4;
+        const std::size_t p_eb = layers.pooled_fp16 ? 2 : 4;
         const Span spans[] = {{raw0 + (std::size_t) i * (std::size_t) raw_stride, std::size_t(n_steps)*D*4},
             {relative_pos_device,pos_span},{layers.gamma[i],D*4},{layers.tail[i],(R-1)*D*4},{layers.dead[i],D*4},
-            {layers.pooled[i],std::size_t(max_cells/R+1)*D*4},{layers.block_pos[i],4}};
+            {layers.pooled[i],std::size_t(max_cells/R+1)*D*p_eb},{layers.block_pos[i],4}};
         for (const auto& span : spans) validate(span);
         for (int a = 0; a < 7; ++a) for (int b = a + 1; b < 7; ++b)
             if (overlaps(spans[a], spans[b])) throw std::invalid_argument("native QSA indexer buffers overlap");
@@ -320,14 +340,19 @@ void native_qsa_indexer_append_steps_layers(const float* raw0, int64_t raw_strid
     const RopeKernelArgs k = scaling.kernel_args(ROT);
     const RopeTab rt = rope_table_for(scaling);
     const cudaStream_t st = static_cast<cudaStream_t>(stream);
-    if (rt.cos != nullptr)
-        append_layers<true><<<n_layers, THREADS, 0, st>>>(raw0, (long long) raw_stride, relative_pos_device, pos_stride, n_steps,
+    auto launch_layers = [&](auto tag_tab, auto tag_fp16) {
+        append_layers<decltype(tag_tab)::value, decltype(tag_fp16)::value><<<n_layers, THREADS, 0, st>>>(
+            raw0, (long long) raw_stride, relative_pos_device, pos_stride, n_steps,
             pos_base, epsilon, layers, int(max_cells), theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor,
             k.attn_factor, mrope_table(), rt);
-    else
-        append_layers<false><<<n_layers, THREADS, 0, st>>>(raw0, (long long) raw_stride, relative_pos_device, pos_stride, n_steps,
-            pos_base, epsilon, layers, int(max_cells), theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor,
-            k.attn_factor, mrope_table(), rt);
+    };
+    if (rt.cos != nullptr) {
+        if (layers.pooled_fp16) launch_layers(std::true_type{}, std::true_type{});
+        else launch_layers(std::true_type{}, std::false_type{});
+    } else {
+        if (layers.pooled_fp16) launch_layers(std::false_type{}, std::true_type{});
+        else launch_layers(std::false_type{}, std::false_type{});
+    }
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
@@ -352,24 +377,51 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
     const int32_t* mtab = mrope_table();
     const RopeTab rt = rope_table_for(scaling);
     if (p0 == 0) {
-        if (rt.cos != nullptr)
-            append_first<true><<<1, THREADS, 0, st>>>(raw, gamma, epsilon, b.dead, b.pooled, theta_scale,
-                                                      fsf, cl, ch, ef, ms, mtab, rt);
-        else
-            append_first<false><<<1, THREADS, 0, st>>>(raw, gamma, epsilon, b.dead, b.pooled, theta_scale,
-                                                       fsf, cl, ch, ef, ms, mtab, rt);
+        if (rt.cos != nullptr) {
+            if (b.pooled_fp16)
+                append_first<true, true><<<1, THREADS, 0, st>>>(raw, gamma, epsilon, b.dead, b.pooled, theta_scale,
+                                                                fsf, cl, ch, ef, ms, mtab, rt);
+            else
+                append_first<true, false><<<1, THREADS, 0, st>>>(raw, gamma, epsilon, b.dead, b.pooled, theta_scale,
+                                                                 fsf, cl, ch, ef, ms, mtab, rt);
+        } else {
+            if (b.pooled_fp16)
+                append_first<false, true><<<1, THREADS, 0, st>>>(raw, gamma, epsilon, b.dead, b.pooled, theta_scale,
+                                                                 fsf, cl, ch, ef, ms, mtab, rt);
+            else
+                append_first<false, false><<<1, THREADS, 0, st>>>(raw, gamma, epsilon, b.dead, b.pooled, theta_scale,
+                                                                  fsf, cl, ch, ef, ms, mtab, rt);
+        }
     }
     // completed blocks: those whose last cell (4b+3) lies in [p0, p0 + n)
     const int64_t first = p0 <= R - 1 ? 0 : (p0 - (R - 1) + R - 1) / R;       // the smallest b with 4b+3 >= p0
     const int64_t hi = p0 + n - 1 >= R - 1 ? (p0 + n - 1 - (R - 1)) / R : -1;   // the largest b with 4b+3 <= p0+n-1
-    if (hi >= first && rt.cos != nullptr)
-        append_blocks<true><<<(unsigned) (hi - first + 1), THREADS, 0, st>>>(raw, n, p0, pos_base, gamma, epsilon,
-            b.tail, b.dead, b.pooled, b.block_pos, first, hi, theta_scale, fsf, cl, ch, ef, ms, mtab, rt);
-    else if (hi >= first)
-        append_blocks<false><<<(unsigned) (hi - first + 1), THREADS, 0, st>>>(raw, n, p0, pos_base, gamma, epsilon,
-            b.tail, b.dead, b.pooled, b.block_pos, first, hi, theta_scale, fsf, cl, ch, ef, ms, mtab, rt);
+    if (hi >= first) {
+        if (rt.cos != nullptr) {
+            if (b.pooled_fp16)
+                append_blocks<true, true><<<(unsigned) (hi - first + 1), THREADS, 0, st>>>(raw, n, p0, pos_base, gamma, epsilon,
+                    b.tail, b.dead, b.pooled, b.block_pos, first, hi, theta_scale, fsf, cl, ch, ef, ms, mtab, rt);
+            else
+                append_blocks<true, false><<<(unsigned) (hi - first + 1), THREADS, 0, st>>>(raw, n, p0, pos_base, gamma, epsilon,
+                    b.tail, b.dead, b.pooled, b.block_pos, first, hi, theta_scale, fsf, cl, ch, ef, ms, mtab, rt);
+        } else {
+            if (b.pooled_fp16)
+                append_blocks<false, true><<<(unsigned) (hi - first + 1), THREADS, 0, st>>>(raw, n, p0, pos_base, gamma, epsilon,
+                    b.tail, b.dead, b.pooled, b.block_pos, first, hi, theta_scale, fsf, cl, ch, ef, ms, mtab, rt);
+            else
+                append_blocks<false, false><<<(unsigned) (hi - first + 1), THREADS, 0, st>>>(raw, n, p0, pos_base, gamma, epsilon,
+                    b.tail, b.dead, b.pooled, b.block_pos, first, hi, theta_scale, fsf, cl, ch, ef, ms, mtab, rt);
+        }
+    }
     append_tail<<<R - 1, D, 0, st>>>(raw, n, p0, b.tail);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+
+void copy_f32_to_f16(const float* src, void* dst, int64_t n, void* stream) {
+    if (n <= 0) return;
+    const int blocks = (int) ((n + 127) / 128);
+    copy_f32_to_f16_kernel<<<blocks, 128, 0, static_cast<cudaStream_t>(stream)>>>(
+        src, static_cast<__half*>(dst), n);
 }
 } // namespace strata::kernels

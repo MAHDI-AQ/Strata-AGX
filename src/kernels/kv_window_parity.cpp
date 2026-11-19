@@ -321,11 +321,49 @@ bool run(int fmt, bool graphs) {
 }
 }  // namespace
 
+bool run_stage_sel_cell_regression() {
+    // P0-1: m.sel_ids holds cell IDs [0, p0+T) with page_size=4; p0=4096 -> 1024 blocks, sel_ids={4092..4095} -> block 1023.
+    const k::QsaShapes s = k::qsa_real_shapes();
+    const int64_t p0 = 4096;
+    const int64_t n_blocks = p0 / s.page_size;
+    const int fmt = k::kKvQ4;
+    Pools stage, host; stage.alloc(n_blocks, s, fmt, false); host.alloc(n_blocks, s, fmt, true);
+    const size_t per = host.arrs[0].per_block;
+    for (auto& a : host.arrs) std::memset(a.h, 0xAA, (size_t) n_blocks * a.per_block);
+    for (auto& a : stage.arrs) ck(cudaMemset(a.d, 0x00, (size_t) n_blocks * a.per_block), "stage zero");
+    const std::vector<int32_t> sel = {4092, 4093, 4094, 4095};
+    int32_t* d_sel = dalloc<int32_t>(sel.size());
+    ck(cudaMemcpy(d_sel, sel.data(), sel.size() * sizeof(int32_t), cudaMemcpyHostToDevice), "sel h2d");
+    cudaStream_t cs = nullptr;
+    ck(cudaStreamCreate(&cs), "stream");
+    k::kv_stage_selected_from_host(stage.attn(nullptr), host.p, fmt, d_sel, (int64_t) sel.size(), n_blocks, s, cs);
+    ck(cudaStreamSynchronize(cs), "stage_sel sync");
+    ck(cudaGetLastError(), "stage_sel err");
+    std::vector<uint8_t> got((size_t) n_blocks * per);
+    ck(cudaMemcpy(got.data(), stage.arrs[0].d, got.size(), cudaMemcpyDeviceToHost), "stage d2h");
+    bool ok = true;
+    for (size_t i = 0; i < per; ++i) {
+        if (got[(size_t) (n_blocks - 1) * per + i] != 0xAA) {
+            fail("stage_sel", "block 1023 not staged with 0xAA", (long long) i);
+            ok = false;
+            break;
+        }
+    }
+    if (got[0] != 0x00) {
+        fail("stage_sel", "block 0 unexpectedly modified");
+        ok = false;
+    }
+    (void) cudaFree(d_sel);
+    (void) cudaStreamDestroy(cs);
+    return ok;
+}
+
 int main() {
     std::printf("kv_window_parity: verify-window KV calls on a streamed layer and on a ring, plain launches and graph replays\n");
     bool ok = true;
     for (int fmt : {k::kKvQ4, k::kKvInt8, k::kKvHybrid})
         for (bool graphs : {false, true}) ok = run(fmt, graphs) && ok;
+    ok = run_stage_sel_cell_regression() && ok;
     std::printf(ok && g_bad == 0 ? "PASS\n" : "FAIL\n");
     return ok && g_bad == 0 ? 0 : 1;
 }

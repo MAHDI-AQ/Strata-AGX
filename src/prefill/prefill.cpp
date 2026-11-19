@@ -285,6 +285,16 @@ bool ple_copy_stream_on() {
 }
 }  // namespace
 namespace strata::prefill {
+namespace {
+inline strata::kernels::KvHostPools kv_src_of(const core::QsaState& st) {
+    if (st.host.present()) return st.host;
+    strata::kernels::KvHostPools p;
+    p.k_pool = st.k_pool; p.v_pool = st.v_pool;
+    p.k_q = st.k_q; p.v_q = st.v_q; p.k_scale = st.k_scale; p.v_scale = st.v_scale;
+    p.k_q4 = st.k_q4; p.v_q4 = st.v_q4;
+    return p;
+}
+}  // namespace
 
 static cudaError_t create_prefill_stream(cudaStream_t* s) {
     static const bool low_prio = [] {
@@ -3002,6 +3012,7 @@ int64_t Prefill::tail_room() const {
 }
 bool Prefill::tail_matters(int64_t chunk, bool src) { return chunk > 0 && fused_layout((size_t) chunk, src); }
 
+
 void Prefill::set_ring_room_active(bool on) {
     ring_room_active_ = on;
     Impl& m = *impl_;
@@ -3191,10 +3202,10 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
             strata::kernels::fwht256_inplace_cuda(Vc, nb * g.n_head_kv, m.cs);
         }
         if (st.kv_q4) {
-            strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, c0, nb, Kc, Vc, s, m.cs, &st.host);
+            strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, c0, nb, Kc, Vc, s, m.cs, st.host.present() ? &st.host : nullptr);
         } else {
             kv_append(Kc, Vc, nb, c0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
-                      st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs, &st.host);
+                      st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs, st.host.present() ? &st.host : nullptr);
         }
     }
     if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
@@ -4591,7 +4602,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             for (int64_t l = layer; l < LE; ++l) {
                 if (!core::is_qsa_layer(g, l)) continue;
                 const core::QsaState& state = ss.qsa_states[ordinal];
-                if (state.kv_mode != 1) { ++ordinal; continue; }
+                if (state.kv_mode != 1 || !state.host.present()) { ++ordinal; continue; }
                 // Reuse one KV pool only after its last attention reader completes. The next layer's
                 // [0, p0) host prefix is immutable throughout this chunk; its new rows are appended later.
                 if (cudaEventRecord(m.kv_released, cs) != cudaSuccess ||
@@ -5249,7 +5260,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     // KV streaming: this layer's cells [0, p0) come in from the host copy to the staging pool, and the
                     // chunk's cells go to the host copy, the staging pool, and the VRAM slots of resident blocks
-                    const bool staged = st.kv_mode == 1;
+                    const bool staged = (st.kv_mode == 1 && st.host.present());
                     static const bool small_t_run = [] {
                         const char* v = std::getenv("STRATA_PF_SMALL_T_RUN");
                         return v != nullptr && v[0] == '1' && v[1] == '\0';
@@ -5268,7 +5279,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 return false;
                             }
                             kv_pending = -1;
-                        } else strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), st.host,
+                        } else strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), kv_src_of(st),
                                                             core::qsa_kv_format(st),
                                                             (p0 + s.page_size - 1) / s.page_size, s, m.cs);
                         pt.mark(kPfQsa, cs);
@@ -5283,7 +5294,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             kv_pending = -1;
                         } else if ((p0 % s.page_size) != 0) {
                             const int64_t tail_blk = p0 / s.page_size;
-                            strata::kernels::kv_stage_block_from_host(pools_of(m.stage, m.ident_table), st.host,
+                            strata::kernels::kv_stage_block_from_host(pools_of(m.stage, m.ident_table), kv_src_of(st),
                                                                       core::qsa_kv_format(st), tail_blk, s, m.cs);
                         }
                         pt.mark(kPfQsa, cs);
@@ -5300,7 +5311,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     static const bool kv_host_dma = core::kv_host_dma_on(std::getenv("STRATA_KV_HOST_DMA"), true);
 #endif
                     const bool host_by_dma = core::kv_host_dma_use(kv_host_dma, staged, m.stage.present());
-                    const strata::kernels::KvHostPools* host_w = host_by_dma ? nullptr : &st.host;
+                    const strata::kernels::KvHostPools* host_w = (host_by_dma || !st.host.present()) ? nullptr : &st.host;
                     if (st.kv_hybrid) {   // K8V4: K INT8 unrotated, V rotated Q4_0 (only V and the output rotate)
                         // streamed: each half writes its part of the host copy and of the staging pool
                         strata::kernels::fwht256_inplace_cuda(m.Vc, T * 2, m.cs);
@@ -5326,7 +5337,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             kv_append(m.Kc, m.Vc, T, p0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
                                       st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs,
                                       host_w, staged ? &m.stage : nullptr);
-                        if (host_by_dma)
+                        if (host_by_dma && st.host.present())
                             strata::kernels::kv_unstage_to_host(pools_of(m.stage, m.ident_table), st.host,
                                                                 core::qsa_kv_format(st), p0 / s.page_size,
                                                                 (p0 + T + s.page_size - 1) / s.page_size, s, m.cs);
@@ -5348,7 +5359,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     // the indexer appends, token by token; then scores + selection for many queries at once:
                     // a query reads completed blocks (final once completed) and `dead` for its own tail block
-                    const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
+                    const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos, st.idx_pooled_fp16};
                     pt.mark(kPfQsaIdx, cs);
                     // C-2: the chunk's appends in three launches instead of one per token (the same end state:
                     // the queries below read it only after the whole chunk is appended). STRATA_INDEXER_PER_TOKEN=1: the old
@@ -5392,7 +5403,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                                     strata::kernels::kStepNBid)] : 0;
                     const bool tp_ok = tp_on && tp_nbid + 1 >= tp_min &&
                                        strata::kernels::qsa_two_pass_keys(st.idx_pooled, tp_nbid, m.sel_batch, m.max_blocks,
-                                                                          m.attn, tp_bytes, m.cs);
+                                                                          m.attn, tp_bytes, m.cs, st.idx_pooled_fp16);
 #endif
                     for (int64_t t0 = 0; t0 < T; t0 += m.sel_batch) {
                         const int64_t nb = std::min(m.sel_batch, T - t0);
@@ -5408,13 +5419,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         tp_call = tp_ok && !old_sel && active >= tp_min &&
                                   strata::kernels::qsa_block_scores_two_pass(st.idx_pooled, st.idx_dead, m.q_idx + t0 * kIdxQW,
                                                                              steps0, nb, m.sel_batch, m.max_blocks, s,
-                                                                             m.sel_scores, m.attn, tp_bytes, m.cs, active);
+                                                                             m.sel_scores, m.attn, tp_bytes, m.cs, active,
+                                                                             st.idx_pooled_fp16);
 #endif
                         if (!tp_call && (old_sel || !strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * kIdxQW,
                                                                              steps0, nb, m.max_blocks, s, m.sel_scores,
-                                                                             m.cs, active)))
+                                                                             m.cs, active, st.idx_pooled_fp16)))
                             strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * kIdxQW, steps0, nb,
-                                                              m.max_blocks, s, m.sel_scores, m.cs, active);
+                                                              m.max_blocks, s, m.sel_scores, m.cs, active, st.idx_pooled_fp16);
                         strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
                                                         m.sel_ids + t0 * m.cap, m.cs, active);
 #if !defined(STRATA_GPU_METAL)
@@ -5454,7 +5466,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 ref_ids = own_ids;
                             }
                             if (!strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * kIdxQW, steps0, nb,
-                                                                      m.max_blocks, s, ref_sc, m.cs, active)) {
+                                                                      m.max_blocks, s, ref_sc, m.cs, active, st.idx_pooled_fp16)) {
                                 err = "STRATA_SELECT_TWO_PASS_CHECK: the tensor-core scorer did not run";
                                 return false;
                             }
@@ -5466,7 +5478,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     if (staged_selected) {
                         pt.mark(kPfKvStage, cs);
-                        strata::kernels::kv_stage_selected_from_host(pools_of(m.stage, m.ident_table), st.host,
+                        strata::kernels::kv_stage_selected_from_host(pools_of(m.stage, m.ident_table), kv_src_of(st),
                                                                      core::qsa_kv_format(st), m.sel_ids, T * m.cap,
                                                                      p0 / s.page_size, s, m.cs);
                         pt.mark(kPfQsa, cs);
@@ -5495,7 +5507,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // design's last question). Every query is selected again from the pooled keys and `dead` rounded
                     // to fp16 (exactly what an fp16 store reads back); the agreement with the fp32 selection is
                     // printed cumulatively after each chunk's last QSA layer. Debug: syncs per layer.
-                    if (static const bool f16chk = std::getenv("STRATA_IDX_FP16_CHECK") != nullptr; f16chk) {
+                    if (static const bool f16chk = std::getenv("STRATA_IDX_FP16_CHECK") != nullptr; f16chk && !st.idx_pooled_fp16) {
                         static float *pooled16 = nullptr, *dead16 = nullptr;
                         static int32_t* ids16 = nullptr;
                         static double shared = 0, cells = 0;
@@ -9107,7 +9119,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                             rms_rows(m.Kc, (const float*) wkn->data, T * 2, 256, 256, EPS, cs);
                             rope(m.Kc, T, 2, 256, 512, p0, strata::kernels::rope_scaling(), cs);
                         }
-                        const bool staged = st.kv_mode == 1;
+                        const bool staged = (st.kv_mode == 1 && st.host.present());
                         static const bool small_t_resident = [] {
                             const char* v = std::getenv("STRATA_PREFILL_SMALL_T_RESIDENT");
                             return v != nullptr && v[0] == '1' && v[1] == '\0';
@@ -9120,14 +9132,14 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                                                      (small_t_resident_staged ? p0 > 0 : p0 > st.n_slots * s.page_size);
                         if (staged && !staged_selected) {
                             pt.mark(kPfKvStage, cs);
-                            strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), st.host,
+                            strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), kv_src_of(st),
                                                                 core::qsa_kv_format(st),
                                                                 (p0 + s.page_size - 1) / s.page_size, s, cs);
                             pt.mark(kPfQsa, cs);
                         } else if (staged_selected && (p0 % s.page_size) != 0) {
                             // Stage ONLY the partial tail block that kv_append will update (preserving selected-block PCIe savings)
                             const int64_t tail_blk = p0 / s.page_size;
-                            strata::kernels::kv_stage_block_from_host(pools_of(m.stage, m.ident_table), st.host,
+                            strata::kernels::kv_stage_block_from_host(pools_of(m.stage, m.ident_table), kv_src_of(st),
                                                                       core::qsa_kv_format(st),
                                                                       tail_blk, s, cs);
                         }
@@ -9137,7 +9149,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                         static const bool kv_host_dma = core::kv_host_dma_on(std::getenv("STRATA_KV_HOST_DMA"), true);
 #endif
                         const bool host_by_dma = core::kv_host_dma_use(kv_host_dma, staged, m.stage.present());
-                        const strata::kernels::KvHostPools* host_w = host_by_dma ? nullptr : &st.host;
+                        const strata::kernels::KvHostPools* host_w = (host_by_dma || !st.host.present()) ? nullptr : &st.host;
                         if (st.kv_hybrid) {
                             // streamed: each half writes its part of the host copy and of the staging pool
                             strata::kernels::fwht256_inplace_cuda(m.Vc, T * 2, cs);
@@ -9163,7 +9175,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                                 kv_append(m.Kc, m.Vc, T, p0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
                                           st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, cs,
                                           host_w, staged ? &m.stage : nullptr);
-                            if (host_by_dma)
+                            if (host_by_dma && st.host.present())
                                 strata::kernels::kv_unstage_to_host(pools_of(m.stage, m.ident_table), st.host,
                                                                     core::qsa_kv_format(st), p0 / s.page_size,
                                                                     (p0 + T + s.page_size - 1) / s.page_size, s, cs);
@@ -9182,7 +9194,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                             rms_rows(m.q_idx, (const float*) wiqn->data, T * 4, 128, 128, EPS, cs);
                             rope(m.q_idx, T, 4, 128, 512, p0, strata::kernels::rope_scaling(), cs);
                         }
-                        const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
+                        const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos, st.idx_pooled_fp16};
                         pt.mark(kPfQsaIdx, cs);
                         try {
                             static const bool per_token = std::getenv("STRATA_INDEXER_PER_TOKEN") != nullptr;
@@ -9207,15 +9219,15 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                             static const bool old_sel = std::getenv("STRATA_SELECT_OLD") != nullptr;
                             if (old_sel || !strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + q0 * 512,
                                                                                  steps0, nb, m.max_blocks, s, m.sel_scores,
-                                                                                 cs, active))
+                                                                                 cs, active, st.idx_pooled_fp16))
                                 strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + q0 * 512, steps0, nb,
-                                                                  m.max_blocks, s, m.sel_scores, cs, active);
+                                                                  m.max_blocks, s, m.sel_scores, cs, active, st.idx_pooled_fp16);
                             strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
                                                             m.sel_ids + q0 * m.cap, cs, active);
                         }
                         if (staged_selected) {
                             pt.mark(kPfKvStage, cs);
-                            strata::kernels::kv_stage_selected_from_host(pools_of(m.stage, m.ident_table), st.host,
+                            strata::kernels::kv_stage_selected_from_host(pools_of(m.stage, m.ident_table), kv_src_of(st),
                                                                          core::qsa_kv_format(st), m.sel_ids, T * m.cap,
                                                                          p0 / s.page_size, s, cs);
                             pt.mark(kPfQsa, cs);

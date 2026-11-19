@@ -13495,6 +13495,28 @@ int main(int argc, char** argv) {
             if (segpool != nullptr || ckpt_pool.on()) (void) cudaDeviceSynchronize();
             // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
             // nothing the outgoing chain does not, apart from the tail this conversation rewrote)
+            if (strata::core::kv_host_lazy_enabled() && o.kv_resident > 0 && (int64_t) src.ids.size() > o.kv_resident) {
+                bool alloc = false;
+                std::string he;
+                if (!strata::core::session_ensure_host(src.session, g, (int64_t) src.ids.size(), alloc, he)) {
+                    err = he;
+                    return false;
+                }
+                for (strata::core::SessionState* stp : src.stage_sessions) {
+                    if (stp && !strata::core::session_ensure_host(*stp, g, (int64_t) src.ids.size(), alloc, he)) {
+                        err = he;
+                        return false;
+                    }
+                }
+                if (alloc) {
+                    ver.invalidate_graphs();
+                    if (pipe) ver_b.invalidate_graphs();
+                    for (auto& stg : stages) {
+                        stg->ver.invalidate_graphs();
+                        if (pipe) stg->ver_b.invalidate_graphs();
+                    }
+                }
+            }
             if (const size_t dropped = conversations.drop_superseded(src.ids, src.imgs, src.checks, src.cvec))
                 std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "
                              "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies", conversations.size());
@@ -15278,7 +15300,7 @@ int main(int argc, char** argv) {
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 if (l == "STOP") { st->stop_req.store(true); continue; }
                 std::vector<int32_t> bin;
-                if (l.rfind("BGENB ", 0) == 0 || l.rfind("GENB ", 0) == 0) {
+                if (l.rfind("BGENB ", 0) == 0 || l.rfind("GENB ", 0) == 0 || l.rfind("BGEND ", 0) == 0) {
                     const size_t bp = l.rfind(" bin=");
                     if (bp != std::string::npos) {
                         const size_t n_tok = (size_t) std::strtoull(l.c_str() + bp + 5, nullptr, 10);
@@ -15288,7 +15310,7 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
-                const bool is_bin_cmd = (l.rfind("BGENB ", 0) == 0 || l.rfind("GENB ", 0) == 0);
+                const bool is_bin_cmd = (l.rfind("BGENB ", 0) == 0 || l.rfind("GENB ", 0) == 0 || l.rfind("BGEND ", 0) == 0);
                 std::lock_guard<std::mutex> lk(st->mu);
                 st->lines.push_back(std::move(l));
                 if (is_bin_cmd) st->bins.push_back(std::move(bin));
@@ -15306,7 +15328,7 @@ int main(int argc, char** argv) {
             if (in_lines.empty()) return false;
             out = std::move(in_lines.front());
             in_lines.pop_front();
-            if (out.rfind("BGENB ", 0) == 0 || out.rfind("GENB ", 0) == 0) {
+            if (out.rfind("BGENB ", 0) == 0 || out.rfind("GENB ", 0) == 0 || out.rfind("BGEND ", 0) == 0) {
                 cur_bin = std::move(in_shared->bins.front());
                 in_shared->bins.pop_front();
             } else {
@@ -16057,7 +16079,7 @@ int main(int argc, char** argv) {
             out = std::move(in_lines.front());
             in_lines.pop_front();
             if (in_lines.empty()) in_has_lines.store(false, std::memory_order_release);
-            if (out.rfind("BGENB ", 0) == 0 || out.rfind("GENB ", 0) == 0) {
+            if (out.rfind("BGENB ", 0) == 0 || out.rfind("GENB ", 0) == 0 || out.rfind("BGEND ", 0) == 0) {
                 cur_bin = std::move(in_shared->bins.front());
                 in_shared->bins.pop_front();
             } else {
@@ -16130,8 +16152,36 @@ int main(int argc, char** argv) {
             }
             return true;
         };
+        auto invalidate_all_graphs = [&]() {
+            ver.invalidate_graphs();
+            if (pipe) ver_b.invalidate_graphs();
+            for (auto& stg : stages) {
+                stg->ver.invalidate_graphs();
+                if (pipe) stg->ver_b.invalidate_graphs();
+            }
+        };
+        auto ensure_ss_host = [&](strata::core::SessionState& sref, int64_t upto, std::string& e) -> bool {
+            if (!strata::core::kv_host_lazy_enabled()) return true;
+            bool alloc = false;
+            if (!strata::core::session_ensure_host(sref, g, upto, alloc, e)) return false;
+            if (alloc) invalidate_all_graphs();
+            return true;
+        };
+        auto ensure_all_stages_host = [&](int b, int64_t upto, std::string& e) -> bool {
+            if (!strata::core::kv_host_lazy_enabled()) return true;
+            bool alloc = false;
+            for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                strata::core::SessionState& sref = b >= 0 ? *bslot_ss[k][(size_t) b] : (k == 0 ? ss : stages[k - 1]->ss);
+                if (!strata::core::session_ensure_host(sref, g, upto, alloc, e)) return false;
+            }
+            if (alloc) invalidate_all_graphs();
+            return true;
+        };
         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e, int64_t from_token = 0) -> bool {
             const int64_t upto = (int64_t) ids.size();
+            if (o.kv_resident > 0 && upto > o.kv_resident) {
+                if (!ensure_all_stages_host(-1, upto, e) || !ensure_all_stages_host(b, upto, e)) return false;
+            }
 #if defined(STRATA_GPU_METAL)
             // the running state and the K/V of the Metal window, not the session's device buffers
             return strata::metal_engine::window_slot_copy_main(true, b, upto, false, e);
@@ -16205,6 +16255,9 @@ int main(int argc, char** argv) {
             // the main session's K/V is replaced by the slot's: K/V retained from a restore described the old one
             conversations.take_reuse();
             const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
+            if (o.kv_resident > 0 && upto > o.kv_resident) {
+                if (!ensure_all_stages_host(-1, upto, e) || !ensure_all_stages_host(b, upto, e)) return false;
+            }
             if (at != nullptr && at->stage_parts.size() != stages.size()) { e = "a checkpoint without its stage parts"; return false; }
 #if defined(STRATA_GPU_METAL)
             if (!strata::metal_engine::window_slot_copy_main(false, b, upto, at != nullptr, e)) return false;
@@ -16493,6 +16546,18 @@ int main(int argc, char** argv) {
                 if (ps.pen_n <= 0 || (t > 0 && rows[t - 1] == rows[t])) continue;
                 const int64_t from = std::max<int64_t>(ps.reply0, (int64_t) ps.ids.size() - ps.pen_n);
                 ver.set_slot_history(rows[t], ps.ids.data() + from, (int64_t) ps.ids.size() - from);
+            }
+            if (o.kv_resident > 0) {
+                for (int t = 0; t < S; ++t) {
+                    if (pos[t] + 1 > o.kv_resident) {
+                        const int sb = rows[t];
+                        if (t > 0 && rows[t - 1] == sb) continue;
+                        if (!ensure_all_stages_host(sb, pos[t] + 1, err)) {
+                            std::printf("ERR %s\n", err.c_str());
+                            return false;
+                        }
+                    }
+                }
             }
             const Clock::time_point w0 = Clock::now();
             if (!ver.run_slot_rows(rows, S, tok, pos, win_pool_fn, win_pool_user, outb, err) || drive.d.failed) {
@@ -17474,11 +17539,16 @@ int main(int argc, char** argv) {
                 return 1;
             }
             admit_slot = -1;
-            if (line.rfind("BGEN ", 0) == 0 || line.rfind("BGENI ", 0) == 0 || line.rfind("BGENB ", 0) == 0) {
+            bool bdelta = false;
+            size_t bdelta_pfx = 0;
+            uint64_t bdelta_hash = 0;
+            bool bdelta_has_hash = false;
+            if (line.rfind("BGEN ", 0) == 0 || line.rfind("BGENI ", 0) == 0 || line.rfind("BGENB ", 0) == 0 || line.rfind("BGEND ", 0) == 0) {
                 const bool bimg = line.rfind("BGENI ", 0) == 0;
                 const bool bbin = line.rfind("BGENB ", 0) == 0;
+                bdelta = line.rfind("BGEND ", 0) == 0;
                 char* e1 = nullptr;
-                const long b = std::strtol(line.c_str() + (bimg || bbin ? 6 : 5), &e1, 10);
+                const long b = std::strtol(line.c_str() + (bimg || bbin || bdelta ? 6 : 5), &e1, 10);
                 char* e2 = nullptr;
                 const long long mn = std::strtoll(e1, &e2, 10);
                 if (bs.empty() || b < 0 || b >= (long) bs.size() || bs[(size_t) b].active || mn < 1 || e2 == e1) {
@@ -17491,7 +17561,7 @@ int main(int argc, char** argv) {
                 adm_drain_ms = line_drain_ms;
                 co_set = std::move(co_pending);
                 co_pending.clear();
-                line = std::string(bimg ? "GENI 1" : bbin ? "GENB 1" : "GEN 1") + e2;
+                line = std::string(bimg ? "GENI 1" : (bbin || bdelta) ? "GENB 1" : "GEN 1") + e2;
             }
             // #477: every --expert-profile-save-every minutes, before the next request (at QUIT: after the loop)
             if (!heat.empty() && line != "QUIT" && o.expert_profile_save_min > 0 &&
@@ -17755,6 +17825,12 @@ int main(int argc, char** argv) {
                     live_ok = false;
                     // host -> device in synchronous copies of the whole state: one bounded allowance
                     blocking("transfer", bytes);
+                    if (o.kv_resident > 0 && (int64_t) image.live.ids.size() > o.kv_resident) {
+                        if (!ensure_all_stages_host(-1, (int64_t) image.live.ids.size(), err)) {
+                            std::printf("ERR %s\n", err.c_str());
+                            return 1;
+                        }
+                    }
                     if (strata::core::conversation_snapshot_restore(image, ss, g, mtp.kv_state(), err) !=
                         strata::core::ConversationRestore::restored) {
                         // validated above: a failure here is a transfer failure, after device writes began - never
@@ -17909,6 +17985,8 @@ int main(int argc, char** argv) {
                     else if (key == "draft") req_draft = tok.substr(eq + 1);
                     else if (key == "pipe") req_pipe = std::max(0.0, (double) fv);
                     else if (key == "aux_cpus") req_aux_cpus = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
+                    else if (key == "pfx") bdelta_pfx = (size_t) std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
+                    else if (key == "pfx_hash") { bdelta_hash = std::strtoull(tok.c_str() + eq + 1, nullptr, 16); bdelta_has_hash = true; }
                     else if (key == "img_keys") {
                         req_img_keys.clear();
                         const char* q = tok.c_str() + eq + 1;
@@ -17941,7 +18019,40 @@ int main(int argc, char** argv) {
             std::vector<int64_t> ids;
             std::string pe;
             bool ids_ok = false;
-            if (genb) {
+            if (bdelta) {
+                static const auto crc32_tab = []() {
+                    std::array<uint32_t, 256> tab{};
+                    for (uint32_t i = 0; i < 256; ++i) {
+                        uint32_t c = i;
+                        for (int k = 0; k < 8; ++k) c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+                        tab[i] = c;
+                    }
+                    return tab;
+                }();
+                const auto& sids = bs[(size_t) admit_slot].ids;
+                uint32_t h = 0xFFFFFFFFu;
+                const size_t n_check = std::min(bdelta_pfx, sids.size());
+                for (size_t i = 0; i < n_check; ++i) {
+                    const uint32_t uv = (uint32_t) sids[i];
+                    h = crc32_tab[(h ^ (uv & 0xffu)) & 0xffu] ^ (h >> 8);
+                    h = crc32_tab[(h ^ ((uv >> 8) & 0xffu)) & 0xffu] ^ (h >> 8);
+                    h = crc32_tab[(h ^ ((uv >> 16) & 0xffu)) & 0xffu] ^ (h >> 8);
+                    h = crc32_tab[(h ^ ((uv >> 24) & 0xffu)) & 0xffu] ^ (h >> 8);
+                }
+                h ^= 0xFFFFFFFFu;
+                if (!bdelta_has_hash || bdelta_pfx == 0 || bdelta_pfx > sids.size() || (uint64_t) h != bdelta_hash) {
+                    cur_bin.clear();
+                    std::printf("ERR BGEND_MISMATCH\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                ids.reserve(bdelta_pfx + cur_bin.size());
+                for (size_t i = 0; i < bdelta_pfx; ++i) ids.push_back((int64_t) sids[i]);
+                for (int32_t t : cur_bin) ids.push_back((int64_t) t);
+                cur_bin.clear();
+                ids_ok = !ids.empty();
+                if (!ids_ok) pe = "empty delta binary prompt";
+            } else if (genb) {
                 ids.assign(cur_bin.begin(), cur_bin.end());
                 cur_bin.clear();
                 ids_ok = !ids.empty();
@@ -18608,6 +18719,10 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "strata batch: slot %d: its shorter checkpoints were not all copied (out of "
                                              "memory); the rest are skipped\n", slot_source);
                     }
+                    std::stable_sort(checks.begin(), checks.end(),
+                                     [](const ConvCheckpoint& a, const ConvCheckpoint& b) {
+                                         return a.ids.size() < b.ids.size();
+                                     });
                     if (slot_ck != nullptr) {
                         for (ConvCheckpoint& c : checks)   // the main session's chain has it now
                             if ((int64_t) c.ids.size() == ck_len) {
@@ -18637,6 +18752,12 @@ int main(int argc, char** argv) {
                 return 1;
             }
             if (borrow) {
+                if (o.kv_resident > 0 && parked.tokens > o.kv_resident) {
+                    if (!ensure_all_stages_host(-1, parked.tokens, err)) {
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                }
                 const auto t0 = Clock::now();
                 const strata::core::SavedConversation* donor = conversations.find(parked.serial);   // still parked
                 if (donor == nullptr ||
@@ -18665,6 +18786,12 @@ int main(int argc, char** argv) {
                              conversations.size(), conversations.bytes(), conversations.borrowed());
             }
             if (incoming) {
+                if (o.kv_resident > 0 && (int64_t) incoming->live.ids.size() > o.kv_resident) {
+                    if (!ensure_all_stages_host(-1, (int64_t) incoming->live.ids.size(), err)) {
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                }
                 const auto t0 = Clock::now();
                 if (strata::core::conversation_snapshot_restore(*incoming, ss, g,
                         use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, err) !=
@@ -20276,6 +20403,12 @@ int main(int argc, char** argv) {
                 const int64_t read_to = merge_at >= 0 ? merge_at : to;   // (merge_at > at: the part's windows before it)
                 const auto tsp = Clock::now();
                 pp_exact = false;   // a batched or pipelined part is in flight: a cancel may leave the state past pp_reached
+                if (o.kv_resident > 0 && read_to > o.kv_resident) {
+                    if (!ensure_all_stages_host(-1, read_to, err)) {
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                }
                 const bool sp_ok = read_to <= at || (win ? read_windows(at, read_to, err) : read_part(at, to, err));
                 if (sp_ok) pp_exact = true;
                 if (trace) {
@@ -21523,6 +21656,12 @@ int main(int argc, char** argv) {
                 else if (strata::spec::mtp_q_applies(use_mtp, req_df2, use_mtp && mtp.prob(), from_sfx, first_window, T_mtp)) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);   // only candidates the MTP drew
                 const auto decode_pool_fn = use_mtp && mtp.prob() ? invariant_win_pool_fn : win_pool_fn;
                 exit_if_gpu_fatal("");   // (the test hook counts windows here)
+                if (o.kv_resident > 0 && p + T > o.kv_resident) {
+                    if (!ensure_all_stages_host(-1, p + T, err)) {
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                }
                 if (!ver.run(T, window.data(), p, decode_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     exit_if_gpu_fatal(drive.d.failed && drive.d.fail ? drive.d.fail : err);
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
@@ -22038,8 +22177,9 @@ int main(int argc, char** argv) {
                     const strata::core::QsaState& st = ss.qsa_states[ss.qsa_ord0 + j];
                     h_tail = hash_dev(st.idx_tail, z.tail, h_tail);
                     h_dead = hash_dev(st.idx_dead, z.dead, h_dead);
-                    h_pool = hash_dev(st.idx_pooled, (size_t) (L / qs.idx_block) * qs.idx_dim * 4, h_pool);
-                    h_pool_full = hash_dev(st.idx_pooled, (size_t) (L > 0 ? L / qs.idx_block + 1 : 0) * qs.idx_dim * 4,
+                    const size_t idx_eb = st.idx_pooled_fp16 ? 2 : 4;
+                    h_pool = hash_dev(st.idx_pooled, (size_t) (L / qs.idx_block) * qs.idx_dim * idx_eb, h_pool);
+                    h_pool_full = hash_dev(st.idx_pooled, (size_t) (L > 0 ? L / qs.idx_block + 1 : 0) * qs.idx_dim * idx_eb,
                                            h_pool_full);
                     // KV streaming: the host copy is the identity layout and holds every cell
                     for (const auto& [pool, w] : kv_arrays(st)) {

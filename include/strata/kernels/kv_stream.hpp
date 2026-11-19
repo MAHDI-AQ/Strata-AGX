@@ -126,4 +126,25 @@ KvStreamCounters kv_stream_counters(const KvStreamMap& m);
 /// Bytes of one block (page) of K and V together.
 uint64_t kv_block_bytes(const QsaShapes& s, int fmt);
 
+/// STRATA_KV_HOST_LAZY=1: initialize identity page_table[0..n_slots-1] = 0..n_slots-1 before host is allocated.
+void kv_stream_init_identity(const KvStreamMap& m, void* stream);
+
+/// STRATA_KV_HOST_LAZY=1: backfill resident blocks [0, n_blocks) from VRAM into newly allocated host pools.
+void kv_stream_backfill_identity(const QsaAttnPools& slots, const KvHostPools& host, int fmt, int64_t n_blocks,
+                                 const QsaShapes& s, void* stream);
+
+/// STRATA_KV_RESOLVE_BATCH=1: resolve and copy up to 8 streamed slots in 1 resolve + 1 copy kernel launch.
+struct KvResolveBatch {
+    static constexpr int kMax = 8;
+    KvStreamMap map[kMax];
+    QsaAttnPools slots[kMax];
+    KvHostPools host[kMax];
+    int fmt[kMax] = {};
+    const int32_t* ids[kMax] = {};
+    const int32_t* steps[kMax] = {};
+    int n_q[kMax] = {};
+    int n = 0;
+};
+void kv_stream_resolve_batch(const KvResolveBatch& b, int64_t cap, const QsaShapes& s, void* stream);
+
 }  // namespace strata::kernels

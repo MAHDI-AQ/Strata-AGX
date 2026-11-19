@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import array
+import zlib
 import logging
 logger = logging.getLogger("strata.serve")
 if not logger.handlers:
@@ -2732,7 +2733,21 @@ class StrataEngine:
                     self._last_done = None                  # (#879: this admission's DONE decides below)
                     if COALESCE_PREFILL > 1 and not embeddings:
                         self._coalesce(cancel, prompt, eff_plen)
-                    if not embeddings and os.environ.get("STRATA_BINARY_IPC", "0") == "1" and array.array("i").itemsize == 4:
+                    held_snap = list(self.slot_held[slot]) if self.slot_held[slot] else []
+                    can_delta = (
+                        not embeddings
+                        and os.environ.get("STRATA_BINARY_IPC", "0") == "1"
+                        and os.environ.get("STRATA_IPC_DELTA", "0") == "1"
+                        and array.array("i").itemsize == 4
+                        and len(held_snap) > 0
+                        and len(prompt) > len(held_snap)
+                        and prompt[:len(held_snap)] == held_snap
+                    )
+                    if can_delta:
+                        h = zlib.crc32(array.array("i", held_snap).tobytes()) & 0xffffffff
+                        dhead = head.replace("BGEN ", "BGEND ", 1) + f" pfx={len(held_snap)} pfx_hash={h:08x}"
+                        self._send_bin(dhead, prompt[len(held_snap):])
+                    elif not embeddings and os.environ.get("STRATA_BINARY_IPC", "0") == "1" and array.array("i").itemsize == 4:
                         self._send_bin(head.replace("BGEN ", "BGENB ", 1), prompt)
                     else:
                         self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
@@ -2771,24 +2786,39 @@ class StrataEngine:
                                 note_progress()
                                 yield None
                     except ValueError as e:
-                        # #1994: the engine says this slot is not free (its view and ours differ for a moment, or a
-                        # slot it still holds).  That is not the request's fault and nothing was read: park the slot
-                        # for a moment (busy here too), and wait for another one - never a 400 for the conversation.
-                        if not (self._ctl_erred and str(e).startswith("BGEN:") and left >= 1 and not cancel.is_set()):
-                            raise
-                        refused += 1
-                        print(f"[strata] parallel: the engine refused slot {slot} ({e}); trying another slot "
-                              f"({refused}/{self.BGEN_REFUSALS_MAX}) (issue #1994)", flush=True)
-                        if refused > self.BGEN_REFUSALS_MAX:
-                            raise GpuBusy("the engine's batch slots are not free right now; try again in a moment",
-                                      retry_after=5) from e
-                        self.slot_live[slot] = None
-                        self.slot_held[slot] = []
-                        phase = "none"
-                        self._ctl_erred = False
-                        self._park_slot(slot)
-                        slot = None
-                        continue
+                        if can_delta and "BGEND_MISMATCH" in str(e):
+                            self._ctl_erred = False
+                            self._send_bin(head.replace("BGEN ", "BGENB ", 1), prompt)
+                            try:
+                                for x in self._control(cancel, pending.append, on_quiet=lambda: (ask(), note_progress()),
+                                                       want_lp=want_lp):
+                                    while pending:
+                                        t = pending.pop(0)
+                                        out.append(t)
+                                        yield t
+                                    if x is None:
+                                        ask()
+                                        note_progress()
+                                        yield None
+                                e = None
+                            except ValueError as e2:
+                                e = e2
+                        if e is not None:
+                            if not (self._ctl_erred and str(e).startswith("BGEN:") and left >= 1 and not cancel.is_set()):
+                                raise
+                            refused += 1
+                            print(f"[strata] parallel: the engine refused slot {slot} ({e}); trying another slot "
+                                  f"({refused}/{self.BGEN_REFUSALS_MAX}) (issue #1994)", flush=True)
+                            if refused > self.BGEN_REFUSALS_MAX:
+                                raise GpuBusy("the engine's batch slots are not free right now; try again in a moment",
+                                          retry_after=5) from e
+                            self.slot_live[slot] = None
+                            self.slot_held[slot] = []
+                            phase = "none"
+                            self._ctl_erred = False
+                            self._park_slot(slot)
+                            slot = None
+                            continue
                     cont = bool(self._ctl_result and self._ctl_result[1])
                     admission_pending = cont
                     phase = "slot" if cont else "none"
@@ -3039,7 +3069,12 @@ class StrataEngine:
             # Check Tier 2 (RAM) or Tier 3 (NVMe)
             tier, sdata = self.session_leases.get_session_tier(session_id)
             if tier == "nvme":
-                candidate_slot = min(free, key=lambda b: (busy_in.get(self.slot_group[b], 0) if self.slot_groups > 1 else 0, bool(self.slot_held[b]), self.slot_used[b]))
+                active_leases = self.session_leases.get_leased_slots() if hasattr(self, "session_leases") else {}
+                unleased_free = [b for b in free if b not in active_leases or (session_id and active_leases[b] == session_id)]
+                if not unleased_free and not allow_lease_steal:
+                    return None
+                nvme_pool = unleased_free if unleased_free else free
+                candidate_slot = min(nvme_pool, key=lambda b: (busy_in.get(self.slot_group[b], 0) if self.slot_groups > 1 else 0, bool(self.slot_held[b]), self.slot_used[b]))
                 print(f"[strata 3-tier] Tier 3 (NVMe) hit for session={session_id}. Promoting to slot {candidate_slot}...", flush=True)
                 self.session_leases.promote_from_nvme(session_id, candidate_slot, self)
                 return candidate_slot
@@ -6509,10 +6544,12 @@ class Service:
             dummy = {"role": "user", "content": "x"}
             if fast_v2:
                 dp_key = (id(self.template), extra_kw)
-                dummy_prefix = self._dummy_prefix_cache.get(dp_key)
+                dummy_prefix = self._dummy_prefix_cache.pop(dp_key, None)
                 if dummy_prefix is None:
                     dummy_prefix = self.template.render([dummy], tools=None, add_generation_prompt=False, **base_kw)
-                    self._dummy_prefix_cache[dp_key] = dummy_prefix
+                    if len(self._dummy_prefix_cache) >= 128:
+                        self._dummy_prefix_cache.pop(next(iter(self._dummy_prefix_cache)))
+                self._dummy_prefix_cache[dp_key] = dummy_prefix
             else:
                 dummy_prefix = self.template.render([dummy], tools=None, add_generation_prompt=False, **base_kw)
             hist_both = self.template.render([dummy] + marked_suffix, tools=None, add_generation_prompt=False, **base_kw)

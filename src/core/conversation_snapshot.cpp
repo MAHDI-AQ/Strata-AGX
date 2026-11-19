@@ -61,7 +61,7 @@ bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index
     if (!product(l.data, {(uint64_t) cells, (uint64_t) g.n_head_kv, per}) ||
         !product(l.scales, {(uint64_t) cells, (uint64_t) g.n_head_kv,
                            int8_keys && !st.kv_q4 ? (uint64_t) (g.head_dim / 64) * 2 : 0}) ||
-        !product(l.pooled, {(uint64_t) pooled, (uint64_t) g.idx_key_dim, sizeof(float)})) {
+        !product(l.pooled, {(uint64_t) pooled, (uint64_t) g.idx_key_dim, st.idx_pooled_fp16 ? sizeof(uint16_t) : sizeof(float)})) {
         error = "conversation snapshot: K/V byte count overflow";
         return false;
     }
@@ -79,7 +79,7 @@ bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index
 }
 
 std::array<void*, 5> pools(const QsaState& st, bool resident = false) {
-    const bool host = st.kv_mode != 0 && !resident;
+    const bool host = st.kv_mode != 0 && !resident && st.host.present();
     if (st.kv_hybrid)
         return {host ? st.host.k_q : st.k_q, host ? st.host.v_q4 : st.v_q4, host ? st.host.k_scale : st.k_scale,
                 nullptr, st.idx_pooled};
@@ -95,7 +95,9 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
     if (upto < 0 || upto > st.max_cells || st.n_pages < 0 || l.cells / l.page_size > st.n_pages ||
         st.kv_mode < 0 || st.kv_mode > 2 || st.n_slots <= 0 ||
         (st.kv_mode == 0 && st.n_slots < st.n_pages) ||
-        l.pooled_rows > st.idx_pooled_rows || (st.kv_mode != 0 && !st.host.present())) {
+        l.pooled_rows > st.idx_pooled_rows ||
+        (st.kv_mode == 2 && !st.host.present()) ||
+        (st.kv_mode == 1 && !st.host.present() && l.cells / l.page_size > st.n_slots)) {
         error = "conversation snapshot: invalid K/V extent or missing authoritative host pool";
         return false;
     }
@@ -433,7 +435,9 @@ bool kv_partial_invalidate_on() {
 bool refresh_residency_from(const QsaState& st, const ModelGeometry& g, int64_t upto, int64_t from_token, std::string& error) {
     auto shapes = strata::kernels::qsa_real_shapes();
     if (st.kv_mode == 1) {
-        if (from_token > 0 && kv_partial_invalidate_on()) {
+        if (!st.host.present()) {
+            strata::kernels::kv_stream_init_identity(st.map, nullptr);
+        } else if (from_token > 0 && kv_partial_invalidate_on()) {
             strata::kernels::kv_stream_invalidate_from(st.map, from_token / shapes.page_size, nullptr);
         } else {
             strata::kernels::kv_stream_reset(st.map, nullptr);
@@ -481,7 +485,7 @@ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelG
             if (!layout(from, g, f_tok_floor, index, l0, error)) return false;
             if (index && f_tok_floor > 0) {
                 const int64_t p_block = f_tok_floor / s.idx_block;
-                l0.pooled = (uint64_t) p_block * (uint64_t) g.idx_key_dim * sizeof(float);
+                l0.pooled = (uint64_t) p_block * (uint64_t) g.idx_key_dim * (from.idx_pooled_fp16 ? sizeof(uint16_t) : sizeof(float));
             }
         }
     }

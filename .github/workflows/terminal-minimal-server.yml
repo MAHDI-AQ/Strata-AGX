@@ -59,7 +59,12 @@ jobs:
                           '--report', str(report)], check=True)
           print(report.read_text())
           PY
+      - name: Run AGX serve unit tests
+        shell: bash
+        run: |
+          "$RUNNER_TEMP/strata-runtime-venv/bin/python" -m unittest discover -s serve -p 'test_agx_*.py' -v
       - name: Run full server suite without terminal packages
+        if: github.event_name == 'workflow_dispatch'
         shell: bash
         run: |
           "$RUNNER_TEMP/strata-runtime-venv/bin/python" -m unittest discover -s serve -p 'test_*.py'

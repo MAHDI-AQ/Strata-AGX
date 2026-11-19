@@ -339,15 +339,15 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
                                                                      float* __restrict__ y, int h_k, int h_v, int T,
                                                                      const int32_t* __restrict__ n_keep, int t_out_begin,
                                                                      GdnQ81* __restrict__ xq, GdnGroups grp = {}) {
+    const int f = (grp.n > 0) ? grp.first[blockIdx.y] : 0;
     if (grp.n > 0) {   // group blockIdx.y - its slot's state and its rows of the window's buffers
-        const int gi = blockIdx.y, f = grp.first[gi];
+        const int gi = blockIdx.y;
         state = grp.state[gi];
         hbuf += (size_t) f * C;
         gate += (size_t) f * h_v;
         beta += (size_t) f * h_v;
         z += (size_t) f * S * h_v;
         y += (size_t) f * S * h_v;
-        if constexpr (Q) xq += (size_t) (f - t_out_begin) * (S * h_v / 32);
         T = grp.ntok[gi];
         n_keep = grp.keep[gi];
     }
@@ -364,7 +364,7 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
     const int n = ALL_OUT ? T : (n_keep ? *n_keep : T);
     if (n > 0) {
         if (rg == 0) sk[0][col] = hbuf[qk + qh * S + col];
-        else if (rg == 1 && (ALL_OUT || 0 >= t_out_begin)) sq[0][col] = hbuf[qh * S + col];
+        else if (rg == 1 && (ALL_OUT || f >= t_out_begin)) sq[0][col] = hbuf[qh * S + col];
     }
     const float gam = (rg == 0) ? gamma[col] : 0.0f;
     float s[RPG];
@@ -375,11 +375,11 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
     for (int t = 0; t < n; ++t) {
         const int cur = t & 1, nxt = (t + 1) & 1;
         const float* ht = hbuf + (size_t) t * C;
-        const bool need_out = ALL_OUT || (t >= t_out_begin);
+        const bool need_out = ALL_OUT || (f + t >= t_out_begin);
         __syncthreads();
         if (t + 1 < n) {
             const float* ht_next = ht + C;
-            const bool need_next = ALL_OUT || (t + 1 >= t_out_begin);
+            const bool need_next = ALL_OUT || (f + t + 1 >= t_out_begin);
             if (rg == 0) sk[nxt][col] = ht_next[qk + qh * S + col];
             else if (rg == 1 && need_next) sq[nxt][col] = ht_next[qh * S + col];
         }
@@ -420,7 +420,7 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
             const float zz = z[(size_t) t * value_dim + head * S + col];
             const float yv = oc * scale * gam * (1.0f / (1.0f + __expf(-zz)));
             y[(size_t) t * value_dim + head * S + col] = yv;
-            if constexpr (Q) gdn_q8_1_store(xq, (size_t) (t - t_out_begin) * value_dim + head * S + col, yv);
+            if constexpr (Q) gdn_q8_1_store(xq, (size_t) (f + t - t_out_begin) * value_dim + head * S + col, yv);
         }
     }
     if (!ALL_OUT && n_keep != nullptr && n > 0) {

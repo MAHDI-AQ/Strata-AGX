@@ -191,9 +191,9 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
 // 1. Coalesces contiguous missed blocks (b, b+1, ...) into single contiguous multi-block transfers
 // 2. Uses 4x uint4 vectorized unrolled loads/stores (64 bytes/thread) with 512B warp coalescence
 //    to maximize PCIe queue depth and eliminate SM warp stall latency.
-__global__ void copy_kernel(KvStreamMap m, Runs r) {
+__device__ __forceinline__ void copy_one(const KvStreamMap& m, const Runs& r, int k0, int kstride) {
     const int need = m.ctl[2];
-    for (int k = blockIdx.x; k < need; k += gridDim.x) {
+    for (int k = k0; k < need; k += kstride) {
         const long long b = m.miss_block[k], sl = m.miss_slot[k];
         // If this miss is part of a contiguous run started earlier, skip it (already copied)
         if (k > 0 && m.miss_block[k - 1] + 1 == b && m.miss_slot[k - 1] + 1 == sl) continue;
@@ -229,6 +229,40 @@ __global__ void copy_kernel(KvStreamMap m, Runs r) {
                 dst[i] = src[i];
             }
         }
+    }
+}
+
+__global__ void copy_kernel(KvStreamMap m, Runs r) {
+    copy_one(m, r, blockIdx.x, gridDim.x);
+}
+
+struct KvResolveBatchDev {
+    static constexpr int kMax = 8;
+    KvStreamMap map[kMax];
+    Runs r[kMax];
+    const int32_t* ids[kMax] = {};
+    const int32_t* steps[kMax] = {};
+    int n_q[kMax] = {};
+};
+
+__global__ void __launch_bounds__(RT) resolve_batch_kernel(KvResolveBatchDev b, int cap, int page_size) {
+    const int s = blockIdx.x;
+    resolve_one(b.map[s], b.ids[s], b.steps[s], b.n_q[s], cap, page_size);
+}
+
+__global__ void copy_batch_kernel(KvResolveBatchDev b) {
+    const int s = blockIdx.y;
+    copy_one(b.map[s], b.r[s], blockIdx.x, gridDim.x);
+}
+
+__global__ void init_identity_kernel(KvStreamMap m) {
+    const long long i0 = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    const long long st = (long long) gridDim.x * blockDim.x;
+    for (long long i = i0; i < m.n_slots; i += st) {
+        m.page_table[i] = (int32_t) i;
+        m.slot_block[i] = (int32_t) i;
+        m.slot_stamp[i] = 0;
+        m.slot_ref[i] = 0;
     }
 }
 
@@ -314,6 +348,45 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
     check("copy");
 }
 
+void kv_stream_init_identity(const KvStreamMap& m, void* stream) {
+    init_identity_kernel<<<128, 256, 0, (cudaStream_t) stream>>>(m);
+    check("init_identity");
+}
+
+void kv_stream_backfill_identity(const QsaAttnPools& slots, const KvHostPools& host, int fmt, int64_t n_blocks,
+                                 const QsaShapes& s, void* stream) {
+    if (n_blocks <= 0) return;
+    const Runs r = runs_of(slots, host, fmt, s);
+    for (int a = 0; a < r.n; ++a)
+        if (cudaMemcpyAsync(const_cast<uint8_t*>(r.src[a]), r.dst[a], (size_t) (n_blocks * r.len[a]), cudaMemcpyDefault,
+                            (cudaStream_t) stream) != cudaSuccess)
+            check("backfill_identity");
+}
+
+void kv_stream_resolve_batch(const KvResolveBatch& b, int64_t cap, const QsaShapes& s, void* stream) {
+    if (b.n <= 0) return;
+    KvResolveBatchDev d{};
+    for (int i = 0; i < b.n; ++i) {
+        if (b.map[i].n_slots < RT) {
+            std::fprintf(stderr, "kv_stream: %lld slots is fewer than %d\n", (long long) b.map[i].n_slots, RT);
+            std::exit(1);
+        }
+        d.map[i] = b.map[i];
+        d.r[i] = runs_of(b.slots[i], b.host[i], b.fmt[i], s);
+        d.ids[i] = b.ids[i];
+        d.steps[i] = b.steps[i];
+        d.n_q[i] = b.n_q[i];
+    }
+    resolve_batch_kernel<<<b.n, RT, 0, (cudaStream_t) stream>>>(d, (int) cap, (int) s.page_size);
+    check("resolve_batch");
+    static const bool wide = [] {
+        const char* v = std::getenv("STRATA_KV_STREAM_WIDE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    copy_batch_kernel<<<dim3(32, b.n), wide ? 256 : 128, 0, (cudaStream_t) stream>>>(d);
+    check("copy_batch");
+}
+
 void kv_ring_table(int32_t* page_table, int64_t n_blocks, int64_t n_slots, void* stream) {
     ring_kernel<<<64, 256, 0, (cudaStream_t) stream>>>(page_table, n_blocks, n_slots);
     check("ring table");
@@ -353,11 +426,15 @@ void kv_stage_block_from_host(const QsaAttnPools& stage, const KvHostPools& host
 }
 
 __global__ void __launch_bounds__(256) stage_mark_selected_kernel(
-    const int32_t* __restrict__ sel_ids, int64_t n_sel, int64_t n_prefix_blocks, uint8_t* __restrict__ d_want) {
+    const int32_t* __restrict__ sel_ids, int64_t n_sel, int64_t n_prefix_blocks, int64_t page_size,
+    uint8_t* __restrict__ d_want) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n_sel) {
-        const int32_t b = sel_ids[i];
-        if (b >= 0 && (int64_t) b < n_prefix_blocks) d_want[b] = 1;
+        const int32_t c = sel_ids[i];
+        if (c >= 0) {
+            const int64_t b = (int64_t) c / page_size;
+            if (b < n_prefix_blocks) d_want[b] = 1;
+        }
     }
 }
 
@@ -411,7 +488,7 @@ static uint8_t* kv_stage_want_buf(int dev, int64_t need) {
 void kv_stage_selected_from_host(const QsaAttnPools& stage, const KvHostPools& host, int fmt,
                                  const int32_t* sel_ids_dev, int64_t n_sel, int64_t n_prefix_blocks,
                                  const QsaShapes& s, void* stream) {
-    if (n_prefix_blocks <= 0 || n_sel <= 0 || sel_ids_dev == nullptr) return;
+    if (n_prefix_blocks <= 0 || n_sel <= 0 || sel_ids_dev == nullptr || s.page_size <= 0) return;
     cudaStream_t cs = (cudaStream_t) stream;
     static const bool gpu_sel = [] {
         const char* v = std::getenv("STRATA_KV_STAGE_SEL_GPU");
@@ -427,7 +504,7 @@ void kv_stage_selected_from_host(const QsaAttnPools& stage, const KvHostPools& h
                     return;
                 }
                 const int blocks = (int) ((n_sel + 255) / 256);
-                stage_mark_selected_kernel<<<blocks, 256, 0, cs>>>(sel_ids_dev, n_sel, n_prefix_blocks, d_want);
+                stage_mark_selected_kernel<<<blocks, 256, 0, cs>>>(sel_ids_dev, n_sel, n_prefix_blocks, s.page_size, d_want);
                 const Runs r = runs_of(stage, host, fmt, s);
                 stage_copy_selected_runs_kernel<<<96, 256, 0, cs>>>(d_want, n_prefix_blocks, r);
                 check("stage_selected_gpu");
@@ -443,8 +520,11 @@ void kv_stage_selected_from_host(const QsaAttnPools& stage, const KvHostPools& h
         return;
     }
     std::vector<uint8_t> want((size_t) n_prefix_blocks, 0);
-    for (int32_t b : h_ids) {
-        if (b >= 0 && (int64_t) b < n_prefix_blocks) want[(size_t) b] = 1;
+    for (int32_t c : h_ids) {
+        if (c >= 0) {
+            const int64_t b = (int64_t) c / s.page_size;
+            if (b < n_prefix_blocks) want[(size_t) b] = 1;
+        }
     }
     const Runs r = runs_of(stage, host, fmt, s);
     int64_t b = 0;

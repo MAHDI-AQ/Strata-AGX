@@ -256,6 +256,7 @@ public:
                    std::string& err);
     /// The same over the S slots `rows` (row t is slot rows[t], any distinct slots in any order): the slots not
     /// listed are not touched, so an idle slot keeps its state (a finished conversation it may continue later).
+    void invalidate_graphs();
     bool run_slot_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user,
                        int32_t* out, std::string& err);
     /// Keep every row of the last batch window.
@@ -702,7 +703,13 @@ private:
         }();
         return on;
     }
-    bool use_no_head_graph() const { return !head_sampling_ && !batch_rec_ && !ar_off_ && read_win_no_head_on(); }
+    bool use_no_head_graph() const {
+        if (head_sampling_ || batch_rec_ || ar_off_ || !read_win_no_head_on()) return false;
+        static const bool dbg_tap = std::getenv("STRATA_LOGPOS") != nullptr ||
+                                    std::getenv("STRATA_LOGITS_DUMP") != nullptr ||
+                                    std::getenv("STRATA_DBG_NAN") != nullptr;
+        return !dbg_tap;
+    }
     int sel_long_ = 0;
     // fork 34a35db (STRATA_SIDE_MIXER=1): the GDN gates and the QSA indexer on a branch of the window's graph beside the
     // mixer's projections, joined before the recurrence / the attention

@@ -1,4 +1,6 @@
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/kernels/native_qsa_indexer.hpp"
+#include <cuda_fp16.h>
 #include "conversation_checked.hpp"
 #include "conversation_copy.hpp"
 #include "conversation_trace.hpp"
@@ -462,7 +464,15 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
             !copy(st.idx_block_pos, c.block_pos.data() + j * z.block_pos, z.block_pos, error)) return false;
         if (!c.ids.empty()) {
             const size_t row = c.ids.size() / strata::kernels::qsa_real_shapes().idx_block;
-            if (!copy(st.idx_pooled + row * g.idx_key_dim, c.dead.data() + j * z.dead, z.dead, error)) return false;
+            if (st.idx_pooled_fp16) {
+                const float* src_f = reinterpret_cast<const float*>(c.dead.data() + j * z.dead);
+                std::vector<__half> h16((size_t) g.idx_key_dim);
+                for (int64_t k = 0; k < g.idx_key_dim; ++k) h16[(size_t) k] = __float2half(src_f[k]);
+                uint16_t* dst16 = reinterpret_cast<uint16_t*>(st.idx_pooled) + row * (size_t) g.idx_key_dim;
+                if (!copy(dst16, h16.data(), (size_t) g.idx_key_dim * sizeof(__half), error)) return false;
+            } else {
+                if (!copy(st.idx_pooled + row * g.idx_key_dim, c.dead.data() + j * z.dead, z.dead, error)) return false;
+            }
         }
     }
     const size_t tokens = c.ids.size();
@@ -499,7 +509,15 @@ bool conversation_checkpoint_copy(const SessionState& from, SessionState& to, co
             !acopy(b.idx_block_pos, a.idx_block_pos, zf.block_pos)) return false;
         if (!ids.empty()) {   // restore writes the saved `dead` row into the pooled row the next token fills
             const size_t row = ids.size() / strata::kernels::qsa_real_shapes().idx_block;
-            if (!acopy(b.idx_pooled + row * g.idx_key_dim, a.idx_dead, zf.dead)) return false;
+            if (b.idx_pooled_fp16) {
+                uint16_t* dst16 = reinterpret_cast<uint16_t*>(b.idx_pooled) + row * (size_t) g.idx_key_dim;
+                cudaStream_t pst = nullptr;
+                if (conversation_detail::private_stream(pst) != cudaSuccess) return fail(error, "private stream failed");
+                strata::kernels::copy_f32_to_f16(a.idx_dead, dst16, g.idx_key_dim, pst);
+                if (!queued && !sync(error)) return false;
+            } else {
+                if (!acopy(b.idx_pooled + row * g.idx_key_dim, a.idx_dead, zf.dead)) return false;
+            }
         }
     }
     const size_t tokens = ids.size();
