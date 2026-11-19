@@ -760,6 +760,31 @@ if(STRATA_ENABLE_CUDA AND STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_
   target_link_libraries(hit_cpu_order_parity PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
 endif()
 
+# Native Ada Lovelace (SM 89) FP8 Kernels & Parity Tests
+option(STRATA_ENABLE_ADA_FP8 "Build native Ada Lovelace SM89 FP8 kernels and parity tests" ON)
+if(STRATA_ENABLE_ADA_FP8)
+  if(STRATA_ENABLE_CUDA)
+    add_executable(ada_fp8_parity_test tests/ada_fp8_parity_test.cu)
+    target_include_directories(ada_fp8_parity_test PRIVATE include )
+    target_link_libraries(ada_fp8_parity_test PRIVATE )
+    set_target_properties(ada_fp8_parity_test PROPERTIES
+      CUDA_ARCHITECTURES "89"
+      CUDA_STANDARD 17
+    )
+    add_executable(test_ada_fp8_lm_head_parity tests/test_ada_fp8_lm_head_parity.cu)
+    target_include_directories(test_ada_fp8_lm_head_parity PRIVATE include )
+    target_link_libraries(test_ada_fp8_lm_head_parity PRIVATE )
+    set_target_properties(test_ada_fp8_lm_head_parity PROPERTIES
+      CUDA_ARCHITECTURES "89"
+      CUDA_STANDARD 17
+    )
+    if(STRATA_BUILD_TESTS)
+      add_test(NAME ada_fp8_parity_test COMMAND ada_fp8_parity_test)
+      add_test(NAME test_ada_fp8_lm_head_parity COMMAND test_ada_fp8_lm_head_parity 1)
+    endif()
+  endif()
+endif()
+
 strata_cpu_tests()
 
 # CUDA release kernels must not spill or keep a per-thread array in local memory: every access there is a round trip

@@ -48,7 +48,8 @@ static uint64_t ple_hist_bytes() {
     return (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM * sizeof(float);
 }
 
-uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo, int64_t layer_hi) {
+uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo, int64_t layer_hi,
+                       bool share_rope, bool slim_serve_scratch, bool slim_block_scratch) {
     if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
     if (layer_lo < 0) layer_lo = 0;
     // QSA layers are `l % interval == interval-1`, so exactly `bound / interval` of them live below `bound`
@@ -57,20 +58,23 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
     const int64_t q_n = std::max<int64_t>(q_hi - q_lo, g.n_qsa_layers() > 0 ? 1 : 0);
     const int64_t gdn_n = std::max<int64_t>((layer_hi - layer_lo) - std::max<int64_t>(q_hi - q_lo, 0), 0);
     uint64_t n = 0;
-    n += gdn_buffers_bytes(g);
+    if (!slim_serve_scratch) n += gdn_buffers_bytes(g);
     n += (uint64_t) gdn_n * gdn_state_floats(g) * 4;
     // One QSA state carries the RoPE table; the others borrow it (P7: 64 MiB per layer at 262K).
     if (g.n_qsa_layers() > 0)
-        n += qsa_state_bytes(g, max_cells, true) + (uint64_t) (q_n - 1) * qsa_state_bytes(g, max_cells, false);
-    n += qsa_buffers_bytes(g, max_cells);
-    n += moe_buffers_bytes(g, k);
-    n += block_buffers_bytes(g);
+        n += qsa_state_bytes(g, max_cells, !share_rope) + (uint64_t) (q_n - 1) * qsa_state_bytes(g, max_cells, false);
+    if (!slim_serve_scratch) {
+        n += qsa_buffers_bytes(g, max_cells);
+        n += moe_buffers_bytes(g, k);
+    }
+    n += slim_block_scratch ? (uint64_t) g.hc * (uint64_t) g.n_embd * sizeof(float) : block_buffers_bytes(g);
     n += ple_hist_bytes();                       // the PLE's NG_HIST normalized history rows
     return align_up(n, SESSION_STATE_ALIGN) + 4096;
 }
 
 uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
-                      int64_t layer_lo, int64_t layer_hi) {
+                      int64_t layer_lo, int64_t layer_hi, const QsaState* external_rope,
+                      bool slim_serve_scratch, bool slim_block_scratch) {
     if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
     if (layer_lo < 0) layer_lo = 0;
     uint8_t* p = (uint8_t*) base;
@@ -92,7 +96,11 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     s.gdn_ord0 = layer_lo - layer_lo / I;
     s.gdn_alloc = std::max<int64_t>((layer_hi - layer_lo) - q_n_range, 0);
 
-    gdn_buffers_init(g, take(gdn_buffers_bytes(g)), s.gdn);
+    if (slim_serve_scratch) {
+        s.gdn = GdnBuffers{};
+    } else {
+        gdn_buffers_init(g, take(gdn_buffers_bytes(g)), s.gdn);
+    }
     s.gdn_state = (float*) take((uint64_t) s.gdn_alloc * gdn_state_floats(g) * 4);
 
     // the QSA states are separate allocations carved from one arena, because `QsaState` is a struct of
@@ -100,24 +108,42 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     // same way, which is a coupling with nothing to gain.  Only the range's ordinals are initialized; the
     // rest stay value-initialized nulls.  The FIRST ALLOCATED one (the session's primary, ordinal qsa_ord0)
     // owns the RoPE table that the others - and the prefill staging identity, and the MTP drafter - borrow.
-    const uint64_t first = qsa_state_bytes(g, max_cells, true), rest = qsa_state_bytes(g, max_cells, false);
+    const uint64_t first = qsa_state_bytes(g, max_cells, external_rope == nullptr);
+    const uint64_t rest = qsa_state_bytes(g, max_cells, false);
     s.qsa_state_arena = take(g.n_qsa_layers() > 0 ? first + (uint64_t) (s.qsa_alloc - 1) * rest : 0);
     s.qsa_states = new QsaState[(size_t) g.n_qsa_layers()]();
-    s.qsa_buf_arena = take(qsa_buffers_bytes(g, max_cells));
+    if (slim_serve_scratch) {
+        s.qsa_buf_arena = nullptr;
+        s.qsa_bufs = QsaBuffers{};
+    } else {
+        s.qsa_buf_arena = take(qsa_buffers_bytes(g, max_cells));
+    }
 
     uint8_t* qp = (uint8_t*) s.qsa_state_arena;
     // a layer whose pinned RAM could not be had (KV streaming's host copy) is half-built: going on would have the
     // attention read null host pointers at the first request ("illegal memory access"), so the session fails here
     for (int64_t j = 0; j < s.qsa_alloc; ++j)
         if (qsa_state_init(g, max_cells, qp + (j == 0 ? 0 : first + (uint64_t) (j - 1) * rest),
-                           s.qsa_states[s.qsa_ord0 + j], j == 0 ? nullptr : &s.qsa_states[s.qsa_ord0]) == 0)
+                           s.qsa_states[s.qsa_ord0 + j],
+                           j == 0 ? external_rope : &s.qsa_states[s.qsa_ord0]) == 0)
             return 0;
-    qsa_buffers_init(g, max_cells, s.qsa_buf_arena, s.qsa_bufs);
-
-    s.moe_arena = take(moe_buffers_bytes(g, k));
-    moe_buffers_init(g, k, s.moe_arena, s.moe);
-    s.block_arena = take(block_buffers_bytes(g));
-    block_buffers_init(g, s.block_arena, s.block);
+    if (!slim_serve_scratch) {
+        qsa_buffers_init(g, max_cells, s.qsa_buf_arena, s.qsa_bufs);
+        s.moe_arena = take(moe_buffers_bytes(g, k));
+        moe_buffers_init(g, k, s.moe_arena, s.moe);
+    } else {
+        s.moe_arena = nullptr;
+        s.moe = MoEBuffers{};
+    }
+    if (slim_block_scratch) {
+        const uint64_t r_bytes = (uint64_t) g.hc * (uint64_t) g.n_embd * sizeof(float);
+        s.block_arena = take(r_bytes);
+        s.block = BlockBuffers{};
+        s.block.R = (float*) s.block_arena;
+    } else {
+        s.block_arena = take(block_buffers_bytes(g));
+        block_buffers_init(g, s.block_arena, s.block);
+    }
     // THE PLE HISTORY: NG_HIST rows of hc_dim floats, row-fastest.  Sequence state, carved here and zeroed by
     // `session_zero`; it survives every token, which is the whole point of a conv history.
     s.ple_hist = (float*) take(ple_hist_bytes());

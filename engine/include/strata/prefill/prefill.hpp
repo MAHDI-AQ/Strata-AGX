@@ -27,6 +27,8 @@
 namespace strata::core { class PeerExperts; }
 namespace strata::kernels::cpu { class ExpertPool; }
 
+namespace strata::kernels::cuda { struct HandoffBufferFP8; }
+
 namespace strata::prefill {
 
 struct PrefillStats {
@@ -100,6 +102,10 @@ public:
     /// ring (a big one only pays when the copy engine, not the host copies, is the limit); set before bytes_needed.
     static void set_pinned_share(double share);
     static double pinned_share();
+    static void set_resident_experts_only(bool on);
+    static bool resident_experts_only();
+    static void set_slim_workspace(bool on);
+    static bool slim_workspace();
     /// The chunk size from which a chunk streams every expert the GPU does not hold, routed or not; a smaller one
     /// stages only the experts it routes to.  1024, or STRATA_PREFILL_STREAM_MIN, or the CPU share's limit once that
     /// is armed (3072 when STRATA_PREFILL_CPU_SHARE is set).
@@ -381,6 +387,11 @@ private:
     bool force_single_ = false, force_planned_ = false;
     bool bind_stage_helper(int64_t T);  // binds the helper's buffers for a one-chunk prompt of T tokens
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
+    const strata::kernels::cuda::HandoffBufferFP8* fp8_hand_in_ = nullptr; ///< Path B: FP8 compressed handoff buffer
+    int64_t fp8_in_tokens_ = 0;
+    /// STRATA_HANDOFF_FP8_ASYNC=1: cudaEvent_t recorded on the producer's side stream after the FP8 D2H.
+    /// The next stage waits on it. Null (the default) means the producer already synchronized.
+    const void* fp8_hand_ev_ = nullptr;
     /// STRATA_HANDOFF_PIPE: the previous stage's per-piece "landed in hand_in_" events (cudaEvent_t[hand_pieces_],
     /// on its device) when it copies the chunk in pieces without a host wait; null with the one-copy hand-off
     const void* hand_ev_ = nullptr;
@@ -393,6 +404,8 @@ private:
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     void release();                          // the destructor's cleanup (also `reset`'s)
     struct Impl;
+    /// STRATA_HANDOFF_FP8_ASYNC=1 opens the side stream. Unset or not 1: the caller keeps the producer synchronize.
+    static bool open_fp8_side(Impl& m);
     std::unique_ptr<Impl> impl_;
     PrefillStats stats_;
 };

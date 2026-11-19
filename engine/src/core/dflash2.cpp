@@ -310,6 +310,9 @@ bool Dflash2Drafter::bind_raw(EmbedFn embed, const void* head_w, int head_type, 
 #ifndef STRATA_DF2_NO_BIND   // the split engine (src/split) binds through bind_raw only: bind() copies head rows between cards with the peer API
 bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const std::string& vocab_file, std::string& err, int head_device) {
     const OnDevice on_device(device_);
+    if (const NativeEmbed* ne = native_embed()) {
+        if (!ne->ensure_device(device_, err)) return false;
+    }
     if (head == nullptr || !head->loaded()) { err = "dflash2: the drafter needs the native head (--native)"; return false; }
     const WeightRef* we = wt.find("token_embd.weight");
     if (we == nullptr && native_embed() == nullptr) { err = "dflash2: token_embd.weight is missing"; return false; }   // (a later stage of a layer split may not carry it: the native table serves)
@@ -1052,7 +1055,9 @@ bool Dflash2Drafter::draft_launch(const float* taps, int n_new, int64_t pos0, in
     } else
     if (cudaGraphLaunch(exec_[n_new], cs_) != cudaSuccess) { err = std::string("dflash2 draft: ") + cudaGetErrorString(cudaGetLastError()); return false; }
     if (timing_) cudaEventRecord(ev_b_, cs_);
+    #ifdef _WIN32
     (void) cudaStreamQuery(cs_);
+    #endif
     launch_t0_ = t0;
     launch_n_ = n_new;
     launch_pos0_ = pos0;

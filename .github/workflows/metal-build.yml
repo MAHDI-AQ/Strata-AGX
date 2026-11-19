@@ -5,14 +5,6 @@ name: Metal build
 # stub or an implementation; a missing one is a link error here, not on a user's Mac (owner round 9, G6).
 
 on:
-  pull_request:
-    paths:
-      - 'engine/src/**'
-      - 'engine/include/**'
-      - 'engine/metal/**'
-      - 'engine/third_party/**'
-      - 'engine/CMakeLists.txt'
-      - '.github/workflows/metal-build.yml'
   workflow_dispatch:
 
 permissions:

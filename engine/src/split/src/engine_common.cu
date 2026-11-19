@@ -1487,6 +1487,125 @@ int Engine::draft_rows(const std::vector<const float*>& src, int T, const std::v
     return mtp_->vocab[h_.bi[best]];
 }
 
+__global__ void publish_draft_tokens_kernel(uint32_t* dst_tokens, const int* src_tokens,
+                                            uint32_t* dst_seq, uint32_t seq, int k_drafts) {
+    int idx = threadIdx.x;
+    if (idx < k_drafts) {
+        dst_tokens[idx] = (uint32_t)src_tokens[idx];
+    }
+    __threadfence_system();
+    if (idx == 0) {
+        *dst_seq = seq;
+    }
+}
+
+void Engine::draft_rows_async(const std::vector<const float*>& src, int T, 
+                              const std::vector<int>& tokens, int pos0,
+                              uint32_t step_seq, int k_drafts) {
+    if (!mtp_) throw std::runtime_error("draft_rows_async: no draft layer attached");
+    if (T < 1 || T > MAXT || (int) tokens.size() != T) throw std::runtime_error("draft: 1..MAXT rows, one token each");
+    if (pos0 < 0 || pos0 + T > max_ctx_) throw std::runtime_error("draft: cells out of the context");
+    ensure_pages(pos0 + T);
+    if (!h_.mtp_emb) throw std::runtime_error("draft: mtp_attach first");
+
+    for (int t = 0; t < T; ++t) embed_token(tokens[t], pos0 + t + 1, h_.mtp_emb + (size_t) t * N);
+    h_.mtp_ctl[0] = pos0;
+    h_.mtp_ctl[1] = (int) ring_tag();
+
+    const std::vector<int> key = graph_key({cur_});
+    if (cb_[0]->mtp_graphs[T].key != key || !cb_[0]->mtp_graphs[T].exec) {
+        for (CardBuf* b : cb_) {
+            ck(cudaSetDevice(b->dev), "set");
+            ck(cudaStreamBeginCapture(b->st, cudaStreamCaptureModeRelaxed), "begin capture");
+        }
+        mtp_enqueue(T);
+        for (CardBuf* b : cb_) {
+            ck(cudaSetDevice(b->dev), "set");
+            cudaGraph_t g;
+            ck(cudaStreamEndCapture(b->st, &g), "end capture");
+            install_graph(b->mtp_graphs[T], g, key);
+        }
+    }
+
+    on_cards([&](int c) {
+        CardBuf& b = *cb_[c];
+        ck(cudaSetDevice(b.dev), "set");
+
+        // Bubble-aligned: Wait for target token x_t to be sampled on S_main before drafting
+        ck(cudaStreamWaitEvent(b.st_mtp, b.ev_target_sampled, 0), "wait ev_target_sampled");
+
+        // Async D2D / H2D uploads on st_mtp
+        ck(cudaMemcpyAsync(b.mtp_src, src[c], (size_t) T * ROW_W * 4, cudaMemcpyDeviceToDevice, b.st_mtp), "d2d src");
+        ck(cudaMemcpyAsync(b.mtp_emb, h_.mtp_emb, (size_t) T * N * 4, cudaMemcpyHostToDevice, b.st_mtp), "h2d emb");
+        ck(cudaMemcpyAsync(b.mtp_ctl, h_.mtp_ctl, 2 * sizeof(int), cudaMemcpyHostToDevice, b.st_mtp), "h2d ctl");
+
+        // Condition 2: Point draft KV append to speculative scratch buffer
+        if (b.spec_kv_scratch) {
+            b.mtp_kc = b.spec_kv_scratch;
+            b.mtp_vc = b.spec_kv_scratch + kvp_rows_halves(c, kv_q8());
+            b.mtp_qsa_pooled = b.spec_kv_scratch + 2 * kvp_rows_halves(c, kv_q8());
+        }
+
+        // Launch MTP CUDA Graph on st_mtp
+        ck(cudaGraphLaunch(b.mtp_graphs[T].exec, b.st_mtp), "launch mtp graph on st_mtp");
+
+        const int last = MTP_HEAD_EVERY_ROW ? T - 1 : 0;
+        ck(cudaMemcpyAsync(&h_.bv[c], b.mtp_bv + last, 4, cudaMemcpyDeviceToHost, b.st_mtp), "draft v");
+        ck(cudaMemcpyAsync(&h_.bi[c], b.mtp_bi + last, 4, cudaMemcpyDeviceToHost, b.st_mtp), "draft i");
+
+        // Publish draft proposals with __threadfence_system()
+        if (b.ring_d) {
+            const uint32_t ring_idx = step_seq % PipelinedMtpRing::RING_CAP;
+            publish_draft_tokens_kernel<<<1, 32, 0, b.st_mtp>>>(
+                (uint32_t*)b.ring_d->draft_tokens[ring_idx],
+                b.mtp_bi,
+                (uint32_t*)&b.ring_d->draft_ready_seq,
+                step_seq,
+                k_drafts
+            );
+        }
+        ck(cudaEventRecord(b.ev_mtp_done, b.st_mtp), "record ev_mtp_done");
+    });
+}
+
+void Engine::draft_async(int T, bool from_main, int src_row, const std::vector<int>& tokens, int pos0,
+                         uint32_t step_seq, int k_drafts) {
+    if (!mtp_) throw std::runtime_error("draft_async: no draft layer attached");
+    if (!h_.R0) throw std::runtime_error("draft_async: no window has run (it drafts from a window's rows)");
+    if (src_row < 0 || src_row + T > MAXT) throw std::runtime_error("draft_async: source rows out of range");
+    std::vector<const float*> src;
+    for (CardBuf* b : cb_) src.push_back(draft_src(*b, from_main) + (size_t) src_row * ROW_W);
+    draft_rows_async(src, T, tokens, pos0, step_seq, k_drafts);
+}
+
+void Engine::wait_mtp_done() {
+    for (int c = 0; c < NCARD; ++c) {
+        CardBuf& b = *cb_[c];
+        ck(cudaSetDevice(b.dev), "set");
+        ck(cudaStreamSynchronize(b.st_mtp), "st_mtp sync");
+    }
+}
+
+bool Engine::poll_draft_ready(uint32_t step_seq) {
+    if (!cb_[0]->ring_h) return true;
+    return cb_[0]->ring_h->draft_ready_seq == step_seq;
+}
+
+std::vector<int> Engine::get_async_drafts(uint32_t step_seq, int k_drafts) {
+    wait_mtp_done();
+    std::vector<int> drafts;
+    if (!cb_[0]->ring_h) return drafts;
+    const uint32_t ring_idx = step_seq % PipelinedMtpRing::RING_CAP;
+    for (int k = 0; k < k_drafts; ++k) {
+        int tok_idx = (int)cb_[0]->ring_h->draft_tokens[ring_idx][k];
+        if (tok_idx >= 0 && tok_idx < (int)mtp_->vocab.size()) {
+            drafts.push_back(mtp_->vocab[tok_idx]);
+        }
+    }
+    return drafts;
+}
+
+
 
 std::vector<int> Engine::draft_lanes(const std::vector<DraftReq>& reqs) {
     if (!mtp_) throw std::runtime_error("draft_lanes: no draft layer attached");

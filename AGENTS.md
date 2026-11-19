@@ -1,3 +1,13 @@
+## Strata-AGX (`v0.2.15` + SM89 Fork) — Mandatory Agent Rules
+
+- **Ref Invariant (`HEAD == main == green`):** Keep `main` and the `green` tag aligned at the latest verified commit. Branch `feat/*`, `perf/*`, or `lever/*` from `main`, and promote back only after passing all spill, parity, and serving gates.
+- **SM89 Pipeline & Session Lease Architecture:** Target Ada Lovelace (`sm_89`) cards with `--kv q4_0` (or `q8_0`), `--batch-mtp-mode shared --group-spread-mtp --concurrent-prefill`, and `"STRATA_EMBED_VRAM": "0"` (`NativeEmbed::ensure_device` retained defensively; `--vanilla-defaults` restores upstream defaults). Radix trees, paged KV, HiCache, and SGLang-style prefix sharing are excluded in favor of **Session Lease + in-place delta appending + `O_DIRECT` NVMe streaming**.
+- **CUDA Spill Gate:** Run `python3 tools/check_cuda_spills.py <build-dir>/libstrata_kernels.a <build-dir>/libstrata_core.a` and `python3 -m unittest tools.test_check_cuda_spills` — must report `0` disallowed spills across all `sm_89` objects (`sampler`, `native_mmvq`, `qsa_select`, `gdn_chunk`, `iq_kernels`, `gemm`, `kv_stream`, `verify_kernels`) and `OK`.
+- **8/8 Idle-GPU Parity:** With no competing server holding VRAM, pass `batch_groups_test`, `batch_read_test`, `batch_rows_parity`, `kv_window_parity`, `gemm_fp8_parity`, `sampler_parity`, `qsa_merge_daily_parity`, `qsa_slots_parity`.
+- **Upstream Sync Audit:** Run `python3 tools/upstream_sync_audit.py --repo . --upstream-ref upstream/main --fetch` before integrating upstream `Niko1221/Strata` updates.
+
+---
+
 # AGENTS.md
 
 Version 0.2.16, engine 0.1.62. The public model families are
@@ -22,6 +32,8 @@ Strata has three parts:
   `serve/` for the Python server with an OpenAI- and Anthropic-compatible API and a web page). `setup.py`, started by
   `START-HERE.bat` or `setup.sh`, is setup from a source checkout, for developers. The release paths are the
   installer and `strata launch`.
+
+- **`STRATA_READ_WIN_MAX_T=0` on multi-stage `--layer-split`:** Keep `STRATA_READ_WIN_MAX_T=0` (upstream default) when `ver.max_t() > S` (e.g., `--lookup-chain 3` with `--spec 4`) on multi-stage `--layer-split`; setting `1` allows `read_windows` to emit `T > S` (such as `T=6` on `enable_thinking=false` turn headers), which leaves the hidden state misaligned at `turn_at`.
 
 ## Installing Strata for a user
 
@@ -97,3 +109,25 @@ follow it whether a person or an agent writes the text. The short version:
   [docs/COMMUNITY_BENCHMARKS.md](docs/COMMUNITY_BENCHMARKS.md), compare against a same-day run of the build you are
   testing, and say what you did not test.
 - Open test requests and the hardware that is wanted are listed in [docs/TEST_REQUESTS.md](docs/TEST_REQUESTS.md).
+
+## Wave K14 Opt-In Controls
+
+- `STRATA_SAMPLER_BATCH_ROWS=1`, `STRATA_PARK_STAGE_THREADS=1`, `STRATA_TOPK_ACTIVE_SM89=1`, `STRATA_KV_STREAM_WIDE=1` (registered in `data/settings-register.json` as `opt-in`; default paths remain bitwise identical).
+
+## Wave K15 Opt-In Controls
+
+- `STRATA_KV_STAGE_SEL_GPU=1`, `STRATA_SAMPLER_ASYNC=1`, `STRATA_GDN_NORM_QFUSE=1`, `STRATA_GDN_CONV_GROUPS=1`, `STRATA_CONC_SUBCHUNK=512`, `STRATA_PREFILL_LOW_PRIO=1`, `STRATA_PARK_STAGE_POOL=1`, `STRATA_MLOCK_CODE=1`, `STRATA_DROP_STARTUP_MMAP=1`, `STRATA_HTTP_KEEPALIVE` (registered in `data/settings-register.json` as `opt-in`; default paths remain bitwise identical).
+
+## Wave K16 Opt-In Controls
+
+- `STRATA_PF_FP8_MIN_T=32` (default `128`; lowers the SM89 FP8 prefill GEMM token threshold with sub-128 bucket sizing `16, 32, 48, 64, 96` in `src/prefill/gemm.cu`, registered in `data/settings-register.json` as `opt-in`; default path remains bitwise identical).
+- Production `8x512k` resident KV headroom: `--kv-resident 212992` (`208k`), maintaining `>= 600 MiB` free VRAM floor across all 4 GPUs (`min_vram_free=642 MiB` under `8x262k` load).
+
+## Wave K17 Opt-In Controls
+
+- `STRATA_CONV_JEMALLOC_PURGE=1` (`include/strata/core/conversation_cache.hpp`: dynamic `mallctl("arenas.narenas")` + `arena.<n>.purge` fallback `arena.4096.purge` in `release_free_heap()`), `STRATA_CONV_NOHUGEPAGE=1` (`include/strata/core/conversation_buffer.hpp`: `MADV_NOHUGEPAGE` on `mmap` conversation segments).
+- `STRATA_MSG_PREFIX_CACHE=1` (`serve/server.py`: `O(delta)` message-boundary prompt prefix cache respecting leading system merge, `tools`/`enable_thinking`/`reasoning_effort`, empty-assistant filtering, and non-`tool` checkpoint cuts).
+- `STRATA_PF_FP8_PAD_SMALL_T=1` (`src/prefill/gemm.cu`: `T_pad >= 16` zero-padded FP8 prefill for `1 <= T < pf_fp8_min_t()` routed through `y_tmp_` + `T`-row FP32 scale/residual epilogue), `STRATA_PF_SMALL_T_RUN=1` (`src/prefill/prefill.cpp`: `run_impl` tail-block + `kv_stage_selected_from_host` for `T <= 256` above resident KV), `STRATA_SLOT_COPY_STREAM_SYNC=1` (`src/program/generate.cpp`: stream-scoped sync in `direct_slot_copy` / `copy_to_slot`), `STRATA_ASYNC_STAGE_WAIT=1` (`src/core/verify.cpp`, `src/core/mtp.cpp`: `cudaEventRecord`/`cudaStreamWaitEvent` for `copy_`, `commit_done_` on split stages, and async `draft_from_row` D2D staging).
+- The 6 C++/CUDA controls (`STRATA_CONV_JEMALLOC_PURGE`, `STRATA_CONV_NOHUGEPAGE`, `STRATA_PF_FP8_PAD_SMALL_T`, `STRATA_PF_SMALL_T_RUN`, `STRATA_SLOT_COPY_STREAM_SYNC`, `STRATA_ASYNC_STAGE_WAIT`) are registered in `data/settings-register.json` as `opt-in` (default paths remain bitwise identical); `STRATA_MSG_PREFIX_CACHE` (`serve/server.py`) is a Python serve-layer toggle outside `settings_register.py`'s C++/CUDA `ENGINE_DIRS`.
+- `Verifier::record_window` CUDA-graph logit-writeback fix (`c75ac8060`): `target_logits = hl`, `zero_dram = false`, `spec_gumbel_fused = false` so captured solo/batch graphs always populate `head_logits_` for subsequent penalized/sampled requests.
+- Verified Wave K17 (`sm_89` 4x RTX 4090, `8x512k @ 208k` resident): `65k` burst `246.09 turns/min` (`agg_decode=197.72 tok/s`, `8/8` needles), `196k` burst `134.45 turns/min` (`agg_decode=119.18 tok/s`, `8/8` needles), `agx_fast_gate --slots 8` `SD_r512_c8=714.92 tok/s` / `NEEDLE_GATE 8/8` / `min_vram_free=638 MiB`, `--smoke 100.0%/0.0%/100.0%`, `0` disallowed spills across 8 `.cu.o`, `8/8` parity, `compute-sanitizer` `0` errors.

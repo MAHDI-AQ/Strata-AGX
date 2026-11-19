@@ -29,6 +29,7 @@ struct QsaScoreRows {
     const float* pooled[8] = {};
     const float* dead[8] = {};
     int n = 0;
+    bool pooled_fp16 = false;
 };
 /// qsa_block_scores for up to 8 queries of DIFFERENT sequences in one launch (the multi kernel, per query its own
 /// keys; the same arithmetic in the same order: bit-identical scores).
@@ -36,7 +37,7 @@ void qsa_block_scores_rows(const QsaScoreRows& rows, const float* q_idx, const i
                            int64_t max_blocks, const QsaShapes& s, float* scores, void* stream);
 void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
                       int64_t max_blocks, const QsaShapes& s, float* scores, void* stream,
-                      int64_t active_blocks = -1);   ///< perf-review C-1: > 0 launches only this many blocks (the
+                      int64_t active_blocks = -1, bool pooled_fp16 = false);   ///< perf-review C-1: > 0 launches only this many blocks (the
                                                      ///< batch's largest n_bid + 1; not for a captured graph)
 
 /// qsa_block_scores for `nq` queries of different slots, query i scoring its own slot's keys (pooled[i], dead[i]; host
@@ -44,20 +45,22 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
 /// False (nothing launched) where that call would run another kernel (nq > 8, STRATA_SCORES_MULTI=0): loop instead.
 bool qsa_block_scores_slots(const float* const* pooled, const float* const* dead, const float* q_idx,
                             const int32_t* steps, int64_t nq, int64_t max_blocks, const QsaShapes& s, float* scores,
-                            void* stream);
+                            void* stream, bool pooled_fp16 = false);
 /// QSAROWS (docs/QSAROWS.md): block_scores_multi_kernel's scores for a call of up to 4 queries, bit for bit, with the
 /// queries in registers and the four heads reduce-scattered (six shuffles instead of twenty a block and query).
 /// qsa_block_scores takes it with STRATA_QSA_ROWS=1; false (nothing launched) above 4 queries or on another geometry.
 /// For qsa_rows_bench's parity and timing it is callable on its own.
 bool qsa_block_scores_rows(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
-                           int64_t max_blocks, const QsaShapes& s, float* scores, void* stream);
+                           int64_t max_blocks, const QsaShapes& s, float* scores, void* stream,
+                           bool pooled_fp16 = false);
 
 /// The same scores on tensor cores (3xTF32, FP32-level accuracy but another summation order: not bitwise; the tail
 /// block n_bid is the warp kernel's arithmetic). For the prompt path; false (nothing launched) on another geometry.
 /// On AMD it is the gfx12 (RDNA4) WMMA kernel (a three-way bf16 split, six products); false on any other AMD target.
 /// On CUDA below sm_80 (no TF32 tensor cores) it is an FP32 tiled kernel, also not bitwise, and only with STRATA_SELECT_SIMT=1 (otherwise false).
 bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
-                         int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks);
+                         int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks,
+                         bool pooled_fp16 = false);
 
 /// ids [nq, cap] (cells, ascending); `cap` >= the largest selection width.
 void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
@@ -89,7 +92,8 @@ void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, i
 void qsa_block_topk_long(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                          const QsaShapes& s, int32_t* ids, void* stream, int64_t active_blocks, int32_t* multi_scratch);
 void qsa_block_scores_long(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
-                           int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks);
+                           int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks,
+                           bool pooled_fp16 = false);
 /// Device ints a qsa_block_topk_long call of `nq` queries may use as multi_scratch (0 on a build without the multi-CTA
 /// path: pass null).
 int64_t qsa_topk_multi_scratch_ints(int64_t nq);
@@ -109,10 +113,11 @@ int64_t qsa_two_pass_min_blocks();  ///< STRATA_SELECT_TWO_PASS_MIN (blocks), re
 uint64_t qsa_two_pass_scratch_bytes(int64_t nq_cap, int64_t max_blocks);
 /// Once per layer and chunk, after the indexer appends and before the calls: the norms of the pooled keys [0, n_blocks).
 bool qsa_two_pass_keys(const float* pooled, int64_t n_blocks, int64_t nq_cap, int64_t max_blocks, void* scratch,
-                       uint64_t scratch_bytes, void* stream);
+                       uint64_t scratch_bytes, void* stream, bool pooled_fp16 = false);
 bool qsa_block_scores_two_pass(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps,
                                int64_t nq, int64_t nq_cap, int64_t max_blocks, const QsaShapes& s, float* scores,
-                               void* scratch, uint64_t scratch_bytes, void* stream, int64_t active_blocks);
+                               void* scratch, uint64_t scratch_bytes, void* stream, int64_t active_blocks,
+                               bool pooled_fp16 = false);
 /// STRATA_SELECT_TWO_PASS_CHECK: right after a two-pass call and its qsa_block_topk, against today's row and ids for
 /// the same queries (ref_scores from qsa_block_scores_tc, ref_ids from qsa_block_topk on them): counts the queries
 /// whose ids differ, the scored-again blocks whose score is not today's bit for bit, and the kept blocks whose

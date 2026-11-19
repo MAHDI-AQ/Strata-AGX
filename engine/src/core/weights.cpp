@@ -599,4 +599,95 @@ bool WeightTable::load_hc_q8(const std::string& pack_dir, uint64_t& bytes, std::
     return true;
 }
 
+WeightTable::~WeightTable() {
+#ifndef _WIN32
+    if (l2_slab_ != nullptr) {
+        cudaFree(l2_slab_);
+        l2_slab_ = nullptr;
+        l2_bytes_ = 0;
+    }
+#endif
+}
+
+bool WeightTable::pack_l2_persist(int dev, std::string& err) {
+#ifdef _WIN32
+    (void) dev; (void) err;
+    return true;
+#else
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_L2_PERSIST");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    (void) err;
+    if (!on || l2_slab_ != nullptr) return true;
+    int major = 0, minor = 0;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
+        cudaGetLastError();
+        return true;
+    }
+    if (major != 8 || minor != 9) return true;
+    int l2_max = 0, max_win = 0;
+    cudaDeviceGetAttribute(&l2_max, cudaDevAttrMaxPersistingL2CacheSize, dev);
+    cudaDeviceGetAttribute(&max_win, cudaDevAttrMaxAccessPolicyWindowSize, dev);
+    if (l2_max <= 0 || max_win <= 0) return true;
+    const size_t budget = std::min<size_t>((size_t) 44 << 20, std::min<size_t>((size_t) l2_max * 85 / 100, (size_t) max_win));
+    auto is_hot_small = [](const std::string& k) -> bool {
+        return k.find("hc_attn_norm") != std::string::npos ||
+               k.find("hc_ffn_norm") != std::string::npos ||
+               k.find("hc_attn_inject") != std::string::npos ||
+               k.find("hc_ffn_inject") != std::string::npos ||
+               k.find("ffn_gate_inp.weight") != std::string::npos ||
+               k.find("ffn_gate_inp_shexp.weight") != std::string::npos ||
+               k.find("ssm_a") != std::string::npos ||
+               k.find("ssm_dt.bias") != std::string::npos ||
+               k.find("ssm_norm.weight") != std::string::npos ||
+               k.find("ssm_conv1d.weight") != std::string::npos ||
+               k.find("ssm_alpha.weight") != std::string::npos ||
+               k.find("ssm_beta.weight") != std::string::npos ||
+               k.find("indexer.k_proj.weight") != std::string::npos ||
+               k.find("output_norm.weight") != std::string::npos;
+    };
+    auto align256 = [](size_t n) { return (n + 255) & ~(size_t) 255; };
+    std::vector<WeightRef*> picks;
+    size_t total = 0;
+    for (auto& kv : table_) {
+        WeightRef& w = kv.second;
+        if (!w.resident || w.data == nullptr || w.bytes == 0 || w.q8_scale != nullptr) continue;
+        if (!is_hot_small(kv.first)) continue;
+        const size_t ab = align256(w.bytes);
+        if (total + ab > budget) continue;
+        picks.push_back(&w);
+        total += ab;
+    }
+    if (picks.empty() || total == 0) return true;
+    void* slab = nullptr;
+    if (cudaMalloc(&slab, total) != cudaSuccess) {
+        cudaGetLastError();
+        return true;   // non-fatal: keep original locations
+    }
+    std::vector<const void*> staged_ptrs(picks.size(), nullptr);
+    size_t off = 0;
+    for (size_t i = 0; i < picks.size(); ++i) {
+        WeightRef* w = picks[i];
+        void* dst = (uint8_t*) slab + off;
+        if (cudaMemcpy(dst, w->data, w->bytes, cudaMemcpyDeviceToDevice) != cudaSuccess) {
+            cudaFree(slab);
+            cudaGetLastError();
+            return true;
+        }
+        staged_ptrs[i] = dst;
+        off += align256(w->bytes);
+    }
+    for (size_t i = 0; i < picks.size(); ++i) {
+        picks[i]->data = staged_ptrs[i];
+    }
+    l2_slab_ = slab;
+    l2_bytes_ = total;
+    std::fprintf(stderr, "strata: STRATA_L2_PERSIST=1 GPU%d: packed %zu hot tensors (%.2f MiB, L2 max %.2f MiB)\n",
+                 dev, picks.size(), (double) total / (1024.0 * 1024.0), (double) l2_max / (1024.0 * 1024.0));
+    return true;
+#endif
+}
+
 }  // namespace strata::core

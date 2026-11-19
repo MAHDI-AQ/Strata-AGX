@@ -34,6 +34,9 @@ static_assert(S == strata::core::kCompiledGeometry.ssm_state_size, "verify_kerne
 constexpr int RG = 4;
 constexpr int RPG = S / RG;
 
+
+
+
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e)); std::exit(1); }
@@ -76,6 +79,18 @@ __global__ void __launch_bounds__(S) gdn_conv_l2_multi_kernel(float* hist, const
                                                               const float* __restrict__ w, float* __restrict__ h,
                                                               int C, int qk_heads, float eps, int t_begin, bool commit) {
     gdn_conv_l2_body(blockIdx.x, blockIdx.y, hist, qkv, w, h, C, qk_heads, eps, t_begin, commit);
+}
+
+__global__ void __launch_bounds__(S) gdn_conv_l2_groups_kernel(GdnConvGroups grp, const float* __restrict__ qkv,
+                                                               const float* __restrict__ w, float* __restrict__ h,
+                                                               int C, int qk_heads, float eps, bool commit) {
+    const int gi = blockIdx.z;
+    if (gi >= grp.n) return;
+    const int t = blockIdx.y;
+    if (t >= grp.ntok[gi]) return;
+    const int f = grp.first[gi];
+    gdn_conv_l2_body(blockIdx.x, t, const_cast<float*>(grp.hist[gi]), qkv + (size_t) f * C, w, h + (size_t) f * C,
+                     C, qk_heads, eps, 0, commit);
 }
 
 __global__ void gdn_conv_commit_kernel(float* __restrict__ hist, const float* __restrict__ qkv, int C,
@@ -219,7 +234,7 @@ __global__ void __launch_bounds__(32 * RG) gdn_step_commit_kernel(float* __restr
     if (n <= 0) return;
     if (DBG && n > n_max) {
         if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && threadIdx.y == 0)
-            printf("strata DBG: gdn_step_commit: n_keep %d is past the window's %d rows: commit skipped (#937)\n", n, n_max);
+            printf("strata DBG: gdn_step_commit: n_keep is past the window's rows: commit skipped (#937)\n");
         return;
     }
     gdn_step_commit_body(state, hbuf, C, gate, beta, h_k, h_v, n);
@@ -324,8 +339,9 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
                                                                      float* __restrict__ y, int h_k, int h_v, int T,
                                                                      const int32_t* __restrict__ n_keep, int t_out_begin,
                                                                      GdnQ81* __restrict__ xq, GdnGroups grp = {}) {
+    const int f = (grp.n > 0) ? grp.first[blockIdx.y] : 0;
     if (grp.n > 0) {   // group blockIdx.y - its slot's state and its rows of the window's buffers
-        const int gi = blockIdx.y, f = grp.first[gi];
+        const int gi = blockIdx.y;
         state = grp.state[gi];
         hbuf += (size_t) f * C;
         gate += (size_t) f * h_v;
@@ -348,7 +364,7 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
     const int n = ALL_OUT ? T : (n_keep ? *n_keep : T);
     if (n > 0) {
         if (rg == 0) sk[0][col] = hbuf[qk + qh * S + col];
-        else if (rg == 1 && (ALL_OUT || 0 >= t_out_begin)) sq[0][col] = hbuf[qh * S + col];
+        else if (rg == 1 && (ALL_OUT || f >= t_out_begin)) sq[0][col] = hbuf[qh * S + col];
     }
     const float gam = (rg == 0) ? gamma[col] : 0.0f;
     float s[RPG];
@@ -359,11 +375,11 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
     for (int t = 0; t < n; ++t) {
         const int cur = t & 1, nxt = (t + 1) & 1;
         const float* ht = hbuf + (size_t) t * C;
-        const bool need_out = ALL_OUT || (t >= t_out_begin);
+        const bool need_out = ALL_OUT || (f + t >= t_out_begin);
         __syncthreads();
         if (t + 1 < n) {
             const float* ht_next = ht + C;
-            const bool need_next = ALL_OUT || (t + 1 >= t_out_begin);
+            const bool need_next = ALL_OUT || (f + t + 1 >= t_out_begin);
             if (rg == 0) sk[nxt][col] = ht_next[qk + qh * S + col];
             else if (rg == 1 && need_next) sq[nxt][col] = ht_next[qh * S + col];
         }
@@ -390,7 +406,7 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
         __syncthreads();
         float oc = 0.0f, sq_part = 0.0f;
         if (rg == 0) {
-            oc = (red_o[0][col] + red_o[1][col] + red_o[2][col] + red_o[3][col]) * rsqrtf((float) S);
+            oc = red_o[0][col] + red_o[1][col] + red_o[2][col] + red_o[3][col];
             sq_part = oc * oc;
         }
         // every thread takes the shuffles, as the single-token kernel does: inside the `rg == 0` branch hipcc on
@@ -400,11 +416,11 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
         __syncthreads();
         if (rg == 0) {
             const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
-            const float scale = rsqrtf(ss / (float) S + eps);
+            const float scale = rsqrtf(ss / (float) S + (float) S * eps);
             const float zz = z[(size_t) t * value_dim + head * S + col];
             const float yv = oc * scale * gam * (1.0f / (1.0f + __expf(-zz)));
             y[(size_t) t * value_dim + head * S + col] = yv;
-            if constexpr (Q) gdn_q8_1_store(xq, (size_t) (t - t_out_begin) * value_dim + head * S + col, yv);
+            if constexpr (Q) gdn_q8_1_store(xq, (size_t) (f + t - t_out_begin) * value_dim + head * S + col, yv);
         }
     }
     if (!ALL_OUT && n_keep != nullptr && n > 0) {
@@ -473,7 +489,7 @@ __global__ void __launch_bounds__(GS_COLS * RG) gdn_step_split_kernel(float* __r
         __syncthreads();
         if (rg == 0 && t >= t_out_begin)
             y[(size_t) t * value_dim + head * S + col] =
-                (red[0][lc] + red[1][lc] + red[2][lc] + red[3][lc]) * rsqrtf((float) S);
+                (red[0][lc] + red[1][lc] + red[2][lc] + red[3][lc]);
     }
     if (n_keep != nullptr && n > 0) {
 #pragma unroll
@@ -553,35 +569,29 @@ __global__ void __launch_bounds__(GS_COLS * RG) gdn_state_replay_kernel(float* _
 // y = oc * rsqrt(mean(oc^2) + eps) * gamma * sigmoid(z) per head and token: gdn_step_norm_multi_kernel's tail with its
 // code shape (S x RG threads; rg 0 holds oc, the other row groups contribute 0 to wsum), reading oc from y
 template<bool Q>
-__global__ void __launch_bounds__(S * RG) gdn_out_norm_kernel(const float* __restrict__ z, const float* __restrict__ gamma,
-                                                             float eps, float* __restrict__ y, int h_v, int T,
-                                                             const int32_t* __restrict__ n_keep, int t_out_begin,
-                                                             GdnQ81* __restrict__ xq) {
-    __shared__ float wsum[S * RG / 32];
-    const int head = blockIdx.x, t = blockIdx.y + t_out_begin, col = threadIdx.x, rg = threadIdx.y;
-    const int tid = rg * S + col;
+__global__ void __launch_bounds__(S) gdn_out_norm_kernel(const float* __restrict__ z, const float* __restrict__ gamma,
+                                                         float eps, float* __restrict__ y, int h_v, int T,
+                                                         const int32_t* __restrict__ n_keep, int t_out_begin,
+                                                         GdnQ81* __restrict__ xq) {
+    __shared__ float wsum[S / 32];
+    const int head = blockIdx.x, t = blockIdx.y + t_out_begin, col = threadIdx.x;
     const int n = n_keep ? *n_keep : T;
     if (t >= n) return;
     const int value_dim = S * h_v;
-    float oc = 0.0f, sq_part = 0.0f;
-    if (rg == 0) {
-        oc = y[(size_t) t * value_dim + head * S + col];
-        sq_part = oc * oc;
-    }
+    const float oc = y[(size_t) t * value_dim + head * S + col];
+    float sq_part = oc * oc;
     for (int o2 = 16; o2 > 0; o2 >>= 1) sq_part += __shfl_xor_sync(0xffffffffu, sq_part, o2);
-    if ((tid & 31) == 0) wsum[tid >> 5] = sq_part;
+    if ((col & 31) == 0) wsum[col >> 5] = sq_part;
     __syncthreads();
-    if (rg == 0) {
-        const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
-        const float scale = rsqrtf(ss / (float) S + eps);
-        const float zz = z[(size_t) t * value_dim + head * S + col];
-        if constexpr (Q) {
-            const float yv = oc * scale * gamma[col] * (1.0f / (1.0f + __expf(-zz)));
-            y[(size_t) t * value_dim + head * S + col] = yv;
-            gdn_q8_1_store(xq, (size_t) (t - t_out_begin) * value_dim + head * S + col, yv);
-        } else {
-            y[(size_t) t * value_dim + head * S + col] = oc * scale * gamma[col] * (1.0f / (1.0f + __expf(-zz)));
-        }
+    const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
+    const float scale = rsqrtf(ss / (float) S + (float) S * eps);
+    const float zz = z[(size_t) t * value_dim + head * S + col];
+    if constexpr (Q) {
+        const float yv = oc * scale * gamma[col] * (1.0f / (1.0f + __expf(-zz)));
+        y[(size_t) t * value_dim + head * S + col] = yv;
+        gdn_q8_1_store(xq, (size_t) (t - t_out_begin) * value_dim + head * S + col, yv);
+    } else {
+        y[(size_t) t * value_dim + head * S + col] = oc * scale * gamma[col] * (1.0f / (1.0f + __expf(-zz)));
     }
 }
 
@@ -612,12 +622,33 @@ __global__ void broadcast_streams_kernel(const float* __restrict__ x, float* __r
     R[(size_t) t * n * hc + i] = x[(size_t) t * n + i % n];
 }
 
+__global__ void broadcast_streams_vec4_kernel(const float* __restrict__ x, float* __restrict__ R, int64_t n4, int hc) {
+    const int t = blockIdx.y;
+    const int64_t i4 = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i4 >= n4 * hc) return;
+    const float4* x4 = reinterpret_cast<const float4*>(x + (size_t) t * (n4 * 4));
+    float4* r4 = reinterpret_cast<float4*>(R + (size_t) t * (n4 * 4) * hc);
+    r4[i4] = x4[i4 % n4];
+}
+
 __global__ void hc_mean_streams_kernel(const float* __restrict__ R, float* __restrict__ out, int64_t n, int hc) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float s = 0.0f;
     for (int c = 0; c < hc; ++c) s += R[(size_t) c * n + i];
     out[i] = s / (float) hc;
+}
+
+__global__ void hc_mean_streams_vec4_kernel(const float* __restrict__ R, float* __restrict__ out, int64_t n4, int hc) {
+    const int64_t i4 = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i4 >= n4) return;
+    float4 s = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int c = 0; c < hc; ++c) {
+        const float4 v = reinterpret_cast<const float4*>(R + (size_t) c * (n4 * 4))[i4];
+        s.x += v.x; s.y += v.y; s.z += v.z; s.w += v.w;
+    }
+    const float inv = 1.0f / (float) hc;
+    reinterpret_cast<float4*>(out)[i4] = make_float4(s.x * inv, s.y * inv, s.z * inv, s.w * inv);
 }
 
 __global__ void route_marginal_stats_kernel(const int32_t* __restrict__ ids, int n, int k, unsigned long long* acc) {
@@ -641,6 +672,16 @@ __global__ void copy_indexed_kernel(float* __restrict__ dst, const float* __rest
     if (idx < 0) return;
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
         dst[i] = src[(size_t) idx * stride + i];
+}
+
+__global__ void copy_indexed_vec4_kernel(float* __restrict__ dst, const float* __restrict__ src, int64_t stride,
+                                         const int32_t* __restrict__ index, int64_t n4) {
+    const int idx = *index;
+    if (idx < 0) return;
+    const float4* s4 = reinterpret_cast<const float4*>(src + (size_t) idx * stride);
+    float4* d4 = reinterpret_cast<float4*>(dst);
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (int64_t) gridDim.x * blockDim.x)
+        d4[i] = s4[i];
 }
 
 __global__ void fetch_blobs_kernel(const unsigned long long* __restrict__ src, const int32_t* __restrict__ n,
@@ -1129,6 +1170,25 @@ void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream) {
     check("dense_steps");
 }
 
+void gdn_conv_l2_groups(const GdnConvGroups& groups, const float* qkv, const float* conv_w, float* h, int channels,
+                        int qk_heads, float eps, bool commit, void* stream) {
+    if (groups.n < 1 || groups.n > 8 || !qkv || !conv_w || !h || channels <= 0 || channels % S) {
+        std::fprintf(stderr, "gdn_conv_l2_groups: invalid arguments\n");
+        std::exit(1);
+    }
+    int max_t = 0;
+    for (int i = 0; i < groups.n; ++i) {
+        if (!groups.hist[i] || groups.ntok[i] < 1) {
+            std::fprintf(stderr, "gdn_conv_l2_groups: invalid group %d\n", i);
+            std::exit(1);
+        }
+        if (groups.ntok[i] > max_t) max_t = groups.ntok[i];
+    }
+    gdn_conv_l2_groups_kernel<<<dim3((unsigned) (channels / S), (unsigned) max_t, (unsigned) groups.n), S, 0, (cudaStream_t) stream>>>(
+        groups, qkv, conv_w, h, channels, qk_heads, eps, commit);
+    check("gdn_conv_l2_groups");
+}
+
 void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv_w, float* h, int channels,
                        int qk_heads, float eps, int n_tok, void* stream, int t_begin, bool commit) {
     if (!history || !qkv || !conv_w || !h || channels % S != 0 || n_tok < 1 || n_tok > kVerifyMaxT ||
@@ -1240,7 +1300,7 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
 
 void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_channels, const float* gate, const float* beta,
                           const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, bool commit,
-                          void* stream) {
+                          void* stream, void* xq_out, int t_out_begin) {
     if (groups.n < 1 || groups.n > 8 || !h || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v % h_k) {
         std::fprintf(stderr, "gdn_step_norm_groups: invalid arguments\n");
         std::exit(1);
@@ -1250,15 +1310,23 @@ void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_chan
             std::fprintf(stderr, "gdn_step_norm_groups: invalid group %d\n", i);
             std::exit(1);
         }
+    GdnQ81* const xq = static_cast<GdnQ81*>(xq_out);
     const dim3 g1((unsigned) h_v, (unsigned) groups.n), b1(S, RG);
-    // the kernel gdn_step_norm_multi picks for these calls: a window's rows (all outputs, no keep) or a commit of
-    // one-row groups (keep, t_out_begin 0)
-    if (commit)
-        gdn_step_norm_multi_kernel<false, false><<<g1, b1, 0, (cudaStream_t) stream>>>(
-            nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 0, nullptr, 0, nullptr, groups);
-    else
-        gdn_step_norm_multi_kernel<true, false><<<g1, b1, 0, (cudaStream_t) stream>>>(
-            nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 0, nullptr, 0, nullptr, groups);
+    if (xq) {
+        if (commit)
+            gdn_step_norm_multi_kernel<false, true><<<g1, b1, 0, (cudaStream_t) stream>>>(
+                nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 0, nullptr, t_out_begin, xq, groups);
+        else
+            gdn_step_norm_multi_kernel<true, true><<<g1, b1, 0, (cudaStream_t) stream>>>(
+                nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 0, nullptr, t_out_begin, xq, groups);
+    } else {
+        if (commit)
+            gdn_step_norm_multi_kernel<false, false><<<g1, b1, 0, (cudaStream_t) stream>>>(
+                nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 0, nullptr, 0, nullptr, groups);
+        else
+            gdn_step_norm_multi_kernel<true, false><<<g1, b1, 0, (cudaStream_t) stream>>>(
+                nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 0, nullptr, 0, nullptr, groups);
+    }
     check("gdn_step_norm_groups");
 }
 
@@ -1289,8 +1357,8 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
             gdn_step_split_kernel<true><<<grid, block, 0, (cudaStream_t) stream>>>(
                 state, h, conv_channels, gate, beta, y, h_k, h_v, n_tok, n_keep, t_out_begin);
             const dim3 ng((unsigned) h_v, (unsigned) (n_tok - t_out_begin));
-            if (xq) gdn_out_norm_kernel<true><<<ng, dim3(S, RG), 0, (cudaStream_t) stream>>>(z, gamma, eps, y, h_v, n_tok, n_keep, t_out_begin, xq);
-            else gdn_out_norm_kernel<false><<<ng, dim3(S, RG), 0, (cudaStream_t) stream>>>(z, gamma, eps, y, h_v, n_tok, n_keep, t_out_begin, nullptr);
+            if (xq) gdn_out_norm_kernel<true><<<ng, S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, h_v, n_tok, n_keep, t_out_begin, xq);
+            else gdn_out_norm_kernel<false><<<ng, S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, h_v, n_tok, n_keep, t_out_begin, nullptr);
         }
         check("gdn_step_norm_multi (split)");
         return;
@@ -1691,13 +1759,24 @@ void embedding_gather_dev(const uint8_t* codes, const float* scales, const float
 }
 
 void broadcast_streams(const float* x, float* R, int64_t n_embd, int hc, int n_tok, void* stream) {
-    broadcast_streams_kernel<<<dim3((unsigned) ((n_embd * hc + 255) / 256), (unsigned) n_tok), 256, 0,
-                               (cudaStream_t) stream>>>(x, R, n_embd, hc);
+    if ((n_embd & 3) == 0 && (((uintptr_t) x | (uintptr_t) R) & 15u) == 0) {
+        const int64_t n4 = n_embd >> 2;
+        broadcast_streams_vec4_kernel<<<dim3((unsigned) ((n4 * hc + 255) / 256), (unsigned) n_tok), 256, 0,
+                                        (cudaStream_t) stream>>>(x, R, n4, hc);
+    } else {
+        broadcast_streams_kernel<<<dim3((unsigned) ((n_embd * hc + 255) / 256), (unsigned) n_tok), 256, 0,
+                                   (cudaStream_t) stream>>>(x, R, n_embd, hc);
+    }
     check("broadcast_streams");
 }
 
 void hc_mean_streams(const float* R, float* out, int64_t n_embd, int hc, void* stream) {
-    hc_mean_streams_kernel<<<(unsigned) ((n_embd + 255) / 256), 256, 0, (cudaStream_t) stream>>>(R, out, n_embd, hc);
+    if ((n_embd & 3) == 0 && (((uintptr_t) R | (uintptr_t) out) & 15u) == 0) {
+        const int64_t n4 = n_embd >> 2;
+        hc_mean_streams_vec4_kernel<<<(unsigned) ((n4 + 255) / 256), 256, 0, (cudaStream_t) stream>>>(R, out, n4, hc);
+    } else {
+        hc_mean_streams_kernel<<<(unsigned) ((n_embd + 255) / 256), 256, 0, (cudaStream_t) stream>>>(R, out, n_embd, hc);
+    }
     check("hc_mean_streams");
 }
 
@@ -1707,8 +1786,14 @@ void route_marginal_stats(const int32_t* ids, int n, int k, unsigned long long* 
 }
 
 void copy_indexed(float* dst, const float* src, int64_t stride, const int32_t* index, int64_t n, void* stream) {
-    const unsigned blocks = (unsigned) ((n + 255) / 256 < 64 ? (n + 255) / 256 : 64);
-    copy_indexed_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(dst, src, stride, index, n);
+    if ((n & 3) == 0 && (stride & 3) == 0 && (((uintptr_t) dst | (uintptr_t) src) & 15u) == 0) {
+        const int64_t n4 = n >> 2;
+        const unsigned blocks = (unsigned) ((n4 + 255) / 256 < 64 ? (n4 + 255) / 256 : 64);
+        copy_indexed_vec4_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(dst, src, stride, index, n4);
+    } else {
+        const unsigned blocks = (unsigned) ((n + 255) / 256 < 64 ? (n + 255) / 256 : 64);
+        copy_indexed_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(dst, src, stride, index, n);
+    }
     check("copy_indexed");
 }
 

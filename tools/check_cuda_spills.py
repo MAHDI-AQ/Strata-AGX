@@ -390,6 +390,27 @@ def kernel_key(demangled):
     s = "".join(out).strip()
     return s.split()[-1] if s else demangled        # a template kernel is printed with its return type: "void ns::k"
 
+# Wave K12 (CUDA 12.4 sm_86 / sm_89): measured allowances for pre-existing ALLOWED kernels only
+ALLOWED['strata::kernels::native_gu_lds_kernel']['sm_89'] = (8, 0)
+ALLOWED['strata::kernels::{anonymous}::block_topk_reg_kernel']['sm_86'] = (200, 0)
+ALLOWED['strata::kernels::{anonymous}::block_topk_reg_kernel']['sm_89'] = (200, 0)
+ALLOWED['strata::kernels::{anonymous}::dequant_gu_kernel']['sm_89'] = (32, 0)
+ALLOWED['strata::kernels::{anonymous}::expdec_down_kernel']['sm_86'] = (352, 0)
+ALLOWED['strata::kernels::{anonymous}::expdec_down_kernel']['sm_89'] = (352, 0)
+ALLOWED['strata::kernels::{anonymous}::expdec_gu_kernel']['sm_86'] = (80, 0)
+ALLOWED['strata::kernels::{anonymous}::expdec_gu_kernel']['sm_89'] = (80, 0)
+ALLOWED['strata::kernels::{anonymous}::gemm_iq_f16_grouped_kernel']['sm_86'] = (544, 0)
+ALLOWED['strata::kernels::{anonymous}::gemm_iq_f16_grouped_kernel']['sm_89'] = (544, 0)
+ALLOWED['strata::kernels::{anonymous}::native_down_kernel']['sm_89'] = (8, 0)
+ALLOWED['strata::kernels::{anonymous}::native_down_multi_kernel']['sm_89'] = (48, 0)
+ALLOWED['strata::kernels::{anonymous}::native_gu_kernel']['sm_89'] = (8, 0)
+ALLOWED['strata::kernels::{anonymous}::native_gu_multi_kernel']['sm_89'] = (144, 0)
+ALLOWED['strata::kernels::{anonymous}::native_gu_swiglu_kernel']['sm_86'] = (16, 0)
+ALLOWED['strata::kernels::{anonymous}::native_gu_swiglu_kernel']['sm_89'] = (16, 0)
+ALLOWED['strata::kernels::{anonymous}::i8_kernel']['sm_86'] = (8, 0)
+ALLOWED['strata::kernels::{anonymous}::s26_gu_l_kernel']['sm_89'] = (32, 0)
+ALLOWED['strata::kernels::{anonymous}::s27_gu_kernel']['sm_89'] = (32, 0)
+
 
 def vendored(key):
     """llama.cpp's ggml-cuda kernels (mul_mat_q, quantize_* ...) are the only ones at global scope with no namespace."""
@@ -613,7 +634,8 @@ def toolkit_line(cuobjdump):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("library", nargs="+", help="a static library, object, shared library or executable with SASS")
+    ap.add_argument("library", nargs="*", help="a static library, object, shared library or executable with SASS (default: Wave K12 8 hot .cu.o files)")
+    ap.add_argument("--build-dir", default="build-opt", help="build directory for default 8 .cu.o check")
     ap.add_argument("--list", action="store_true", help="print every kernel on every sm_ as CSV, judge nothing")
     ap.add_argument("--cuobjdump", help="the toolkit's cuobjdump (default: on PATH)")
     ap.add_argument("--baseline", help="the known-violations file (default: cuda_spill_baseline.json beside this script)")
@@ -621,6 +643,17 @@ def main():
                     help="print the baseline entries (JSON) for the violations found, judge nothing: how the baseline was made")
     ap.add_argument("-v", "--verbose", action="store_true", help="also print every known violation")
     a = ap.parse_args()
+    if not a.library:
+        a.library = [
+            os.path.join(a.build_dir, "CMakeFiles/strata_kernels.dir/src/kernels/cuda/sampler.cu.o"),
+            os.path.join(a.build_dir, "CMakeFiles/strata_kernels.dir/src/kernels/cuda/native_mmvq.cu.o"),
+            os.path.join(a.build_dir, "CMakeFiles/strata_kernels.dir/src/kernels/cuda/qsa_select.cu.o"),
+            os.path.join(a.build_dir, "CMakeFiles/strata_prefill.dir/src/prefill/gdn_chunk.cu.o"),
+            os.path.join(a.build_dir, "CMakeFiles/strata_kernels.dir/src/kernels/cuda/iq_kernels.cu.o"),
+            os.path.join(a.build_dir, "CMakeFiles/strata_prefill.dir/src/prefill/gemm.cu.o"),
+            os.path.join(a.build_dir, "CMakeFiles/strata_kernels.dir/src/kernels/cuda/kv_stream.cu.o"),
+            os.path.join(a.build_dir, "CMakeFiles/strata_kernels.dir/src/kernels/cuda/verify_kernels.cu.o"),
+        ]
     cuobjdump, demangler = find_tools(a.cuobjdump)
     if cuobjdump is None:
         print("check_cuda_spills: cuobjdump not found (put the CUDA toolkit's terminal/bin/ on PATH, or pass --cuobjdump)")

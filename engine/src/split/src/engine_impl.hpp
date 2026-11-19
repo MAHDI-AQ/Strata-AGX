@@ -2,6 +2,8 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <cstddef>
+#include <cstdint>
 
 #include <functional>
 #include <map>
@@ -12,6 +14,22 @@
 #include "owned.hpp"
 
 namespace fnx {
+
+// Path A: Zero-P2P host-pinned ring buffer for asynchronous MTP drafting
+struct alignas(64) PipelinedMtpRing {
+    static constexpr uint32_t RING_CAP = 16;
+
+    // Target token channel (Stage 3 -> Stage 0 / Coordinator)
+    alignas(64) volatile uint32_t target_token[RING_CAP];
+    alignas(64) volatile uint32_t target_ready_seq;
+
+    // MTP draft proposal channel (S_mtp -> Stage 0 / Coordinator)
+    alignas(64) volatile uint32_t draft_tokens[RING_CAP][4];
+    alignas(64) volatile float    draft_probs[RING_CAP][4];
+    alignas(64) volatile uint32_t draft_counts[RING_CAP];
+    alignas(64) volatile uint32_t draft_ready_seq;
+};
+
 
 // a lane's state on one card: its page table, recurrent states and histories, QSA raw-key rings; the engine's
 // current-lane pointers in CardBuf are a copy of the lane's (Engine::use_lane)
@@ -30,6 +48,18 @@ struct CardBuf {
     int dev;
     cudaStream_t st;
     cudaStream_t st2;                 // the shared expert, beside the routed ones
+    cudaStream_t st_mtp = nullptr;             ///< Dedicated high-priority auxiliary stream for asynchronous MTP drafting
+    cudaEvent_t  ev_target_sampled = nullptr;  ///< Recorded on S_main when target token x_t is sampled
+    cudaEvent_t  ev_mtp_done = nullptr;        ///< Recorded on S_mtp when draft proposals are ready
+
+    // Pipelined ring buffer pointers (host-mapped portable)
+    PipelinedMtpRing* ring_h = nullptr;
+    PipelinedMtpRing* ring_d = nullptr;
+
+    // Condition 2: Speculative scratch buffer pointer
+    uint16_t* spec_kv_scratch = nullptr;
+    uint16_t* mtp_kc_primary = nullptr;
+    uint16_t* mtp_vc_primary = nullptr;
     cudaEvent_t fork, join;
     float *R, *mixed, *bo_a, *bo_f, *inj_a, *inj_f, *hcs;
     void* xq;   // q8_1 rows

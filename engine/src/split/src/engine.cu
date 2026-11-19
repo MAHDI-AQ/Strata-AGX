@@ -28,6 +28,42 @@
 
 namespace fnx {
 
+namespace {
+
+// MoE-3: reserve the Ada persisting-L2 set-aside and pin the current layer's router matrix in it.
+// Runtime hint only. STRATA_L2_PERSIST_MIB=0 (default) leaves the default path byte-identical.
+void l2_persist_router(cudaStream_t st, const float* W, size_t bytes) {
+    static int persist_mib = -1;
+    if (persist_mib < 0) {
+        const char* v = std::getenv("STRATA_L2_PERSIST_MIB");
+        persist_mib = v ? std::atoi(v) : 0;
+    }
+    if (persist_mib <= 0 || W == nullptr || bytes == 0) return;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return;
+    int max_persist = 0;
+    int max_window = 0;
+    (void) cudaDeviceGetAttribute(&max_persist, cudaDevAttrMaxPersistingL2CacheSize, dev);
+    (void) cudaDeviceGetAttribute(&max_window, cudaDevAttrMaxAccessPolicyWindowSize, dev);
+    size_t want = (size_t) persist_mib * 1024u * 1024u;
+    if (max_persist > 0 && want > (size_t) max_persist) want = (size_t) max_persist;
+    static bool limit_done[16] = {};
+    if (dev >= 0 && dev < 16 && !limit_done[dev]) {
+        (void) cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, want);
+        limit_done[dev] = true;
+    }
+    if (max_window > 0 && bytes > (size_t) max_window) bytes = (size_t) max_window;
+    cudaStreamAttrValue attr{};
+    attr.accessPolicyWindow.base_ptr = const_cast<float*>(W);
+    attr.accessPolicyWindow.num_bytes = bytes;
+    attr.accessPolicyWindow.hitRatio = 1.0f;
+    attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+    attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+    (void) cudaStreamSetAttribute(st, cudaStreamAttributeAccessPolicyWindow, &attr);
+}
+
+}  // namespace
+
 
 Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
     // the 27B build's settings: this Flash-Next engine has none of what they set, so one given is a mistake, not a
@@ -161,6 +197,16 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         own_stream(b->st);
         ck(cudaStreamCreateWithFlags(&b->st2, cudaStreamNonBlocking), "stream");
         own_stream(b->st2);
+        int prio_low = 0, prio_high = 0;
+        cudaDeviceGetStreamPriorityRange(&prio_low, &prio_high);
+        ck(cudaStreamCreateWithPriority(&b->st_mtp, cudaStreamNonBlocking, prio_high), "st_mtp stream");
+        own_stream(b->st_mtp);
+        ck(cudaEventCreateWithFlags(&b->ev_target_sampled, cudaEventDisableTiming), "ev_target_sampled");
+        own_event(b->ev_target_sampled);
+        ck(cudaEventCreateWithFlags(&b->ev_mtp_done, cudaEventDisableTiming), "ev_mtp_done");
+        own_event(b->ev_mtp_done);
+        b->ring_h = hxalloc<PipelinedMtpRing>(1);
+        ck(cudaHostGetDevicePointer((void**)&b->ring_d, (void*)b->ring_h, 0), "ring host get dev ptr");
         ck(cudaEventCreateWithFlags(&b->fork, cudaEventDisableTiming), "event");
         own_event(b->fork);
         ck(cudaEventCreateWithFlags(&b->join, cudaEventDisableTiming), "event");
@@ -950,6 +996,7 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
     // the slots as they were, so with it the plan runs after, in moe_cache)
     const bool live = cache_live() && lyr >= 0 && lyr < NL;
     const bool plan_in_router = live && !b.probe_cnt;
+    l2_persist_router(b.st, L.router, (size_t) (NEXP + 1) * (size_t) N * sizeof(float));
     router_route(L.router, b.mixed, b.logits, T, b.topi, b.topw, b.jobs_gu, b.jobs_dn, b.njobs, b.st, plan_in_router ? &w.ec : nullptr,
                  lyr, b.cache_list, sh_in ? &L.sh_gu.s : nullptr, 2 * ffs, b.xq, b.sh_gu);
     if (const int l = lyr; l >= 0 && l < NL) {
@@ -979,6 +1026,15 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
 }
 
 // every card's work for one window of T rows, in stream order (captured into a graph unless dumping)
+__global__ void publish_target_token_kernel(uint32_t* dst_token, const int* src_token,
+                                            uint32_t* dst_seq, uint32_t seq) {
+    if (threadIdx.x == 0) {
+        *dst_token = (uint32_t)(*src_token);
+        __threadfence_system();
+        *dst_seq = seq;
+    }
+}
+
 void Engine::enqueue(int T, bool dumps) {
     const float eps = m_.eps;
     int call = 0;
@@ -1046,6 +1102,16 @@ void Engine::enqueue(int T, bool dumps) {
         hc_read(b.R, b.bo_f, b.inj_f, w.head_norm, w.head_down, w.head_up, nullptr, eps, b.mixed, b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq);
         dense(w.out, b.xq, b.head_logits, b, T);
         argmax(b.head_logits, w.v1 - w.v0, T, w.v0, b.best_v, b.best_i, b.am_keys, b.ring.err, b.st);
+        ck(cudaEventRecord(b.ev_target_sampled, b.st), "record ev_target_sampled");
+        if (b.ring_d) {
+            const uint32_t ring_idx = step_seq_ % PipelinedMtpRing::RING_CAP;
+            publish_target_token_kernel<<<1, 1, 0, b.st>>>(
+                (uint32_t*)&b.ring_d->target_token[ring_idx],
+                b.best_i,
+                (uint32_t*)&b.ring_d->target_ready_seq,
+                step_seq_
+            );
+        }
     });
     dd("result_norm", -1, cb_[0]->mixed, N);
 }
@@ -1120,10 +1186,20 @@ void Engine::enqueue_batch(const std::vector<int>& lanes) {
         each([&](int, CardBuf& b, const CardW& w) { ffn_half(T, call, b, w, w.L[l], b.R, b.ctl); });
         ++call;
     }
-    each([&](int, CardBuf& b, const CardW& w) {
+    each([&](int c, CardBuf& b, const CardW& w) {
         hc_read(b.R, b.bo_f, b.inj_f, w.head_norm, w.head_down, w.head_up, nullptr, eps, b.mixed, b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq);
         dense(w.out, b.xq, b.head_logits, b, T);
         argmax(b.head_logits, w.v1 - w.v0, T, w.v0, b.best_v, b.best_i, b.am_keys, b.ring.err, b.st);
+        ck(cudaEventRecord(b.ev_target_sampled, b.st), "record ev_target_sampled");
+        if (b.ring_d) {
+            const uint32_t ring_idx = step_seq_ % PipelinedMtpRing::RING_CAP;
+            publish_target_token_kernel<<<1, 1, 0, b.st>>>(
+                (uint32_t*)&b.ring_d->target_token[ring_idx],
+                b.best_i,
+                (uint32_t*)&b.ring_d->target_ready_seq,
+                step_seq_
+            );
+        }
     });
 }
 
@@ -1206,10 +1282,20 @@ void Engine::enqueue_rows(const std::vector<int>& lanes, const std::vector<int>&
         df2_tap_window(l, T);
         ++call;
     }
-    each([&](int, CardBuf& b, const CardW& w) {
+    each([&](int c, CardBuf& b, const CardW& w) {
         hc_read(b.R, b.bo_f, b.inj_f, w.head_norm, w.head_down, w.head_up, nullptr, eps, b.mixed, b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq);
         dense(w.out, b.xq, b.head_logits, b, T);
         argmax(b.head_logits, w.v1 - w.v0, T, w.v0, b.best_v, b.best_i, b.am_keys, b.ring.err, b.st);
+        ck(cudaEventRecord(b.ev_target_sampled, b.st), "record ev_target_sampled");
+        if (b.ring_d) {
+            const uint32_t ring_idx = step_seq_ % PipelinedMtpRing::RING_CAP;
+            publish_target_token_kernel<<<1, 1, 0, b.st>>>(
+                (uint32_t*)&b.ring_d->target_token[ring_idx],
+                b.best_i,
+                (uint32_t*)&b.ring_d->target_ready_seq,
+                step_seq_
+            );
+        }
     });
 }
 
@@ -1261,7 +1347,11 @@ void Engine::mtp_attach(const Mtp& mtp) {
         b.mtp_hn = dalloc<float>((size_t) MAXT * D);
         b.mtp_h2 = dalloc<float>((size_t) MAXT * D);
         b.mtp_R = dalloc<float>((size_t) MAXT * D);
-        b.mtp_kc = b.pool + (size_t) (KVP_SLOTS - 1) * kvp_slot(c);   // the draft layer: the pool's last slot
+        b.mtp_kc_primary = b.pool + (size_t) (KVP_SLOTS - 1) * kvp_slot(c);   // the draft layer: the pool's last slot
+        b.mtp_vc_primary = b.mtp_kc_primary + kvp_rows_halves(c, kv_q8());
+        b.spec_kv_scratch = dalloc<uint16_t>(kvp_slot(c, kv_q8()));
+        const bool use_scratch = (std::getenv("STRATA_SYNC_MTP") == nullptr);
+        b.mtp_kc = use_scratch ? b.spec_kv_scratch : b.mtp_kc_primary;
         b.mtp_vc = b.mtp_kc + kvp_rows_halves(c, kv_q8());
         b.lanes[0].mtp_ring = dalloc<uint16_t>((size_t) qsa_ring_rows() * 128);   // lanes after 0 carry theirs in their blocks
         b.mtp_qsa_ring = b.lanes[(size_t) cur_].mtp_ring;
@@ -1355,6 +1445,18 @@ void Engine::mtp_enqueue(int T) {
 
 // The draft layer for several lanes in ONE window (Engine::draft_lanes): mtp_enqueue's layer, with the attention of enqueue_rows' batched windows for the draft
 // layer's own K/V slot (each lane's rows at its cells on its pages). Greedy: no penalties, argmax of every row.
+void Engine::pl_commit_async(int lane, int accepted_drafts, cudaStream_t stream) {
+    if (accepted_drafts <= 0) return;
+    for (int c = 0; c < NCARD; ++c) {
+        CardBuf& b = *cb_[c];
+        if (!b.spec_kv_scratch || !b.mtp_kc_primary) continue;
+        ck(cudaSetDevice(b.dev), "set device");
+        cudaStream_t s = stream ? stream : b.st;
+        const size_t slot_bytes = kvp_slot(c, kv_q8()) * sizeof(uint16_t);
+        ck(cudaMemcpyAsync(b.mtp_kc_primary, b.spec_kv_scratch, slot_bytes, cudaMemcpyDeviceToDevice, s), "commit spec kv");
+    }
+}
+
 void Engine::mtp_enqueue_lanes(const std::vector<DraftReq>& reqs, int T) {
     const float eps = m_.eps;
     const int nl = (int) reqs.size(), mp = max_ctx_ / 4;

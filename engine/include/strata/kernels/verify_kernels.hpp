@@ -35,6 +35,14 @@ inline constexpr int kVerifyLongT = kVerifyMaxT > kVerifyNarrowT ? kVerifyMaxT :
 /// `fused_gdn_conv_l2` per token.
 void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv_w, float* h, int channels,
                        int qk_heads, float eps, int n_tok, void* stream, int t_begin = 0, bool commit = false);
+struct GdnConvGroups {
+    const float* hist[8] = {};
+    int first[8] = {};
+    int ntok[8] = {};
+    int n = 0;
+};
+void gdn_conv_l2_groups(const GdnConvGroups& groups, const float* qkv, const float* conv_w, float* h, int channels,
+                        int qk_heads, float eps, bool commit, void* stream);
 /// history <- the last 3 entries of [history | qkv_0 .. qkv_{n-1}], n = *n_keep (0 leaves it as it was).
 void gdn_conv_commit(float* history, const float* qkv, int channels, const int32_t* n_keep, void* stream);
 /// alpha/beta for T columns of x (T, n_embd): gate (T, h_v), beta (T, h_v).  Bitwise `fused_gdn_ab` per column.
@@ -61,7 +69,7 @@ struct GdnGroups {
 /// same arithmetic as one call each: bit-identical).  `commit`: every group keeps *keep[i] tokens, no outputs used.
 void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_channels, const float* gate, const float* beta,
                           const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, bool commit,
-                          void* stream);
+                          void* stream, void* xq_out = nullptr, int t_out_begin = 0);
 void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
                          const int32_t* n_keep, void* stream, int t_out_begin = 0, void* xq_out = nullptr);

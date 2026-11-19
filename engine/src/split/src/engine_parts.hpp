@@ -39,6 +39,8 @@ namespace fnx {
 //   window_error(err, draft)    their message (null when no bit is set)
 //   state_pieces(...)           a sequence's device state on one card as (pointer, bytes) pieces, in a fixed order
 
+// PipelinedMtpRing defined in engine_impl.hpp
+
 void ck(cudaError_t e, const char* what);
 float h2f(uint16_t h);   // an fp16 bit pattern's value
 // a graph just captured into its slot: the slot's executable updated in place when it has one (the same kernels with

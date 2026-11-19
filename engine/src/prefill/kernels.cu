@@ -114,10 +114,45 @@ void check(const char* what) {
 }
 unsigned blocks_for(int64_t n, int t = 256) { return (unsigned) ((n + t - 1) / t); }
 
+// PF-1a (STRATA_PF_FP8_FUSED_AMAX=1): the amax of an FP16 activation image, accumulated by the kernel that writes it.
+// A thread's |value| is warp-reduced and each block stores one maximum in the caller's block array
+// (d_block_max[blockIdx.x]); k_reduce_block_max reduces that array to the scalar Gemm::fp8 scales by.  Per-block
+// atomics into the final scalar would serialize at large T.
+__device__ __forceinline__ void atomicMaxFloat(float* addr, float val) {
+    int* addr_as_int = (int*) addr;
+    int old = *addr_as_int, assumed;
+    while (val > __int_as_float(old)) {
+        assumed = old;
+        old = atomicCAS(addr_as_int, assumed, __float_as_int(val));
+    }
+}
+// |f16(stored_bits)| exactly as x16_amax_kernel reads an element: fabsf(__half2float(bits))
+__device__ __forceinline__ float f16_amax_abs(uint16_t bits) {
+    return fabsf(__half2float(__ushort_as_half(bits)));
+}
+// block-wide max for blockDim <= 1024; only thread 0's result is the block's max
+__device__ __forceinline__ float block_reduce_max(float v, float* sh) {
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    v = warp_max(v);
+    if (lane == 0) sh[w] = v;
+    __syncthreads();
+    const int nw = (blockDim.x + 31) >> 5;
+    float t = (threadIdx.x < nw) ? sh[threadIdx.x] : 0.0f;
+    if (w == 0) t = warp_max(t);
+    return t;
+}
+__global__ void k_reduce_block_max(const float* __restrict__ block_max, int n, float* __restrict__ d_max) {
+    float v = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) v = fmaxf(v, block_max[i]);
+    __shared__ float sh[32];
+    v = block_reduce_max(v, sh);
+    if (threadIdx.x == 0) atomicMaxFloat(d_max, v);
+}
+
 // ---------------------------------------------------------------- hyper-connection
 __global__ void gr_norm_kernel(const float* __restrict__ R, const float* __restrict__ w, float eps,
                                float* __restrict__ xn, uint16_t* __restrict__ xn16, uint16_t* __restrict__ xn16_lo,
-                               int f16img) {
+                               int f16img, float* __restrict__ d_block_max) {
     __shared__ float sh[32];
     const int64_t row = blockIdx.x;                 // t * 4 + c
     const int c = (int) (row % HC);
@@ -125,19 +160,28 @@ __global__ void gr_norm_kernel(const float* __restrict__ R, const float* __restr
     float ss = 0.0f;
     for (int d = threadIdx.x; d < N; d += blockDim.x) ss += r[d] * r[d];
     const float rs = rsqrtf(block_sum(ss, sh) / (float) N + eps);
+    float amax = 0.0f;
     for (int d = threadIdx.x; d < N; d += blockDim.x) {
         const float v = r[d] * rs * w[c * N + d];
         xn[row * N + d] = v;
         const uint16_t h = act16(v);
-        xn16[row * N + d] = f16img ? bf_to_hf_conv(h) : h;
+        const uint16_t stored = f16img ? bf_to_hf_conv(h) : h;
+        xn16[row * N + d] = stored;
         if (xn16_lo) xn16_lo[row * N + d] = bf_lo(v, h);
+        if (d_block_max) amax = fmaxf(amax, f16_amax_abs(stored));
+    }
+    if (d_block_max) {
+        __shared__ float amax_sh[32];
+        const float bm = block_reduce_max(amax, amax_sh);
+        if (threadIdx.x == 0) d_block_max[blockIdx.x + gridDim.x * blockIdx.y] = bm;
     }
 }
 // F-1: the row scale only (and the BF16 image); gr_mix_r_kernel recomputes r * rs * w itself, in the same order,
 // so the FP32 copy of the normalized rows (T x 10240 floats) is neither written nor read
 __global__ void gr_norm_rs_kernel(const float* __restrict__ R, const float* __restrict__ w, float eps,
                                   float* __restrict__ rs_out, uint16_t* __restrict__ xn16,
-                                  uint16_t* __restrict__ xn16_lo, int64_t ldx, int f16img) {
+                                  uint16_t* __restrict__ xn16_lo, int64_t ldx, int f16img,
+                                  float* __restrict__ d_block_max) {
     __shared__ float sh[32];
     const int64_t row = blockIdx.x;                 // t * 4 + c
     const int c = (int) (row % HC);
@@ -147,34 +191,52 @@ __global__ void gr_norm_rs_kernel(const float* __restrict__ R, const float* __re
     for (int d = threadIdx.x; d < N; d += blockDim.x) ss += r[d] * r[d];
     const float rs = rsqrtf(block_sum(ss, sh) / (float) N + eps);
     if (threadIdx.x == 0) rs_out[row] = rs;
+    float amax = 0.0f;
     for (int d = threadIdx.x; d < N; d += blockDim.x) {
         const float v = r[d] * rs * w[c * N + d];
         const uint16_t h = act16(v);
-        xn16[xo + d] = f16img ? bf_to_hf_conv(h) : h;
+        const uint16_t stored = f16img ? bf_to_hf_conv(h) : h;
+        xn16[xo + d] = stored;
         if (xn16_lo) xn16_lo[xo + d] = bf_lo(v, h);
+        if (d_block_max) amax = fmaxf(amax, f16_amax_abs(stored));
+    }
+    if (d_block_max) {
+        __shared__ float amax_sh[32];
+        const float bm = block_reduce_max(amax, amax_sh);
+        if (threadIdx.x == 0) d_block_max[blockIdx.x + gridDim.x * blockIdx.y] = bm;
     }
 }
 __global__ void gr_mix_r_kernel(const float* __restrict__ R, const float* __restrict__ rs, const float* __restrict__ w,
                                 const float* __restrict__ g, float* __restrict__ mixed, uint16_t* __restrict__ mixed16,
-                                int64_t T, uint16_t* __restrict__ mixed_h, uint16_t* __restrict__ mixed16_lo) {
+                                int64_t T, uint16_t* __restrict__ mixed_h, uint16_t* __restrict__ mixed16_lo,
+                                float* __restrict__ d_block_max) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= T * N) return;
-    const int64_t t = i / N, d = i % N;
-    float s = 0.0f;
+    float amax = 0.0f;
+    if (i < T * N) {
+        const int64_t t = i / N, d = i % N;
+        float s = 0.0f;
 #pragma unroll
-    for (int c = 0; c < HC; ++c) {
-        const int64_t j = t * D + c * N + d;
-        const float x = R[j] * rs[t * HC + c] * w[c * N + d];   // gr_norm_kernel's value, bit for bit
-        s = fmaf(x, sigm(g[j]), s);
+        for (int c = 0; c < HC; ++c) {
+            const int64_t j = t * D + c * N + d;
+            const float x = R[j] * rs[t * HC + c] * w[c * N + d];   // gr_norm_kernel's value, bit for bit
+            s = fmaf(x, sigm(g[j]), s);
+        }
+        s /= (float) HC;
+        mixed[i] = s;
+        if (mixed16) {
+            const uint16_t h = act16(s);
+            mixed16[i] = h;
+            if (mixed16_lo) mixed16_lo[i] = bf_lo(s, h);
+        }
+        const uint16_t h = hf(s);
+        if (mixed_h) mixed_h[i] = h;
+        if (d_block_max) amax = f16_amax_abs(h);
     }
-    s /= (float) HC;
-    mixed[i] = s;
-    if (mixed16) {
-        const uint16_t h = act16(s);
-        mixed16[i] = h;
-        if (mixed16_lo) mixed16_lo[i] = bf_lo(s, h);
+    if (d_block_max) {
+        __shared__ float amax_sh[32];
+        const float bm = block_reduce_max(amax, amax_sh);
+        if (threadIdx.x == 0) d_block_max[blockIdx.x + gridDim.x * blockIdx.y] = bm;
     }
-    if (mixed_h) mixed_h[i] = hf(s);
 }
 // F-2: gr_write_kernel for one row (t, c), then gr_norm_rs_kernel's reduction over it with the next half's norm
 // weights - the same thread-to-element mapping (256 threads, stride 256) and block_sum, so rs and the BF16 image are
@@ -184,7 +246,8 @@ __global__ void __launch_bounds__(256) gr_write_norm_rs_kernel(float* __restrict
                                                                const float* __restrict__ inj, int64_t inj_ld,
                                                                const float* __restrict__ w, float eps,
                                                                float* __restrict__ rs_out, uint16_t* __restrict__ xn16,
-                                                               uint16_t* __restrict__ xn16_lo, int64_t ldx, int f16img) {
+                                                               uint16_t* __restrict__ xn16_lo, int64_t ldx, int f16img,
+                                                               float* __restrict__ d_block_max) {
     __shared__ float sh[32];
     const int64_t row = blockIdx.x;                 // t * 4 + c
     const int64_t t = row / HC;
@@ -204,13 +267,21 @@ __global__ void __launch_bounds__(256) gr_write_norm_rs_kernel(float* __restrict
     }
     const float rs = rsqrtf(block_sum(ss, sh) / (float) N + eps);
     if (threadIdx.x == 0) rs_out[row] = rs;
+    float amax = 0.0f;
     k = 0;
 #pragma unroll
     for (int d = threadIdx.x; d < N; d += 256, ++k) {
         const float x = v[k] * rs * w[c * N + d];
         const uint16_t h = act16(x);
-        xn16[xo + d] = f16img ? bf_to_hf_conv(h) : h;
+        const uint16_t stored = f16img ? bf_to_hf_conv(h) : h;
+        xn16[xo + d] = stored;
         if (xn16_lo) xn16_lo[xo + d] = bf_lo(x, h);
+        if (d_block_max) amax = fmaxf(amax, f16_amax_abs(stored));
+    }
+    if (d_block_max) {
+        __shared__ float amax_sh[32];
+        const float bm = block_reduce_max(amax, amax_sh);
+        if (threadIdx.x == 0) d_block_max[blockIdx.x + gridDim.x * blockIdx.y] = bm;
     }
 }
 // S23 (opt-in STRATA_CVEC_FUSE=1): a steered layer's FFN write, its control vector and the next half's norm in one
@@ -221,7 +292,7 @@ __global__ void __launch_bounds__(256) gr_write_cvec_norm_rs_kernel(
     float* __restrict__ R, const float* __restrict__ bo, const float* __restrict__ inj, int64_t inj_ld,
     const float* __restrict__ v_l, const float* __restrict__ s_l, const int* __restrict__ on, int mode,
     const float* __restrict__ w, float eps, float* __restrict__ rs_out, uint16_t* __restrict__ xn16,
-    uint16_t* __restrict__ xn16_lo, int64_t ldx, int f16img) {
+    uint16_t* __restrict__ xn16_lo, int64_t ldx, int f16img, float* __restrict__ d_block_max) {
     __shared__ float sh[32];
     __shared__ float part[8];
     const int64_t row = blockIdx.x;                 // t * 4 + c
@@ -266,13 +337,21 @@ __global__ void __launch_bounds__(256) gr_write_cvec_norm_rs_kernel(
     }
     const float rs = rsqrtf(block_sum(ss, sh) / (float) N + eps);
     if (threadIdx.x == 0) rs_out[row] = rs;
+    float amax = 0.0f;
     k = 0;
 #pragma unroll
     for (int d = threadIdx.x; d < N; d += 256, ++k) {
         const float y = x[k] * rs * w[c * N + d];
         const uint16_t h = act16(y);
-        xn16[t * ldx + (int64_t) c * N + d] = f16img ? bf_to_hf_conv(h) : h;
+        const uint16_t stored = f16img ? bf_to_hf_conv(h) : h;
+        xn16[t * ldx + (int64_t) c * N + d] = stored;
         if (xn16_lo) xn16_lo[t * ldx + (int64_t) c * N + d] = bf_lo(y, h);
+        if (d_block_max) amax = fmaxf(amax, f16_amax_abs(stored));
+    }
+    if (d_block_max) {
+        __shared__ float amax_sh[32];
+        const float bm = block_reduce_max(amax, amax_sh);
+        if (threadIdx.x == 0) d_block_max[blockIdx.x + gridDim.x * blockIdx.y] = bm;
     }
 }
 __global__ void gr_silu_kernel(const float* __restrict__ lo, uint16_t* __restrict__ lo16, uint16_t* __restrict__ lo16_lo,
@@ -287,24 +366,33 @@ __global__ void gr_silu_kernel(const float* __restrict__ lo, uint16_t* __restric
 }
 __global__ void gr_mix_kernel(const float* __restrict__ xn, const float* __restrict__ g, float* __restrict__ mixed,
                               uint16_t* __restrict__ mixed16, int64_t T, uint16_t* __restrict__ mixed_h,
-                              uint16_t* __restrict__ mixed16_lo) {
+                              uint16_t* __restrict__ mixed16_lo, float* __restrict__ d_block_max) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= T * N) return;
-    const int64_t t = i / N, d = i % N;
-    float s = 0.0f;
+    float amax = 0.0f;
+    if (i < T * N) {
+        const int64_t t = i / N, d = i % N;
+        float s = 0.0f;
 #pragma unroll
-    for (int c = 0; c < HC; ++c) {
-        const int64_t j = t * D + c * N + d;
-        s = fmaf(xn[j], sigm(g[j]), s);
+        for (int c = 0; c < HC; ++c) {
+            const int64_t j = t * D + c * N + d;
+            s = fmaf(xn[j], sigm(g[j]), s);
+        }
+        s /= (float) HC;
+        mixed[i] = s;
+        if (mixed16) {
+            const uint16_t h = act16(s);
+            mixed16[i] = h;
+            if (mixed16_lo) mixed16_lo[i] = bf_lo(s, h);
+        }
+        const uint16_t h = hf(s);
+        if (mixed_h) mixed_h[i] = h;
+        if (d_block_max) amax = f16_amax_abs(h);
     }
-    s /= (float) HC;
-    mixed[i] = s;
-    if (mixed16) {
-        const uint16_t h = act16(s);
-        mixed16[i] = h;
-        if (mixed16_lo) mixed16_lo[i] = bf_lo(s, h);
+    if (d_block_max) {
+        __shared__ float amax_sh[32];
+        const float bm = block_reduce_max(amax, amax_sh);
+        if (threadIdx.x == 0) d_block_max[blockIdx.x + gridDim.x * blockIdx.y] = bm;
     }
-    if (mixed_h) mixed_h[i] = hf(s);
 }
 __global__ void gr_write_kernel(float* __restrict__ R, const float* __restrict__ bo, const float* __restrict__ inj,
                                 int64_t inj_ld, int64_t T) {
@@ -2642,7 +2730,7 @@ __global__ void __launch_bounds__(512) gr_upmix_kernel(const uint16_t* __restric
                                                        const float* __restrict__ R, const float* __restrict__ rs,
                                                        const float* __restrict__ w, float* __restrict__ mixed,
                                                        uint16_t* __restrict__ mixed16, uint16_t* __restrict__ mixed_h,
-                                                       int64_t T) {
+                                                       int64_t T, float* __restrict__ d_block_max) {
     __shared__ __align__(16) uint16_t sB[HC * UM_D][UM_LD];
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, l16 = lane & 15, hi = lane >> 4;
     // blocks ordered column-tile fastest: the blocks in flight share a token tile, so the epilogue's R reads run
@@ -2663,7 +2751,8 @@ __global__ void __launch_bounds__(512) gr_upmix_kernel(const uint16_t* __restric
         *reinterpret_cast<uint4*>(&sB[rr][8 * q]) = v;
     }
     __syncthreads();
-    if (t0 >= T) return;
+    // PF-1a: no early return - every warp reaches the amax reduction below; the out-of-range warps read the last
+    // real row (as the CUDA kernel does) and their epilogue writes are skipped by `t >= T`
     const int64_t ta = t0 + l16 < T ? t0 + l16 : T - 1;
     const uint16_t* arow = lo16 + ta * LR;
     um_f8 acc[HC];
@@ -2685,6 +2774,7 @@ __global__ void __launch_bounds__(512) gr_upmix_kernel(const uint16_t* __restric
         }
     }
     const int d = d0 + l16;
+    float amax = 0.0f;
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
         const int64_t t = t0 + 2 * i + hi;
@@ -2698,7 +2788,14 @@ __global__ void __launch_bounds__(512) gr_upmix_kernel(const uint16_t* __restric
         s /= (float) HC;
         mixed[t * N + d] = s;
         if (mixed16) mixed16[t * N + d] = act16(s);
-        if (mixed_h) mixed_h[t * N + d] = hf(s);
+        const uint16_t h = hf(s);
+        if (mixed_h) mixed_h[t * N + d] = h;
+        if (d_block_max) amax = fmaxf(amax, f16_amax_abs(h));
+    }
+    if (d_block_max) {
+        __shared__ float amax_sh[32];
+        const float bm = block_reduce_max(amax, amax_sh);
+        if (threadIdx.x == 0) d_block_max[blockIdx.x + gridDim.x * blockIdx.y] = bm;
     }
 }
 #endif
@@ -2738,7 +2835,7 @@ __global__ void __launch_bounds__(256, 2) gr_upmix_cuda_kernel(const uint16_t* _
                                                               const float* __restrict__ w, float* __restrict__ mixed,
                                                               uint16_t* __restrict__ mixed16,
                                                               uint16_t* __restrict__ mixed_h,
-                                                              int64_t T) {
+                                                              int64_t T, float* __restrict__ d_block_max) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     __shared__ __align__(16) uint16_t sA[2][UC_BM][UC_LD];
     __shared__ __align__(16) uint16_t sB[2][HC * UC_BD][UC_LD];
@@ -2802,6 +2899,7 @@ __global__ void __launch_bounds__(256, 2) gr_upmix_cuda_kernel(const uint16_t* _
         }
         __syncthreads();   // every read of `buf` before stage(kc + 2) refills it
     }
+    float amax = 0.0f;
 #pragma unroll
     for (int mt = 0; mt < 2; ++mt)
 #pragma unroll
@@ -2827,10 +2925,19 @@ __global__ void __launch_bounds__(256, 2) gr_upmix_cuda_kernel(const uint16_t* _
                 if (mixed16)
                     *reinterpret_cast<uint32_t*>(mixed16 + t * N + d) =
                         (uint32_t) act16(sm[0]) | ((uint32_t) act16(sm[1]) << 16);
-                if (mixed_h)
-                    *reinterpret_cast<uint32_t*>(mixed_h + t * N + d) = (uint32_t) hf(sm[0]) | ((uint32_t) hf(sm[1]) << 16);
+                const uint32_t h01 = (uint32_t) hf(sm[0]) | ((uint32_t) hf(sm[1]) << 16);
+                if (mixed_h) *reinterpret_cast<uint32_t*>(mixed_h + t * N + d) = h01;
+                if (d_block_max) {
+                    amax = fmaxf(amax, f16_amax_abs((uint16_t) (h01 & 0xffffu)));
+                    amax = fmaxf(amax, f16_amax_abs((uint16_t) (h01 >> 16)));
+                }
             }
         }
+    if (d_block_max) {
+        __shared__ float amax_sh[32];
+        const float bm = block_reduce_max(amax, amax_sh);
+        if (threadIdx.x == 0) d_block_max[blockIdx.x + gridDim.x * blockIdx.y] = bm;
+    }
 #endif
 }
 #endif
@@ -2900,25 +3007,37 @@ void to_bf16(const float* x, uint16_t* y, int64_t n, void* stream, uint16_t* ylo
     check("to_bf16");
 }
 
+void reduce_block_max(const float* block_max, int n, float* d_max, void* stream) {
+    if (block_max == nullptr || d_max == nullptr || n <= 0) return;
+    k_reduce_block_max<<<1, 256, 0, (cudaStream_t) stream>>>(block_max, n, d_max);
+    check("reduce_block_max");
+}
+
 void gr_norm(const float* R, const float* w_norm, float eps, float* xn, uint16_t* xn16, int64_t T, void* stream,
-             uint16_t* xn16_lo, bool f16img) {
-    gr_norm_kernel<<<(unsigned) (T * HC), 256, 0, (cudaStream_t) stream>>>(R, w_norm, eps, xn, xn16, xn16_lo, f16img ? 1 : 0);
+             uint16_t* xn16_lo, bool f16img, float* d_amax, float* d_block_max) {
+    gr_norm_kernel<<<(unsigned) (T * HC), 256, 0, (cudaStream_t) stream>>>(R, w_norm, eps, xn, xn16, xn16_lo,
+                                                                             f16img ? 1 : 0, d_block_max);
     check("gr_norm");
+    if ((d_amax != nullptr && d_block_max != nullptr)) reduce_block_max(d_block_max, (int) (T * HC), d_amax, stream);
 }
 void gr_norm_rs(const float* R, const float* w_norm, float eps, float* rs, uint16_t* xn16, int64_t T, void* stream,
-                uint16_t* xn16_lo, int64_t ldx, bool f16img) {
+                uint16_t* xn16_lo, int64_t ldx, bool f16img, float* d_amax, float* d_block_max) {
     gr_norm_rs_kernel<<<(unsigned) (T * HC), 256, 0, (cudaStream_t) stream>>>(R, w_norm, eps, rs, xn16, xn16_lo,
-                                                                                ldx > 0 ? ldx : D, f16img ? 1 : 0);
+                                                                                ldx > 0 ? ldx : D, f16img ? 1 : 0,
+                                                                                d_block_max);
     check("gr_norm_rs");
+    if ((d_amax != nullptr && d_block_max != nullptr)) reduce_block_max(d_block_max, (int) (T * HC), d_amax, stream);
 }
 void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float* gated, float* mixed, uint16_t* mixed16,
-              int64_t T, void* stream, uint16_t* mixed_h, uint16_t* mixed16_lo) {
+              int64_t T, void* stream, uint16_t* mixed_h, uint16_t* mixed16_lo, float* d_amax, float* d_block_max) {
     gr_mix_r_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(R, rs, w_norm, gated, mixed, mixed16, T,
-                                                                          mixed_h, mixed16_lo);
+                                                                          mixed_h, mixed16_lo, d_block_max);
     check("gr_mix_r");
+    if ((d_amax != nullptr && d_block_max != nullptr)) reduce_block_max(d_block_max, (int) ((T * N + 255) / 256), d_amax, stream);
 }
 bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const float* rs, const float* w_norm,
-              float* mixed, uint16_t* mixed16, uint16_t* mixed_h, int64_t T, void* stream) {
+              float* mixed, uint16_t* mixed16, uint16_t* mixed_h, int64_t T, void* stream, float* d_amax,
+              float* d_block_max) {
 #if defined(__HIPCC__)
     static const bool gfx11 = [] {
         int dev = 0;
@@ -2928,8 +3047,10 @@ bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const 
     }();
     if (!gfx11 || T <= 0) return false;
     gr_upmix_kernel<<<dim3(N / UM_D, (unsigned) ((T + UM_T - 1) / UM_T)), 512, 0, (cudaStream_t) stream>>>(
-        lo16, w_up, R, rs, w_norm, mixed, mixed16, mixed_h, T);
+        lo16, w_up, R, rs, w_norm, mixed, mixed16, mixed_h, T, d_block_max);
     check("gr_upmix");
+    if ((d_amax != nullptr && d_block_max != nullptr))
+        reduce_block_max(d_block_max, (int) ((N / UM_D) * ((T + UM_T - 1) / UM_T)), d_amax, stream);
     return true;
 #else
     static int ok_dev[64] = {};   // per device: 0 not asked yet, 1 sm_80+, 2 no
@@ -2943,33 +3064,44 @@ bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const 
     }
     if (ok_dev[dev] != 1) return false;
     gr_upmix_cuda_kernel<<<dim3(N / UC_BD, (unsigned) ((T + UC_BM - 1) / UC_BM)), 256, 0, (cudaStream_t) stream>>>(
-        lo16, w_up, R, rs, w_norm, mixed, mixed16, mixed_h, T);
+        lo16, w_up, R, rs, w_norm, mixed, mixed16, mixed_h, T, d_block_max);
     check("gr_upmix");
+    if ((d_amax != nullptr && d_block_max != nullptr))
+        reduce_block_max(d_block_max, (int) ((N / UC_BD) * ((T + UC_BM - 1) / UC_BM)), d_amax, stream);
     return true;
 #endif
 }
 void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
-                      float* rs, uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo, int64_t ldx, bool f16img) {
+                      float* rs, uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo, int64_t ldx, bool f16img,
+                      float* d_amax, float* d_block_max) {
     gr_write_norm_rs_kernel<<<(unsigned) (T * HC), 256, 0, (cudaStream_t) stream>>>(R, bo, inj, inj_ld, w_norm_next, eps,
                                                                                       rs, xn16, xn16_lo,
-                                                                                      ldx > 0 ? ldx : D, f16img ? 1 : 0);
+                                                                                      ldx > 0 ? ldx : D, f16img ? 1 : 0,
+                                                                                      d_block_max);
     check("gr_write_norm_rs");
+    if ((d_amax != nullptr && d_block_max != nullptr)) reduce_block_max(d_block_max, (int) (T * HC), d_amax, stream);
 }
 void gr_write_cvec_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* v_l,
                            const float* s_l, const int* on, int mode, const float* w_norm_next, float eps, float* rs,
-                           uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo, int64_t ldx, bool f16img) {
+                           uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo, int64_t ldx, bool f16img,
+                           float* d_amax, float* d_block_max) {
     gr_write_cvec_norm_rs_kernel<<<(unsigned) (T * HC), 256, 0, (cudaStream_t) stream>>>(
-        R, bo, inj, inj_ld, v_l, s_l, on, mode, w_norm_next, eps, rs, xn16, xn16_lo, ldx > 0 ? ldx : D, f16img ? 1 : 0);
+        R, bo, inj, inj_ld, v_l, s_l, on, mode, w_norm_next, eps, rs, xn16, xn16_lo, ldx > 0 ? ldx : D, f16img ? 1 : 0,
+        d_block_max);
     check("gr_write_cvec_norm_rs");
+    if ((d_amax != nullptr && d_block_max != nullptr)) reduce_block_max(d_block_max, (int) (T * HC), d_amax, stream);
 }
 void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream, uint16_t* lo16_lo) {
     gr_silu_kernel<<<blocks_for(T * LR), 256, 0, (cudaStream_t) stream>>>(lo, lo16, lo16_lo, T * LR);
     check("gr_silu");
 }
 void gr_mix(const float* xn, const float* gated, float* mixed, uint16_t* mixed16, int64_t T, void* stream,
-            uint16_t* mixed_h, uint16_t* mixed16_lo) {
-    gr_mix_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(xn, gated, mixed, mixed16, T, mixed_h, mixed16_lo);
+            uint16_t* mixed_h, uint16_t* mixed16_lo, float* d_amax, float* d_block_max) {
+    gr_mix_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(xn, gated, mixed, mixed16, T, mixed_h,
+                                                                        mixed16_lo, d_block_max);
     check("gr_mix");
+    if (d_amax != nullptr && d_block_max != nullptr)
+        reduce_block_max(d_block_max, (int) ((T * N + 255) / 256), d_amax, stream);
 }
 void gr_write(float* R, const float* bo, const float* inj, int64_t inj_ld, int64_t T, void* stream) {
     gr_write_kernel<<<blocks_for(T * D), 256, 0, (cudaStream_t) stream>>>(R, bo, inj, inj_ld, T);

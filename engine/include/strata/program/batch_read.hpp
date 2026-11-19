@@ -38,6 +38,7 @@ struct ConcurrentReadSetup {
     bool staged_source = false;     ///< the GGUF source stages its blobs (in place, unbuffered, STRATA_IO_PREFETCH):
                                     ///< it recycles the buffers it hands out, one thread at a time
     bool other_source = false;      ///< an expert source that is neither the GGUF source nor the arena
+    bool resident_experts_only = false;
 };
 
 /// Why the concurrent read stays off with `s` (the first reason, for the log line), or nullptr when it can run.
@@ -47,9 +48,9 @@ inline const char* concurrent_read_off(const ConcurrentReadSetup& s) {
     if (s.fs_slots) return "STRATA_FS_SLOTS";
     if (s.pcie_dma) return "--pcie-mode dma";
     if (s.helper_caches) return "the helper caches (--expert-cache-device1..3)";
-    if (s.staged_source)
+    if (!s.resident_experts_only && s.staged_source)
         return "an expert source that stages its blobs (the GGUF in place, unbuffered, STRATA_IO_PREFETCH)";
-    if (s.other_source) return "this expert source";
+    if (!s.resident_experts_only && s.other_source) return "this expert source";
     return nullptr;
 }
 
@@ -64,6 +65,21 @@ inline int64_t piped_read_piece(int64_t piece_tokens, int64_t chunk) {
     if (piece_tokens <= 0) return 0;
     chunk = std::max<int64_t>(chunk, 1);
     return std::clamp<int64_t>(piece_tokens / chunk, 1, kPipedMaxChunks) * chunk;
+}
+
+/// Dynamic piped read piece (#Phase 1 / QoL):
+/// Scales prefill chunk size dynamically based on real-time active decode concurrency:
+/// - prompt_tokens <= 2048: return 0 (tool return micro-prefill, single burst)
+/// - active_decodes <= 0: return 0 (all slots idle, one run at full 4,000+ tok/s; no chunk slicing)
+/// - active_decodes == 1: 2048 tokens (high prefill throughput, smooth decode interleave)
+/// - active_decodes >= 2: 1024 tokens (interleaved smoothly with decode pump to eliminate frame-drops)
+inline int64_t dynamic_piped_read_piece(int64_t piece_tokens, int64_t chunk, int active_decodes, int64_t prompt_tokens) {
+    if (prompt_tokens <= 2048) return 0;
+    if (active_decodes <= 0) return 0;
+    chunk = std::max<int64_t>(chunk, 1);
+    int64_t target = (active_decodes == 1) ? 2048 : 1024;
+    if (piece_tokens > 0) target = std::min(target, piece_tokens);
+    return std::clamp<int64_t>(target / chunk, 1, kPipedMaxChunks) * chunk;
 }
 
 /// The slots' decode time between two pieces: share x the piece's time (STRATA_BATCH_DECODE_SHARE, the rule the

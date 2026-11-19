@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <unordered_map>
 
 namespace strata::prefill {
 
@@ -20,6 +21,24 @@ namespace strata::prefill {
 void gemm_set_f16_range(bool on);
 bool gemm_f16_range_read(float max_abs[2], unsigned long long over[2], bool reset);
 
+struct PrefillFp8Activation {
+    const uint16_t* X = nullptr;
+    int64_t T = 0;
+    int64_t K = 0;
+    int64_t ldx = 0;
+    const float* act_amax = nullptr;
+    bool per_token = false;
+    uint64_t x8_gen = 0;
+    bool valid = false;
+
+    void invalidate() noexcept { valid = false; }
+
+    bool matches(const uint16_t* x, int64_t t, int64_t k, int64_t ld,
+                 const float* amax, bool pt, uint64_t gen) const noexcept {
+        return valid && X == x && T == t && K == k && ldx == ld &&
+               act_amax == amax && per_token == pt && x8_gen == gen;
+    }
+};
 
 class Gemm {
 public:
@@ -53,12 +72,26 @@ public:
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
              float beta = 0.0f);
 
+    /// Y = X . W^T with W in FP8 E4M3 (CUDA_R_8F_E4M3), X scaled to FP8 on the fly, accumulated in FP32 (CUBLAS_COMPUTE_32F).
+    /// `act_amax` (PF-1a, STRATA_PF_FP8_FUSED_AMAX=1): X's amax, already computed by the kernel that produced X (the
+    /// norm/mix producers' d_amax).  With the gate on, x16_amax_kernel is skipped; null or the gate off: unchanged.
+    /// True only when the cuBLASLt matmul wrote Y. False leaves Y to the caller: Gemm::native falls through to the
+    /// FP16/MMQ path (a missing handle, an allocation failure, or no usable algo must not return with Y unwritten).
+    /// STRATA_PF_FP8_FORCE_NO_ALGO=1 (any value other than 0) forces that false. STRATA_PF_FP8_AUTOTUNE=1 are off unless the variable is exactly "1".
+    /// `reuse_x8` (STRATA_GDN_QKVZ): skip the activation quantize when the previous fp8() on this Gemm
+    /// wrote x8_ for this same X, T, K, ldx and amax pointer.  Default false keeps that quantize launch.
+    bool fp8(const uint16_t* X, const uint8_t* W8, const float* d_inv_scale_w, float* Y,
+             int64_t T, int64_t N, int64_t K, int64_t ldy = 0, float beta = 0.0f, int64_t ldx = 0,
+             const float* act_amax = nullptr, bool reuse_x8 = false,
+             PrefillFp8Activation* act_ticket = nullptr);
+
     /// W given as native GGUF blocks of `ggml_type`, dequantized to FP16 in the scratch, X in FP16.  `ldx` (> K) is
     /// X's padded row stride, taken only by STRATA_PF_PAD's path (0 = K).
     /// On an MMQ build a beta = 0 product whose type is covered, whose K is a multiple of 256 values and whose matrix fits
     /// the card's shared memory runs through llama.cpp's int8 MMQ instead (opt-in: STRATA_DENSE_MMQ=1).
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
-                int64_t ldy = 0, float beta = 0.0f, int64_t ldx = 0);
+                int64_t ldy = 0, float beta = 0.0f, int64_t ldx = 0, const float* act_amax = nullptr,
+                bool reuse_x8 = false, PrefillFp8Activation* act_ticket = nullptr);
 
     /// HIP gfx103x (prompt_f16()): bf16() takes X as the FP16 image the prompt path's kernels write (set_act_f16),
     /// and bf16() / f16() / native() run the GEMM with FP16 out (rocBLAS's tuned kernels there), widened in place in
@@ -79,12 +112,22 @@ public:
     int64_t scratch_elems() const { return scratch_elems_; }
     void* stream() const { return stream_; }
 
+    /// PF-1a parity (gemm_fp8_parity): the last fp8() call's quantized activations and their scales.
+    const uint8_t* x8() const { return x8_; }
+    const float* scale_x() const { return d_scale_x_; }
+    const float* inv_scale_x() const { return d_inv_scale_x_; }
+    const float* inv_scale_tok() const { return d_inv_scale_tok_; }
+    const float* max_x() const { return d_max_x_; }
+    /// Last native() took the FP8 path and left x8_ holding that call's activation.
+    bool fp8_image_ready() const { return fp8_image_ready_; }
+
 private:
     void* handle_ = nullptr;
     void* stream_ = nullptr;
     uint16_t* scratch_ = nullptr;
     int64_t scratch_elems_ = 0;
     void* workspace_ = nullptr;
+    size_t ws_bytes_ = 32u << 20;
     bool external_ = false;
     // STRATA_DEQUANT_SIDE (set_dequant_side): the second scratch, the side stream and, per scratch, "the dequant
     // landed" (recorded on the side stream) and "the GEMM read it" (recorded on the compute stream); side_cur_ is
@@ -108,8 +151,68 @@ public:
     /// The engine's own default for the FP16 weight cache when STRATA_PF_W16_CACHE_MIB is not set: true -> sized by the card (weights are cached while
     /// kW16AutoReserve stays free).  generate.cpp sets it on Linux CUDA when the engine runs batch slots (round0212 item 7).  =0 in the environment wins.
     static void set_w16_auto_default(bool on) { w16_auto_default_().store(on); }
+    static void set_w8_auto_default(bool on) { w8_auto_default_().store(on); }
 private:
     static std::atomic<bool>& w16_auto_default_() { static std::atomic<bool> v{false}; return v; }
+    static std::atomic<bool>& w8_auto_default_() { static std::atomic<bool> v{false}; return v; }
+
+    // Dense FP8 Prefill Weight Cache (w8_):
+    // Weights cached as CUDA_R_8F_E4M3 (N * K * 1 byte), saving 50% VRAM vs FP16 cache.
+    struct W8Entry { const void* p; int type; int64_t n, k; uint8_t* d; float* scale_w; };
+    std::vector<W8Entry> w8_;
+    int64_t w8_budget_ = -1;
+    int64_t w8_used_ = 0;
+    int64_t w8_reserve_ = 512ll << 20; // 512 MiB default (down from 2048 MiB)
+    bool w8_reserve_user_set_ = false;
+    bool w8_logged_ = false;
+    static constexpr int64_t kW8AutoReserve = 512ll << 20; // 512 MiB cluster default
+    static constexpr int64_t kW8MinReserve  = 384ll << 20; // 384 MiB floor for tight stages (MTP drafter)
+
+    void* lt_handle_ = nullptr;
+    void* lt_pref_ = nullptr;
+    uint8_t* x8_ = nullptr;
+    int64_t x8_bytes_ = 0;
+    bool fp8_image_ready_ = false;
+    bool x8_key_valid_ = false;
+    const uint16_t* x8_key_x_ = nullptr;
+    const float* x8_key_amax_ = nullptr;
+    int64_t x8_key_t_ = 0;
+    int64_t x8_key_k_ = 0;
+    int64_t x8_key_ldx_ = 0;
+    bool x8_key_per_token_ = false;
+    uint64_t x8_gen_ = 0;
+    float* d_scale_x_ = nullptr;
+    float* d_inv_scale_x_ = nullptr;
+    float* d_inv_scale_tok_ = nullptr;
+    size_t inv_scale_tok_cap_ = 0;
+    float* y_tmp_ = nullptr;
+    size_t y_tmp_bytes_ = 0;
+    float* d_max_x_ = nullptr;
+    float* d_max_w_ = nullptr;
+    // Discretized T-bucket algorithm memoization for FP8 cuBLASLt
+    struct AlgoCacheKey {
+        int64_t n, k, ldy, t_bucket;
+        bool per_token;
+        bool operator==(const AlgoCacheKey& o) const noexcept {
+            return n == o.n && k == o.k && ldy == o.ldy && t_bucket == o.t_bucket && per_token == o.per_token;
+        }
+    };
+    struct AlgoCacheKeyHash {
+        size_t operator()(const AlgoCacheKey& x) const noexcept {
+            uint64_t h = (uint64_t) x.n ^ ((uint64_t) x.k << 16) ^ ((uint64_t) x.ldy << 32) ^ ((uint64_t) x.t_bucket << 48) ^ (x.per_token ? 0x9e3779b97f4a7c15ULL : 0ULL);
+            h ^= h >> 33;
+            h *= 0xff51afd7ed558ccdULL;
+            h ^= h >> 33;
+            return (size_t) h;
+        }
+    };
+    struct AlgoCacheVal {
+        uint64_t algo_data[8]; // sizeof(cublasLtMatmulAlgo_t) is 64 bytes
+        size_t workspace_bytes;
+        bool valid;
+        bool tuned = false; // STRATA_PF_FP8_AUTOTUNE timed this entry; false is the single heuristic
+    };
+    std::unordered_map<AlgoCacheKey, AlgoCacheVal, AlgoCacheKeyHash> algo_cache_;
     void* hipblaslt_state_ = nullptr;
     void* rocblas_state_ = nullptr;   // HIP: the rocBLAS solution table of f16_inplace (STRATA_ROCBLAS_TUNING)
     bool f16_io_ = false;

@@ -14,9 +14,14 @@
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#if !defined(STRATA_USE_HIP)
+#include <cublasLt.h>
+#include <cuda_fp8.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
+#include <mutex>
 
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
 // The HIP compatibility shim maps CUDA shuffle spellings to Strata helpers.
@@ -668,6 +673,10 @@ bool gemm_dequant_side() {
 }
 
 Gemm::~Gemm() {
+    for (W8Entry& e : w8_) {
+        if (e.d) (void) cudaFree(e.d);
+        if (e.scale_w) (void) cudaFree(e.scale_w);
+    }
     for (W16Entry& e : w16_) if (e.d) (void) cudaFree(e.d);
     for (void* e : side_ready_)
         if (e) (void) cudaEventDestroy((cudaEvent_t) e);
@@ -683,6 +692,17 @@ Gemm::~Gemm() {
 #endif
 #if defined(__HIPCC__) && defined(STRATA_ROCBLAS_AVAILABLE)
     delete static_cast<RocBlasState*>(rocblas_state_);
+#endif
+#if !defined(STRATA_USE_HIP)
+    if (lt_pref_) cublasLtMatmulPreferenceDestroy((cublasLtMatmulPreference_t) lt_pref_);
+    if (lt_handle_) cublasLtDestroy((cublasLtHandle_t) lt_handle_);
+    if (x8_) cudaFree(x8_);
+    if (d_scale_x_) cudaFree(d_scale_x_);
+    if (d_inv_scale_x_) cudaFree(d_inv_scale_x_);
+    if (d_inv_scale_tok_) cudaFree(d_inv_scale_tok_);
+    if (y_tmp_) cudaFree(y_tmp_);
+    if (d_max_x_) cudaFree(d_max_x_);
+    if (d_max_w_) cudaFree(d_max_w_);
 #endif
     if (handle_) cublasDestroy((cublasHandle_t) handle_);
     if (tc_w_) cudaFree(tc_w_);
@@ -706,8 +726,23 @@ bool Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems,
     external_ = true;
     note(cublasSetStream(h, (cudaStream_t) stream), "cublasSetStream");
     workspace_ = workspace;
+    ws_bytes_ = ws_bytes;
     note(cublasSetWorkspace(h, workspace_, ws_bytes), "cublasSetWorkspace");
     note(cublasSetMathMode(h, CUBLAS_DEFAULT_MATH), "cublasSetMathMode");
+#if !defined(STRATA_USE_HIP)
+    {
+        cublasLtHandle_t lt = nullptr;
+        if (cublasLtCreate(&lt) == CUBLAS_STATUS_SUCCESS) {
+            lt_handle_ = lt;
+            cublasLtMatmulPreference_t pref = nullptr;
+            if (cublasLtMatmulPreferenceCreate(&pref) == CUBLAS_STATUS_SUCCESS) {
+                size_t ws_bytes = 32u << 20;
+                cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_bytes, sizeof(ws_bytes));
+                lt_pref_ = pref;
+            }
+        }
+    }
+#endif
     scratch_ = scratch;
     scratch_elems_ = scratch_elems;
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
@@ -723,6 +758,7 @@ void Gemm::rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, siz
     scratch_ = scratch;
     scratch_elems_ = scratch_elems;
     workspace_ = workspace;
+    ws_bytes_ = ws_bytes;
     cublasSetWorkspace((cublasHandle_t) handle_, workspace_, ws_bytes);
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     if (hipblaslt_state_) {
@@ -781,8 +817,23 @@ bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
         err = std::string("prefill gemm: workspace of 32 MiB: ") + cudaGetErrorString(e);
         return false;
     }
+    ws_bytes_ = ws;
     note(cublasSetWorkspace(h, workspace_, ws), "cublasSetWorkspace");
     note(cublasSetMathMode(h, CUBLAS_DEFAULT_MATH), "cublasSetMathMode");
+#if !defined(STRATA_USE_HIP)
+    {
+        cublasLtHandle_t lt = nullptr;
+        if (cublasLtCreate(&lt) == CUBLAS_STATUS_SUCCESS) {
+            lt_handle_ = lt;
+            cublasLtMatmulPreference_t pref = nullptr;
+            if (cublasLtMatmulPreferenceCreate(&pref) == CUBLAS_STATUS_SUCCESS) {
+                size_t ws_bytes = 32u << 20;
+                cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_bytes, sizeof(ws_bytes));
+                lt_pref_ = pref;
+            }
+        }
+    }
+#endif
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     hipblaslt_state_ = create_hipblaslt_state(workspace_, ws).release();
 #endif
@@ -1192,6 +1243,919 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
     STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx");
 }
 
+#if !defined(STRATA_USE_HIP)
+namespace {
+
+__device__ __forceinline__ void atomicMaxFloat(float* addr, float val) {
+    int* addr_as_int = (int*)addr;
+    int old = *addr_as_int, assumed;
+    while (val > __int_as_float(old)) {
+        assumed = old;
+        old = atomicCAS(addr_as_int, assumed, __float_as_int(val));
+    }
+}
+
+__device__ __forceinline__ float warpReduceMax(float val) {
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, mask));
+    }
+    return val;
+}
+
+__global__ void w16_amax_kernel(const half* __restrict__ src, int64_t n, float* __restrict__ d_max) {
+
+    float local_max = 0.0f;
+    int tid = threadIdx.x;
+    int wid = tid / 32;
+    int lane = tid % 32;
+
+    int64_t total_vec = n / 8;
+    const uint4* src_v = reinterpret_cast<const uint4*>(src);
+    int64_t idx = (int64_t)blockDim.x * blockIdx.x + tid;
+    int64_t stride = (int64_t)blockDim.x * gridDim.x;
+
+    for (int64_t i = idx; i < total_vec; i += stride) {
+        uint4 v = src_v[i];
+        const half2* h2 = reinterpret_cast<const half2*>(&v);
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float2 f2 = __half22float2(h2[j]);
+            local_max = fmaxf(local_max, fmaxf(fabsf(f2.x), fabsf(f2.y)));
+        }
+    }
+    for (int64_t i = total_vec * 8 + idx; i < n; i += stride) {
+        local_max = fmaxf(local_max, fabsf(__half2float(src[i])));
+    }
+
+    local_max = warpReduceMax(local_max);
+    __shared__ float s_warp_max[8];
+    if (lane == 0) s_warp_max[wid] = local_max;
+    __syncthreads();
+
+    if (wid == 0) {
+        float block_max = (lane < (blockDim.x / 32)) ? s_warp_max[lane] : 0.0f;
+        block_max = warpReduceMax(block_max);
+        if (lane == 0 && block_max > 0.0f) {
+            atomicMaxFloat(d_max, block_max);
+        }
+    }
+}
+
+__global__ void w16_scale_and_quantize_vectorized_kernel(
+    const half* __restrict__ src, uint8_t* __restrict__ dst,
+    int64_t n, const float* __restrict__ d_max, float* __restrict__ d_inv_scale_w) {
+
+    __shared__ float s_scale;
+    if (threadIdx.x == 0) {
+        float m = *d_max;
+        if (m < 1e-8f) m = 1e-8f;
+        float s = 448.0f / m;
+        s_scale = s;
+        if (blockIdx.x == 0 && d_inv_scale_w) {
+            *d_inv_scale_w = 1.0f / s;
+        }
+    }
+    __syncthreads();
+
+    float s = s_scale;
+    int tid = threadIdx.x;
+    int64_t total_vec = n / 8;
+    const uint4* src_v = reinterpret_cast<const uint4*>(src);
+    uint2* dst_v = reinterpret_cast<uint2*>(dst);
+    int64_t idx = (int64_t)blockDim.x * blockIdx.x + tid;
+    int64_t stride = (int64_t)blockDim.x * gridDim.x;
+
+    for (int64_t i = idx; i < total_vec; i += stride) {
+        uint4 in_val = src_v[i];
+        const half2* h2 = reinterpret_cast<const half2*>(&in_val);
+        uint8_t out_b[8];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float2 f2 = __half22float2(h2[j]);
+            __nv_fp8_e4m3 q0(f2.x * s);
+            __nv_fp8_e4m3 q1(f2.y * s);
+            out_b[j * 2] = *reinterpret_cast<uint8_t*>(&q0);
+            out_b[j * 2 + 1] = *reinterpret_cast<uint8_t*>(&q1);
+        }
+        dst_v[i] = *reinterpret_cast<uint2*>(out_b);
+    }
+
+    for (int64_t i = total_vec * 8 + idx; i < n; i += stride) {
+        __nv_fp8_e4m3 q(__half2float(src[i]) * s);
+        dst[i] = *reinterpret_cast<uint8_t*>(&q);
+    }
+}
+
+__global__ void x16_amax_kernel(const half* __restrict__ src, int64_t T, int64_t K, int64_t ldx,
+                                float* __restrict__ d_max) {
+
+    float local_max = 0.0f;
+    int tid = threadIdx.x;
+    int wid = tid / 32;
+    int lane = tid % 32;
+
+    if (ldx == K) {
+        int64_t total = T * K;
+        int64_t total_vec = total / 8;
+        const uint4* src_v = reinterpret_cast<const uint4*>(src);
+        int64_t idx = (int64_t)blockDim.x * blockIdx.x + tid;
+        int64_t stride = (int64_t)blockDim.x * gridDim.x;
+        for (int64_t i = idx; i < total_vec; i += stride) {
+            uint4 v = src_v[i];
+            const half2* h2 = reinterpret_cast<const half2*>(&v);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float2 f2 = __half22float2(h2[j]);
+                local_max = fmaxf(local_max, fmaxf(fabsf(f2.x), fabsf(f2.y)));
+            }
+        }
+        for (int64_t i = total_vec * 8 + idx; i < total; i += stride) {
+            local_max = fmaxf(local_max, fabsf(__half2float(src[i])));
+        }
+    } else {
+        int64_t K_vec = K / 8;
+        int64_t total_blocks = T * K_vec;
+        int64_t idx = (int64_t)blockDim.x * blockIdx.x + tid;
+        int64_t stride = (int64_t)blockDim.x * gridDim.x;
+        for (int64_t i = idx; i < total_blocks; i += stride) {
+            int64_t t = i / K_vec;
+            int64_t k_block = (i % K_vec) * 8;
+            const uint4* src_v = reinterpret_cast<const uint4*>(src + t * ldx + k_block);
+            uint4 v = *src_v;
+            const half2* h2 = reinterpret_cast<const half2*>(&v);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float2 f2 = __half22float2(h2[j]);
+                local_max = fmaxf(local_max, fmaxf(fabsf(f2.x), fabsf(f2.y)));
+            }
+        }
+        int64_t rem = K - K_vec * 8;
+        if (rem > 0) {
+            for (int64_t t = blockIdx.x; t < T; t += gridDim.x) {
+                for (int64_t k = K_vec * 8 + tid; k < K; k += blockDim.x) {
+                    local_max = fmaxf(local_max, fabsf(__half2float(src[t * ldx + k])));
+                }
+            }
+        }
+    }
+
+    local_max = warpReduceMax(local_max);
+    __shared__ float s_warp_max[8];
+    if (lane == 0) s_warp_max[wid] = local_max;
+    __syncthreads();
+
+    if (wid == 0) {
+        float block_max = (lane < (blockDim.x / 32)) ? s_warp_max[lane] : 0.0f;
+        block_max = warpReduceMax(block_max);
+        if (lane == 0 && block_max > 0.0f) {
+            atomicMaxFloat(d_max, block_max);
+        }
+    }
+}
+
+__global__ void x16_scale_and_quantize_vectorized_kernel(
+    const half* __restrict__ src, uint8_t* __restrict__ dst,
+    int64_t T, int64_t K, int64_t ldx,
+    const float* __restrict__ d_max,
+    float* __restrict__ d_scale_x,
+    float* __restrict__ d_inv_scale_x) {
+
+    __shared__ float s_scale;
+    if (threadIdx.x == 0) {
+        float m = *d_max;
+        if (m < 1e-8f) m = 1e-8f;
+        float s = 448.0f / m;
+        s_scale = s;
+        if (blockIdx.x == 0) {
+            if (d_scale_x) *d_scale_x = s;
+            if (d_inv_scale_x) *d_inv_scale_x = 1.0f / s;
+        }
+    }
+    __syncthreads();
+
+    float s = s_scale;
+    int tid = threadIdx.x;
+
+    if (ldx == K) {
+        int64_t total = T * K;
+        int64_t total_vec = total / 8;
+        const uint4* src_v = reinterpret_cast<const uint4*>(src);
+        uint2* dst_v = reinterpret_cast<uint2*>(dst);
+        int64_t idx = (int64_t)blockDim.x * blockIdx.x + tid;
+        int64_t stride = (int64_t)blockDim.x * gridDim.x;
+
+        for (int64_t i = idx; i < total_vec; i += stride) {
+            uint4 in_val = src_v[i];
+            const half2* h2 = reinterpret_cast<const half2*>(&in_val);
+            uint8_t out_b[8];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float2 f2 = __half22float2(h2[j]);
+                __nv_fp8_e4m3 q0(f2.x * s);
+                __nv_fp8_e4m3 q1(f2.y * s);
+                out_b[j * 2] = *reinterpret_cast<uint8_t*>(&q0);
+                out_b[j * 2 + 1] = *reinterpret_cast<uint8_t*>(&q1);
+            }
+            dst_v[i] = *reinterpret_cast<uint2*>(out_b);
+        }
+
+        for (int64_t i = total_vec * 8 + idx; i < total; i += stride) {
+            __nv_fp8_e4m3 q(__half2float(src[i]) * s);
+            dst[i] = *reinterpret_cast<uint8_t*>(&q);
+        }
+    } else {
+        int64_t K_vec = K / 8;
+        int64_t total_blocks = T * K_vec;
+        int64_t idx = (int64_t)blockDim.x * blockIdx.x + tid;
+        int64_t stride = (int64_t)blockDim.x * gridDim.x;
+
+        for (int64_t i = idx; i < total_blocks; i += stride) {
+            int64_t t = i / K_vec;
+            int64_t k_block = (i % K_vec) * 8;
+            const uint4* in_ptr = reinterpret_cast<const uint4*>(src + t * ldx + k_block);
+            uint2* out_ptr = reinterpret_cast<uint2*>(dst + t * K + k_block);
+
+            uint4 in_val = *in_ptr;
+            const half2* h2 = reinterpret_cast<const half2*>(&in_val);
+            uint8_t out_b[8];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float2 f2 = __half22float2(h2[j]);
+                __nv_fp8_e4m3 q0(f2.x * s);
+                __nv_fp8_e4m3 q1(f2.y * s);
+                out_b[j * 2] = *reinterpret_cast<uint8_t*>(&q0);
+                out_b[j * 2 + 1] = *reinterpret_cast<uint8_t*>(&q1);
+            }
+            *out_ptr = *reinterpret_cast<uint2*>(out_b);
+        }
+
+        int64_t rem = K - K_vec * 8;
+        if (rem > 0) {
+            for (int64_t t = blockIdx.x; t < T; t += gridDim.x) {
+                for (int64_t k = K_vec * 8 + tid; k < K; k += blockDim.x) {
+                    __nv_fp8_e4m3 q(__half2float(src[t * ldx + k]) * s);
+                    dst[t * K + k] = *reinterpret_cast<uint8_t*>(&q);
+                }
+            }
+        }
+    }
+}
+
+__global__ void __launch_bounds__(256) x16_per_token_quantize_e4m3_kernel(
+    const half* __restrict__ src, uint8_t* __restrict__ dst,
+    float* __restrict__ d_inv_scale_tok,
+    int64_t T, int64_t K, int64_t ldx) {
+
+    const int64_t t = (int64_t) blockIdx.x;
+    if (t >= T) return;
+
+    const int tid = threadIdx.x;
+    const int wid = tid / 32;
+    const int lane = tid % 32;
+
+    const half* row_in = src + t * ldx;
+    uint8_t* row_out = dst + t * K;
+    const bool can_vec = ((reinterpret_cast<uintptr_t>(row_in) & 15u) == 0) &&
+                         ((reinterpret_cast<uintptr_t>(row_out) & 7u) == 0) &&
+                         ((K & 7) == 0);
+
+    uint4 reg_v0{}, reg_v1{};
+    const bool reg_cached = can_vec && (K <= 4096);
+    float local_max = 0.0f;
+    if (reg_cached) {
+        const int64_t K_vec = K / 8;
+        const uint4* in_v = reinterpret_cast<const uint4*>(row_in);
+        if (tid < K_vec) {
+            reg_v0 = in_v[tid];
+            const half2* h2 = reinterpret_cast<const half2*>(&reg_v0);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float2 f2 = __half22float2(h2[j]);
+                local_max = fmaxf(local_max, fmaxf(fabsf(f2.x), fabsf(f2.y)));
+            }
+        }
+        if (tid + 256 < K_vec) {
+            reg_v1 = in_v[tid + 256];
+            const half2* h2 = reinterpret_cast<const half2*>(&reg_v1);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float2 f2 = __half22float2(h2[j]);
+                local_max = fmaxf(local_max, fmaxf(fabsf(f2.x), fabsf(f2.y)));
+            }
+        }
+    } else if (can_vec) {
+        const int64_t K_vec = K / 8;
+        const uint4* in_v = reinterpret_cast<const uint4*>(row_in);
+        for (int64_t i = tid; i < K_vec; i += blockDim.x) {
+            uint4 v = in_v[i];
+            const half2* h2 = reinterpret_cast<const half2*>(&v);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float2 f2 = __half22float2(h2[j]);
+                local_max = fmaxf(local_max, fmaxf(fabsf(f2.x), fabsf(f2.y)));
+            }
+        }
+    } else {
+        for (int64_t k = tid; k < K; k += blockDim.x) {
+            local_max = fmaxf(local_max, fabsf(__half2float(row_in[k])));
+        }
+    }
+
+    local_max = warpReduceMax(local_max);
+    __shared__ float s_warp_max[8];
+    if (lane == 0) s_warp_max[wid] = local_max;
+    __syncthreads();
+
+    __shared__ float s_scale;
+    if (wid == 0) {
+        float row_amax = (lane < (blockDim.x / 32)) ? s_warp_max[lane] : 0.0f;
+        row_amax = warpReduceMax(row_amax);
+        if (lane == 0) {
+            const float inv_scale = (row_amax > 0.0f) ? fmaxf(row_amax * (1.0f / 448.0f), 1.0f / (448.0f * 512.0f)) : 0.0f;
+            const float scale = (row_amax > 0.0f) ? (1.0f / inv_scale) : 0.0f;
+            d_inv_scale_tok[t] = inv_scale;
+            s_scale = scale;
+        }
+    }
+    __syncthreads();
+
+    const float scale = s_scale;
+    if (reg_cached) {
+        const int64_t K_vec = K / 8;
+        uint2* out_v = reinterpret_cast<uint2*>(row_out);
+        if (tid < K_vec) {
+            const half2* h2 = reinterpret_cast<const half2*>(&reg_v0);
+            uint8_t out_b[8];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float2 f2 = __half22float2(h2[j]);
+                __nv_fp8_e4m3 q0(f2.x * scale);
+                __nv_fp8_e4m3 q1(f2.y * scale);
+                out_b[j * 2] = *reinterpret_cast<uint8_t*>(&q0);
+                out_b[j * 2 + 1] = *reinterpret_cast<uint8_t*>(&q1);
+            }
+            out_v[tid] = *reinterpret_cast<const uint2*>(out_b);
+        }
+        if (tid + 256 < K_vec) {
+            const half2* h2 = reinterpret_cast<const half2*>(&reg_v1);
+            uint8_t out_b[8];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float2 f2 = __half22float2(h2[j]);
+                __nv_fp8_e4m3 q0(f2.x * scale);
+                __nv_fp8_e4m3 q1(f2.y * scale);
+                out_b[j * 2] = *reinterpret_cast<uint8_t*>(&q0);
+                out_b[j * 2 + 1] = *reinterpret_cast<uint8_t*>(&q1);
+            }
+            out_v[tid + 256] = *reinterpret_cast<const uint2*>(out_b);
+        }
+    } else if (can_vec) {
+        const int64_t K_vec = K / 8;
+        const uint4* in_v = reinterpret_cast<const uint4*>(row_in);
+        uint2* out_v = reinterpret_cast<uint2*>(row_out);
+        for (int64_t i = tid; i < K_vec; i += blockDim.x) {
+            uint4 in_val = in_v[i];
+            const half2* h2 = reinterpret_cast<const half2*>(&in_val);
+            uint8_t out_b[8];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float2 f2 = __half22float2(h2[j]);
+                __nv_fp8_e4m3 q0(f2.x * scale);
+                __nv_fp8_e4m3 q1(f2.y * scale);
+                out_b[j * 2] = *reinterpret_cast<uint8_t*>(&q0);
+                out_b[j * 2 + 1] = *reinterpret_cast<uint8_t*>(&q1);
+            }
+            out_v[i] = *reinterpret_cast<uint2*>(out_b);
+        }
+    } else {
+        for (int64_t k = tid; k < K; k += blockDim.x) {
+            __nv_fp8_e4m3 q(__half2float(row_in[k]) * scale);
+            row_out[k] = *reinterpret_cast<uint8_t*>(&q);
+        }
+    }
+}
+
+__global__ void __launch_bounds__(256) y32_per_token_scale_epilogue_kernel(
+    float* __restrict__ Y, const float* __restrict__ d_inv_scale_tok,
+    int64_t T, int64_t N, int64_t ldy) {
+
+    const int64_t t = (int64_t) blockIdx.x;
+    if (t >= T) return;
+
+    const float s = d_inv_scale_tok[t];
+    float* row_y = Y + t * ldy;
+    const bool can_vec = ((reinterpret_cast<uintptr_t>(row_y) & 15u) == 0) && ((N & 3) == 0);
+
+    if (can_vec) {
+        const int64_t N_vec = N / 4;
+        float4* y_v = reinterpret_cast<float4*>(row_y);
+        for (int64_t i = threadIdx.x; i < N_vec; i += blockDim.x) {
+            float4 v = y_v[i];
+            v.x *= s;
+            v.y *= s;
+            v.z *= s;
+            v.w *= s;
+            y_v[i] = v;
+        }
+    } else {
+        for (int64_t n = threadIdx.x; n < N; n += blockDim.x) {
+            row_y[n] *= s;
+        }
+    }
+}
+
+__global__ void __launch_bounds__(256) y32_per_token_accum_epilogue_kernel(
+    float* __restrict__ Y, const float* __restrict__ y_tmp,
+    const float* __restrict__ d_inv_scale_tok,
+    int64_t T, int64_t N, int64_t ldy, float beta) {
+
+    const int64_t t = (int64_t) blockIdx.x;
+    if (t >= T) return;
+
+    const float s = d_inv_scale_tok[t];
+    float* row_y = Y + t * ldy;
+    const float* row_tmp = y_tmp + t * N;
+    const bool can_vec = ((reinterpret_cast<uintptr_t>(row_y) & 15u) == 0) &&
+                         ((reinterpret_cast<uintptr_t>(row_tmp) & 15u) == 0) &&
+                         ((N & 3) == 0);
+
+    if (can_vec) {
+        const int64_t N_vec = N / 4;
+        float4* y_v = reinterpret_cast<float4*>(row_y);
+        const float4* tmp_v = reinterpret_cast<const float4*>(row_tmp);
+        for (int64_t i = threadIdx.x; i < N_vec; i += blockDim.x) {
+            float4 yv = y_v[i];
+            const float4 tv = tmp_v[i];
+            yv.x = beta * yv.x + tv.x * s;
+            yv.y = beta * yv.y + tv.y * s;
+            yv.z = beta * yv.z + tv.z * s;
+            yv.w = beta * yv.w + tv.w * s;
+            y_v[i] = yv;
+        }
+    } else {
+        for (int64_t n = threadIdx.x; n < N; n += blockDim.x) {
+            row_y[n] = beta * row_y[n] + row_tmp[n] * s;
+        }
+    }
+}
+
+__global__ void __launch_bounds__(256) y32_per_token_scale_copy_epilogue_kernel(
+    float* __restrict__ Y, const float* __restrict__ y_tmp,
+    const float* __restrict__ d_inv_scale_tok,
+    int64_t T, int64_t N, int64_t ldy) {
+
+    const int64_t t = (int64_t) blockIdx.x;
+    if (t >= T) return;
+
+    const float s = d_inv_scale_tok[t];
+    float* row_y = Y + t * ldy;
+    const float* row_tmp = y_tmp + t * N;
+    const bool can_vec = ((reinterpret_cast<uintptr_t>(row_y) & 15u) == 0) &&
+                         ((reinterpret_cast<uintptr_t>(row_tmp) & 15u) == 0) &&
+                         ((N & 3) == 0);
+
+    if (can_vec) {
+        const int64_t N_vec = N / 4;
+        float4* y_v = reinterpret_cast<float4*>(row_y);
+        const float4* tmp_v = reinterpret_cast<const float4*>(row_tmp);
+        for (int64_t i = threadIdx.x; i < N_vec; i += blockDim.x) {
+            const float4 tv = tmp_v[i];
+            float4 yv;
+            yv.x = tv.x * s;
+            yv.y = tv.y * s;
+            yv.z = tv.z * s;
+            yv.w = tv.w * s;
+            y_v[i] = yv;
+        }
+    } else {
+        for (int64_t n = threadIdx.x; n < N; n += blockDim.x) {
+            row_y[n] = row_tmp[n] * s;
+        }
+    }
+}
+
+__global__ void __launch_bounds__(256) y32_copy_or_accum_epilogue_kernel(
+    float* __restrict__ Y, const float* __restrict__ y_tmp,
+    int64_t T, int64_t N, int64_t ldy, float beta) {
+
+    const int64_t t = (int64_t) blockIdx.x;
+    if (t >= T) return;
+
+    float* row_y = Y + t * ldy;
+    const float* row_tmp = y_tmp + t * N;
+    const bool can_vec = ((reinterpret_cast<uintptr_t>(row_y) & 15u) == 0) &&
+                         ((reinterpret_cast<uintptr_t>(row_tmp) & 15u) == 0) &&
+                         ((N & 3) == 0);
+
+    if (can_vec) {
+        const int64_t N_vec = N / 4;
+        float4* y_v = reinterpret_cast<float4*>(row_y);
+        const float4* tmp_v = reinterpret_cast<const float4*>(row_tmp);
+        if (beta == 0.0f) {
+            for (int64_t i = threadIdx.x; i < N_vec; i += blockDim.x) {
+                y_v[i] = tmp_v[i];
+            }
+        } else {
+            for (int64_t i = threadIdx.x; i < N_vec; i += blockDim.x) {
+                float4 yv = y_v[i];
+                const float4 tv = tmp_v[i];
+                yv.x = beta * yv.x + tv.x;
+                yv.y = beta * yv.y + tv.y;
+                yv.z = beta * yv.z + tv.z;
+                yv.w = beta * yv.w + tv.w;
+                y_v[i] = yv;
+            }
+        }
+    } else {
+        if (beta == 0.0f) {
+            for (int64_t n = threadIdx.x; n < N; n += blockDim.x) {
+                row_y[n] = row_tmp[n];
+            }
+        } else {
+            for (int64_t n = threadIdx.x; n < N; n += blockDim.x) {
+                row_y[n] = beta * row_y[n] + row_tmp[n];
+            }
+        }
+    }
+}
+
+inline int64_t get_t_bucket(int64_t T) {
+    static constexpr int64_t kBuckets[] = {16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096};
+    for (int64_t b : kBuckets) {
+        if (T <= b) return b;
+    }
+    return ((T + 1023) / 1024) * 1024;
+}
+
+inline int64_t pf_fp8_min_t() {
+    const char* v = std::getenv("STRATA_PF_FP8_MIN_T");
+    if (v != nullptr && v[0] != '\0') {
+        const int64_t n = std::atoll(v);
+        if (n >= 1) return n;
+    }
+    return 128;
+}
+
+bool env_is_1(const char* name) {
+    const char* v = std::getenv(name);
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+}
+
+// A failed query counts as capture: do not time, and do not skip a quantize, inside a graph.
+bool stream_capturing(void* stream) {
+    if (stream == nullptr) return false;
+    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing((cudaStream_t) stream, &st) != cudaSuccess) return true;
+    return st != cudaStreamCaptureStatusNone;
+}
+
+} // namespace
+
+static bool gdn_qkvz_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_GDN_QKVZ"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+
+static bool pf_fp8_pair_ticket_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PF_FP8_PAIR_TICKET"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+
+bool Gemm::fp8(const uint16_t* X, const uint8_t* W8, const float* d_inv_scale_w, float* Y,
+               int64_t T, int64_t N, int64_t K, int64_t ldy, float beta, int64_t ldx, const float* act_amax,
+               bool reuse_x8, PrefillFp8Activation* act_ticket) {
+    if (T <= 0 || N <= 0 || K <= 0) return false;
+    if (ldy <= 0) ldy = N;
+    if (ldx <= 0) ldx = K;
+
+    if (!lt_handle_ || !lt_pref_) return false;
+    const bool pad_small_t = (T < pf_fp8_min_t()) && env_is_1("STRATA_PF_FP8_PAD_SMALL_T");
+    const int64_t T_pad = pad_small_t ? (T < 16 ? 16 : ((T + 15) / 16) * 16) : T;
+    // 1. Ensure transient activation buffer x8_ is allocated
+    int64_t want_bytes = T_pad * K;
+    if (x8_bytes_ < want_bytes) {
+        if (x8_) cudaFree(x8_);
+        x8_ = nullptr;
+        x8_bytes_ = 0;
+        x8_key_valid_ = false;
+        ++x8_gen_;
+        int64_t alloc_bytes = std::max<int64_t>(want_bytes, 4ll << 20);
+        if (cudaMalloc((void**) &x8_, (size_t) alloc_bytes) != cudaSuccess) {
+            cudaGetLastError();
+            x8_ = nullptr;
+            return false;
+        }
+        x8_bytes_ = alloc_bytes;
+    }
+
+    const bool per_token = [] {
+        const char* v = std::getenv("STRATA_PF_FP8_PER_TOKEN");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+
+    if (per_token) {
+        if (inv_scale_tok_cap_ < (size_t) T) {
+            if (d_inv_scale_tok_) cudaFree(d_inv_scale_tok_);
+            d_inv_scale_tok_ = nullptr;
+            inv_scale_tok_cap_ = 0;
+            x8_key_valid_ = false;
+            ++x8_gen_;
+            const size_t alloc_elems = std::max<size_t>((size_t) T, 4096u);
+            if (cudaMalloc((void**) &d_inv_scale_tok_, alloc_elems * sizeof(float)) != cudaSuccess) {
+                cudaGetLastError();
+                d_inv_scale_tok_ = nullptr;
+                return false;
+            }
+            inv_scale_tok_cap_ = alloc_elems;
+        }
+    } else if (!d_scale_x_) {
+        if (cudaMalloc((void**) &d_scale_x_, sizeof(float)) != cudaSuccess ||
+            cudaMalloc((void**) &d_inv_scale_x_, sizeof(float)) != cudaSuccess ||
+            cudaMalloc((void**) &d_max_x_, sizeof(float)) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+    }
+
+    // 2. Dynamic scaling of activations X (FP16) -> x8_ (FP8 E4M3) on stream_
+    // STRATA_PF_FP8_PER_TOKEN=1: 1-pass per-row amax + quantize; else 2-pass per-tensor (with optional PF-1a fused amax).
+    // STRATA_GDN_QKVZ: reuse_x8 skips quantization only when mode, buffers, and shape all match.
+    const bool bufs_ok = x8_ != nullptr && x8_bytes_ >= want_bytes &&
+                         (per_token ? (d_inv_scale_tok_ != nullptr && inv_scale_tok_cap_ >= (size_t) T)
+                                    : (d_inv_scale_x_ != nullptr));
+    static const bool allow_pad_reuse = [] {
+        const char* v = std::getenv("STRATA_PF_FP8_SMALL_T_REUSE");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    const bool gdn_reuse = (allow_pad_reuse || !pad_small_t) && reuse_x8 && x8_key_valid_ && x8_key_x_ == X && x8_key_amax_ == act_amax &&
+                           x8_key_t_ == T && x8_key_k_ == K && x8_key_ldx_ == ldx &&
+                           x8_key_per_token_ == per_token && bufs_ok;
+    const bool ticket_reuse = !gdn_reuse && pf_fp8_pair_ticket_on() && act_ticket != nullptr &&
+                              bufs_ok && act_ticket->matches(X, T, K, ldx, act_amax, per_token, x8_gen_);
+    if (!gdn_reuse && !ticket_reuse) {
+        ++x8_gen_;
+        if (per_token) {
+            x16_per_token_quantize_e4m3_kernel<<<(unsigned) T, 256, 0, (cudaStream_t) stream_>>>(
+                (const half*) X, x8_, d_inv_scale_tok_, T, K, ldx);
+        } else {
+            const int num_blocks = 64;
+            bool fused_amax = act_amax != nullptr;
+            if (fused_amax) {
+                const char* v = std::getenv("STRATA_PF_FP8_FUSED_AMAX");
+                if (v == nullptr || std::atoi(v) == 0) fused_amax = false;
+            }
+            if (fused_amax) {
+                if (cudaMemcpyAsync(d_max_x_, act_amax, sizeof(float), cudaMemcpyDeviceToDevice,
+                                    (cudaStream_t) stream_) != cudaSuccess) {
+                    (void) cudaGetLastError();   // the producer's slot could not be read: take the amax pass instead
+                    fused_amax = false;
+                }
+            }
+            if (!fused_amax) {
+                cudaMemsetAsync(d_max_x_, 0, sizeof(float), (cudaStream_t) stream_);
+                x16_amax_kernel<<<num_blocks, 256, 0, (cudaStream_t) stream_>>>(
+                    (const half*) X, T, K, ldx, d_max_x_);
+            }
+            x16_scale_and_quantize_vectorized_kernel<<<num_blocks, 256, 0, (cudaStream_t) stream_>>>(
+                (const half*) X, x8_, T, K, ldx, d_max_x_, d_scale_x_, d_inv_scale_x_);
+        }
+    }
+    if (!ticket_reuse && act_ticket != nullptr && pf_fp8_pair_ticket_on()) {
+        *act_ticket = {X, T, K, ldx, act_amax, per_token, x8_gen_, true};
+    }
+    if ((allow_pad_reuse ? (!gdn_reuse && !ticket_reuse) : true) && pad_small_t && T_pad > T) {
+        cudaMemsetAsync(x8_ + T * K, 0, (size_t) (T_pad - T) * (size_t) K, (cudaStream_t) stream_);
+    }
+    if (gdn_qkvz_on() && (allow_pad_reuse || !pad_small_t)) {
+        x8_key_valid_ = true;
+        x8_key_x_ = X;
+        x8_key_amax_ = act_amax;
+        x8_key_t_ = T;
+        x8_key_k_ = K;
+        x8_key_ldx_ = ldx;
+        x8_key_per_token_ = per_token;
+        fp8_image_ready_ = true;
+    }
+
+    float* matmul_y = Y;
+    float matmul_beta = beta;
+    int64_t c_ldy = ldy;
+    if (pad_small_t || (per_token && beta != 0.0f)) {
+        const size_t need_bytes = (size_t) T_pad * (size_t) N * sizeof(float);
+        if (y_tmp_bytes_ < need_bytes) {
+            if (y_tmp_) cudaFree(y_tmp_);
+            y_tmp_ = nullptr;
+            y_tmp_bytes_ = 0;
+            if (cudaMalloc((void**) &y_tmp_, need_bytes) != cudaSuccess) {
+                cudaGetLastError();
+                y_tmp_ = nullptr;
+                return false;
+            }
+            y_tmp_bytes_ = need_bytes;
+        }
+        matmul_y = y_tmp_;
+        matmul_beta = 0.0f;
+        c_ldy = N;
+    }
+
+    // 3. cuBLASLt Tiered Memoization & Execution
+    int64_t t_bucket = get_t_bucket(T_pad);
+    AlgoCacheKey key{N, K, c_ldy, t_bucket, per_token};
+
+    cublasLtMatmulDescOpaque_t opDesc;
+    cublasLtMatmulDescInit(&opDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    cublasOperation_t opA = CUBLAS_OP_T;
+    cublasOperation_t opB = CUBLAS_OP_N;
+    cublasLtMatmulDescSetAttribute(&opDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA));
+    cublasLtMatmulDescSetAttribute(&opDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB));
+    cublasLtMatmulDescSetAttribute(&opDesc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &d_inv_scale_w, sizeof(d_inv_scale_w));
+    if (!per_token) {
+        cublasLtMatmulDescSetAttribute(&opDesc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &d_inv_scale_x_, sizeof(d_inv_scale_x_));
+    }
+
+    cublasLtMatrixLayoutOpaque_t aLayout, bLayout, cLayout;
+    cublasLtMatrixLayoutInit(&aLayout, CUDA_R_8F_E4M3, (uint64_t) K, (uint64_t) N, (int64_t) K);
+    cublasLtMatrixLayoutInit(&bLayout, CUDA_R_8F_E4M3, (uint64_t) K, (uint64_t) T_pad, (int64_t) K);
+    cublasLtMatrixLayoutInit(&cLayout, CUDA_R_32F, (uint64_t) N, (uint64_t) T_pad, (int64_t) c_ldy);
+
+    size_t actual_ws_bytes = ws_bytes_;
+    AlgoCacheVal cached_algo{{}, 0, false};
+    AlgoCacheVal first_algo{{}, 0, false};
+    auto it = algo_cache_.find(key);
+    // Read per call, like STRATA_PF_FP8_FUSED_AMAX, so a parity run can force the fallthrough in one process.
+    const bool force_no_algo = [] {
+        const char* v = std::getenv("STRATA_PF_FP8_FORCE_NO_ALGO");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    // Real prompt shapes only (the FP8 gate is T >= 128). Once per cache key, on the first call outside capture.
+    // Timing during capture is illegal; beta != 0 would accumulate into Y across the timed runs.
+    const bool tune = !force_no_algo && beta == 0.0f && T >= pf_fp8_min_t() && env_is_1("STRATA_PF_FP8_AUTOTUNE") &&
+                      !stream_capturing(stream_);
+    if (tune && it != algo_cache_.end() && it->second.tuned && !it->second.valid) return false;
+    if (it != algo_cache_.end() && it->second.valid && (!tune || it->second.tuned)) {
+        cached_algo = it->second;
+    } else if (tune) {
+        cublasLtMatrixLayoutOpaque_t bLayoutBucket, cLayoutBucket;
+        cublasLtMatrixLayoutInit(&bLayoutBucket, CUDA_R_8F_E4M3, (uint64_t) K, (uint64_t) t_bucket, (int64_t) K);
+        cublasLtMatrixLayoutInit(&cLayoutBucket, CUDA_R_32F, (uint64_t) N, (uint64_t) t_bucket, (int64_t) c_ldy);
+        cublasLtMatmulHeuristicResult_t found[8];
+        int nret = 0;
+        cublasStatus_t hst = cublasLtMatmulAlgoGetHeuristic(
+            (cublasLtHandle_t) lt_handle_, &opDesc, &aLayout, &bLayoutBucket, &cLayoutBucket, &cLayoutBucket,
+            (cublasLtMatmulPreference_t) lt_pref_, 8, found, &nret);
+        int valid_i[8];
+        int nvalid = 0;
+        if (hst == CUBLAS_STATUS_SUCCESS) {
+            for (int i = 0; i < nret && i < 8; ++i) {
+                if (found[i].state == CUBLAS_STATUS_SUCCESS && found[i].workspaceSize <= actual_ws_bytes)
+                    valid_i[nvalid++] = i;
+            }
+        }
+        int best = -1;
+        float best_ms = 0.0f;
+        cudaEvent_t ev0 = nullptr, ev1 = nullptr;
+        const bool can_time = nvalid > 0 && cudaEventCreate(&ev0) == cudaSuccess &&
+                              cudaEventCreate(&ev1) == cudaSuccess;
+        if (!can_time) {
+            if (ev0 != nullptr) (void) cudaEventDestroy(ev0);
+            if (ev1 != nullptr) (void) cudaEventDestroy(ev1);
+            ev0 = nullptr;
+            ev1 = nullptr;
+        }
+        auto run_one = [&](const cublasLtMatmulAlgo_t& algo) -> cublasStatus_t {
+            float alpha = 1.0f;
+            return cublasLtMatmul(
+                (cublasLtHandle_t) lt_handle_, &opDesc,
+                &alpha, W8, &aLayout,
+                x8_, &bLayout,
+                &matmul_beta, matmul_y, &cLayout,
+                matmul_y, &cLayout,
+                &algo,
+                workspace_, actual_ws_bytes, (cudaStream_t) stream_);
+        };
+        if (can_time) {
+            static bool said = false;
+            if (!said) {
+                said = true;
+                std::fprintf(stderr, "strata prefill: FP8 cuBLASLt autotune on (STRATA_PF_FP8_AUTOTUNE=1); "
+                                     "once per prompt shape, never during capture\n");
+            }
+            for (int v = 0; v < nvalid; ++v) {
+                const cublasLtMatmulAlgo_t& algo = found[valid_i[v]].algo;
+                if (run_one(algo) != CUBLAS_STATUS_SUCCESS) continue;   // warmup; a failed algo is not timed
+                float samples[3];
+                bool ok = true;
+                for (int r = 0; ok && r < 3; ++r) {
+                    ok = cudaEventRecord(ev0, (cudaStream_t) stream_) == cudaSuccess &&
+                         run_one(algo) == CUBLAS_STATUS_SUCCESS &&
+                         cudaEventRecord(ev1, (cudaStream_t) stream_) == cudaSuccess &&
+                         cudaEventSynchronize(ev1) == cudaSuccess &&
+                         cudaEventElapsedTime(&samples[r], ev0, ev1) == cudaSuccess;
+                }
+                if (!ok) continue;
+                float a = samples[0], b = samples[1], c = samples[2];
+                if (a > b) { float t = a; a = b; b = t; }
+                if (b > c) { float t = b; b = c; c = t; }
+                if (a > b) { float t = a; a = b; b = t; }
+                if (best < 0 || b < best_ms) { best = v; best_ms = b; }
+            }
+        }
+        if (ev0) (void) cudaEventDestroy(ev0);
+        if (ev1) (void) cudaEventDestroy(ev1);
+        // No timed winner: the first valid heuristic, which is the single-heuristic choice when it is valid.
+        const int pick = best >= 0 ? best : (nvalid > 0 ? 0 : -1);
+        if (pick >= 0) {
+            const cublasLtMatmulHeuristicResult_t& chosen = found[valid_i[pick]];
+            cached_algo.workspace_bytes = chosen.workspaceSize;
+            std::memcpy(cached_algo.algo_data, &chosen.algo, sizeof(cublasLtMatmulAlgo_t));
+            cached_algo.valid = true;
+            cached_algo.tuned = true;
+            algo_cache_[key] = cached_algo;
+            if (pick != 0) {
+                const cublasLtMatmulHeuristicResult_t& head = found[valid_i[0]];
+                first_algo.workspace_bytes = head.workspaceSize;
+                std::memcpy(first_algo.algo_data, &head.algo, sizeof(cublasLtMatmulAlgo_t));
+                first_algo.valid = true;
+                first_algo.tuned = true;
+            }
+        }
+    } else if (it != algo_cache_.end() && it->second.valid) {
+        cached_algo = it->second;
+    } else {
+        // Query heuristic for bucketed layout
+        cublasLtMatrixLayoutOpaque_t bLayoutBucket, cLayoutBucket;
+        cublasLtMatrixLayoutInit(&bLayoutBucket, CUDA_R_8F_E4M3, (uint64_t) K, (uint64_t) t_bucket, (int64_t) K);
+        cublasLtMatrixLayoutInit(&cLayoutBucket, CUDA_R_32F, (uint64_t) N, (uint64_t) t_bucket, (int64_t) c_ldy);
+
+        cublasLtMatmulHeuristicResult_t heuristicResult;
+        int returnedResults = 0;
+        cublasStatus_t hst = cublasLtMatmulAlgoGetHeuristic(
+            (cublasLtHandle_t) lt_handle_, &opDesc, &aLayout, &bLayoutBucket, &cLayoutBucket, &cLayoutBucket,
+            (cublasLtMatmulPreference_t) lt_pref_, 1, &heuristicResult, &returnedResults);
+
+        if (hst == CUBLAS_STATUS_SUCCESS && returnedResults > 0 &&
+            heuristicResult.state == CUBLAS_STATUS_SUCCESS &&
+            heuristicResult.workspaceSize <= actual_ws_bytes) {
+            cached_algo.workspace_bytes = heuristicResult.workspaceSize;
+            std::memcpy(cached_algo.algo_data, &heuristicResult.algo, sizeof(cublasLtMatmulAlgo_t));
+            cached_algo.valid = true;
+            algo_cache_[key] = cached_algo;
+        }
+    }
+
+    // A cache miss or a rejected heuristic must fall through to FP16/MMQ, not leave Y unwritten.
+    if (force_no_algo) return false;
+
+    auto launch = [&](const AlgoCacheVal& slot) -> cublasStatus_t {
+        float alpha = 1.0f;
+        cublasLtMatmulAlgo_t algo;
+        std::memcpy(&algo, slot.algo_data, sizeof(cublasLtMatmulAlgo_t));
+        return cublasLtMatmul(
+            (cublasLtHandle_t) lt_handle_, &opDesc,
+            &alpha, W8, &aLayout,
+            x8_, &bLayout,
+            &matmul_beta, matmul_y, &cLayout,
+            matmul_y, &cLayout,
+            &algo,
+            workspace_, actual_ws_bytes, (cudaStream_t) stream_);
+    };
+    if (cached_algo.valid) {
+        cublasStatus_t mst = launch(cached_algo);
+        if (mst != CUBLAS_STATUS_SUCCESS && first_algo.valid) {
+            mst = launch(first_algo);   // the timed choice failed: the first heuristic
+            if (mst == CUBLAS_STATUS_SUCCESS) algo_cache_[key] = first_algo;
+        }
+        if (mst != CUBLAS_STATUS_SUCCESS) {
+            std::fprintf(stderr, "strata fp8 prefill: cublasLtMatmul failed with status %d\n", (int) mst);
+            // Remember a tuned shape that produced nothing, so the next call falls through without timing again.
+            if (cached_algo.tuned) {
+                cached_algo.valid = false;
+                algo_cache_[key] = cached_algo;
+            }
+            return false;
+        }
+        if (per_token) {
+            if (pad_small_t && beta == 0.0f) {
+                y32_per_token_scale_copy_epilogue_kernel<<<(unsigned) T, 256, 0, (cudaStream_t) stream_>>>(
+                    Y, y_tmp_, d_inv_scale_tok_, T, N, ldy);
+            } else if (beta == 0.0f) {
+                y32_per_token_scale_epilogue_kernel<<<(unsigned) T, 256, 0, (cudaStream_t) stream_>>>(
+                    Y, d_inv_scale_tok_, T, N, ldy);
+            } else {
+                y32_per_token_accum_epilogue_kernel<<<(unsigned) T, 256, 0, (cudaStream_t) stream_>>>(
+                    Y, y_tmp_, d_inv_scale_tok_, T, N, ldy, beta);
+            }
+        } else if (pad_small_t) {
+            y32_copy_or_accum_epilogue_kernel<<<(unsigned) T, 256, 0, (cudaStream_t) stream_>>>(
+                Y, y_tmp_, T, N, ldy, beta);
+        }
+        return true;
+    }
+    return false;
+}
+#endif
+
 void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                float beta) {
     if (T <= 0 || N <= 0) return;
@@ -1379,7 +2343,10 @@ void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T
 }
 
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
-                  int64_t ldy, float beta, int64_t ldx) {
+                  int64_t ldy, float beta, int64_t ldx, const float* act_amax, bool reuse_x8,
+                  PrefillFp8Activation* act_ticket) {
+    if (gdn_qkvz_on()) fp8_image_ready_ = false;
+    (void) reuse_x8;
 #ifdef STRATA_USE_HIP
     // S23 (opt-in STRATA_PF_PAD=1, with STRATA_PF_GEMM=1 on chunks of STRATA_PF_SWITCH_MIN_T+ tokens): the weight
     // dequantized into the scratch with row stride K + 64 halves, so no 4 KB-multiple stride camps on the memory
@@ -1418,7 +2385,7 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
         // than ending the engine.
         const uint16_t* Xu = unpad_x(X, T, K, ldx);
         if (Xu != nullptr) {
-            native(Xu, ggml_type, W_blocks, Y, T, N, K, ldy, beta, 0);
+            native(Xu, ggml_type, W_blocks, Y, T, N, K, ldy, beta, 0, act_amax, reuse_x8, nullptr);
             return;
         }
         std::fprintf(stderr, "prefill gemm: a padded X (ldx %lld, K %lld) has no path on this card and could not be "
@@ -1429,6 +2396,89 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     if (beta == 0.0f && (ldx == 0 || ldx == K) && native_mmq(X, ggml_type, W_blocks, Y, T, N, K, ldy)) return;
 #endif
 #ifndef STRATA_USE_HIP
+    // Dense FP8 Prefill Weight Cache (w8_):
+    // Caches weights in CUDA_R_8F_E4M3 (1 byte/element, saving 50% VRAM vs FP16).
+    // When prompt chunk T >= 128, invokes cublasLtMatmul using FP8 Tensor Cores with FP32 accumulation.
+    if (w8_budget_ < 0) {
+        const char* v = std::getenv("STRATA_PF_W8_CACHE_MIB");
+        const char* on = std::getenv("STRATA_PF_W8_CACHE");
+        const char* w16_env = std::getenv("STRATA_PF_W16_CACHE_MIB");
+        if (v != nullptr && std::strcmp(v, "auto") == 0) {
+            w8_budget_ = 16ll << 30;
+            w8_reserve_ = kW8AutoReserve;
+        } else if (v != nullptr) {
+            w8_budget_ = (int64_t) std::atoll(v) * (1ll << 20);
+            w8_reserve_ = kW8AutoReserve;
+        } else if (on != nullptr) {
+            w8_budget_ = (std::strcmp(on, "0") == 0) ? 0 : (16ll << 30);
+            w8_reserve_ = kW8AutoReserve;
+        } else if (w16_env != nullptr && std::strcmp(w16_env, "0") != 0) {
+            // Explicit W16 cache test requested: leave w8 off
+            w8_budget_ = 0;
+            w8_reserve_ = kW8AutoReserve;
+        } else {
+            // Default: on Ada Lovelace (cc >= 89) or when w8/w16 auto default is active
+            const int cc = current_cc();
+            const bool auto_on = (cc >= 89) || w8_auto_default_().load() || w16_auto_default_().load();
+            w8_budget_ = auto_on ? (16ll << 30) : 0;
+            w8_reserve_ = kW8AutoReserve;
+        }
+    }
+    if (w8_budget_ > 0) {
+        const int64_t bytes = N * K;
+        uint8_t* cw8 = nullptr;
+        float* d_scale_w = nullptr;
+        for (const W8Entry& e : w8_) {
+            if (e.p == W_blocks && e.type == ggml_type && e.n == N && e.k == K) {
+                cw8 = e.d;
+                d_scale_w = e.scale_w;
+                break;
+            }
+        }
+        if (cw8 == nullptr && w8_used_ + bytes <= w8_budget_ && N * K <= scratch_elems_) {
+            size_t fb = 0, tb = 0;
+            if (cudaMemGetInfo(&fb, &tb) == cudaSuccess) {
+                int64_t effective_reserve = w8_reserve_;
+                // Adaptive reserve: clamp to kW8MinReserve if free VRAM is under 1536 MiB to accommodate tight stages
+                if (!w8_reserve_user_set_ && fb < (1536ll << 20)) {
+                    effective_reserve = std::max<int64_t>(kW8MinReserve, effective_reserve / 2);
+                }
+                if (fb > (size_t) bytes + (size_t) effective_reserve &&
+                    cudaMalloc((void**) &cw8, (size_t) bytes) == cudaSuccess &&
+                    cudaMalloc((void**) &d_scale_w, sizeof(float)) == cudaSuccess) {
+                    if (!d_max_w_) (void) cudaMalloc((void**) &d_max_w_, sizeof(float));
+                    strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
+                    cudaMemsetAsync(d_max_w_, 0, sizeof(float), (cudaStream_t) stream_);
+                    w16_amax_kernel<<<64, 256, 0, (cudaStream_t) stream_>>>((const half*) scratch_, N * K, d_max_w_);
+                    w16_scale_and_quantize_vectorized_kernel<<<64, 256, 0, (cudaStream_t) stream_>>>(
+                        (const half*) scratch_, cw8, N * K, d_max_w_, d_scale_w);
+                    w8_.push_back({W_blocks, ggml_type, N, K, cw8, d_scale_w});
+                    w8_used_ += bytes;
+                    if (!w8_logged_) {
+                        w8_logged_ = true;
+                        std::fprintf(stderr, "strata prefill: surgical FP8 dense weight cache active (%lld MiB cached, card keeps %lld MiB free; STRATA_PF_W8_CACHE=0 turns it off)\n",
+                                     (long long) (w8_used_ >> 20), (long long) (effective_reserve >> 20));
+                    }
+                } else {
+                    (void) cudaGetLastError();
+                    if (cw8) { (void) cudaFree(cw8); cw8 = nullptr; }
+                    if (d_scale_w) { (void) cudaFree(d_scale_w); d_scale_w = nullptr; }
+                    // Cap budget to currently used cache if any weights cached; do NOT zero out budget on initial skip!
+                    if (w8_used_ > 0) {
+                        w8_budget_ = w8_used_;
+                    }
+                }
+            }
+        }
+        static const bool pad_small_t_env = [] {
+            const char* v = std::getenv("STRATA_PF_FP8_PAD_SMALL_T");
+            return v != nullptr && v[0] == '1' && v[1] == '\0';
+        }();
+        if (cw8 != nullptr && (T >= pf_fp8_min_t() || (pad_small_t_env && T >= 1))) {
+            if (fp8(X, cw8, d_scale_w, Y, T, N, K, ldy, beta, ldx, act_amax, reuse_x8, act_ticket)) return;
+        }
+    }
+
     // The FP16 weight kept on the device after its first dequant.  NOT bit-exact against the uncached sliced form on every
     // card (see the default below): off unless STRATA_PF_W16_CACHE_MIB is set.  When on it is sized by the card, never by the user.  It takes only VRAM nobody else holds: a weight is
     // cached while the card keeps kW16AutoReserve free afterwards (the MTP prompt capture, the batch windows and a long
@@ -1458,7 +2508,7 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
             w16_reserve_ = kW16AutoReserve;
         }
     }
-    if (w16_budget_ > 0 && !side_scratch_) {
+    if (w8_budget_ <= 0 && w16_budget_ > 0 && !side_scratch_) {
         const int64_t bytes = N * K * 2;
         uint16_t* cw = nullptr;
         for (const W16Entry& e : w16_)

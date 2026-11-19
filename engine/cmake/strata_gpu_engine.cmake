@@ -285,7 +285,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
-    src/core/remote_expert_opt.cu
+    src/core/remote_expert_opt.cu src/core/native_fp8.cu
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp src/core/dflash2.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
     src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
@@ -451,7 +451,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # what composes them into a token.  No tokenizer - the prompt arrives as ids - because Gate C1 compares logits
   # against llama.cpp on the SAME ids and a tokenizer on one side of that comparison is a second variable.
   # plan v0.3 P5: batched prompt processing (tensor-core GEMMs through cuBLAS).
-  add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
+  add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/handoff_fp8.cu src/prefill/prefill.cpp)
   if(STRATA_ENABLE_HIP)
     # #313: the RDNA3 WMMA GEMMs include hip_runtime.h: AMD builds only (a CUDA build never sees this file)
     target_sources(strata_prefill PRIVATE src/prefill/wmma_gemm.cu)
@@ -884,6 +884,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(gemm_w16_parity PRIVATE strata_prefill )
     add_test(NAME gemm_w16_parity COMMAND gemm_w16_parity)
     set_tests_properties(gemm_w16_parity PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(gemm_fp8_parity src/prefill/gemm_fp8_parity.cu)
+    target_link_libraries(gemm_fp8_parity PRIVATE strata_prefill CUDA::cublasLt)
+    add_test(NAME gemm_fp8_parity COMMAND gemm_fp8_parity)
+    set_tests_properties(gemm_fp8_parity PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(handoff_fp8_parity tests/cuda/handoff_fp8_parity.cu)
+    target_link_libraries(handoff_fp8_parity PRIVATE strata_prefill)
+    add_test(NAME handoff_fp8_parity COMMAND handoff_fp8_parity)
     # Pascal, opt-in STRATA_DENSE_F32=1: the dense projections' FP16 GEMMs as cublasSgemm on FP32 copies, bitwise vs
     # the cuBLAS FP16 call over a sweep of chunk sizes (GPU, synthetic, no model; --full sweeps every size, --bench
     # adds timings).  Not a ctest: whether the two agree is a property of the cuBLAS build, which this checks.

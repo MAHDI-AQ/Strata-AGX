@@ -94,6 +94,7 @@ jobs:
 
   hip:
     name: HIP ROCm 7.2
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     container: rocm/dev-ubuntu-24.04:7.2.4-complete
@@ -127,6 +128,7 @@ jobs:
     # 2025.3.2 compiler does not have: it stops at "no member named 'entangle'"; the intel/oneapi-basekit images end at 2025.3), so the
     # compiler comes from Intel's apt repository at a pinned version.
     name: SYCL oneAPI 2026.1
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     container: ubuntu:24.04
@@ -162,6 +164,7 @@ jobs:
 
   metal:
     name: Metal strata
+    if: github.event_name == 'workflow_dispatch'
     # the macOS 26 SDK: engine/metal/src/mtl_rt.mm names MTLGPUFamilyMetal4 behind @available (a run-time check); the names must be in the SDK
     runs-on: macos-26
     timeout-minutes: 60

@@ -221,6 +221,7 @@ struct QsaIndexerBuffers {
     float* dead = nullptr;
     float* pooled = nullptr;
     int32_t* block_pos = nullptr;
+    bool pooled_fp16 = false;
 };
 
 /// Append one raw indexer key (IDX_DIM wide, fp32, NEVER normed and NEVER rotated - `ref/qsa.py` L201-210) and

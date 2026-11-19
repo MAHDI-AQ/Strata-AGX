@@ -1,4 +1,6 @@
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/kernels/native_qsa_indexer.hpp"
+#include <cuda_fp16.h>
 #include "conversation_checked.hpp"
 #include "conversation_copy.hpp"
 #include "conversation_trace.hpp"
@@ -189,25 +191,42 @@ void ckpt_test_point(int point) {
 // STRATA_CKPT_VRAM_SLOTS=N (with STRATA_CKPT_ASYNC): the last N saved GDN states stay in VRAM (allocated only while
 // more than 1.5 GB stays free); a restore of a checkpoint whose tag a slot holds copies device to device.
 struct VramSlot { void* p = nullptr; size_t n = 0; uint64_t tag = 0, used = 0; int dev = -1; };
-struct VramSlots { std::vector<VramSlot> s; uint64_t clock = 0, next_tag = 0; };
+struct VramSlots { std::mutex mu; std::vector<VramSlot> s; uint64_t clock = 0, next_tag = 0; };
 VramSlots& vram_slots() { static VramSlots v; return v; }
 int vram_slots_n() {
     static const int n = [] { const char* v = std::getenv("STRATA_CKPT_VRAM_SLOTS"); return v ? std::max(0, std::min(16, std::atoi(v))) : 0; }();
     return n;
 }
-// a slot for `n` bytes on `dev`: a free one, a new one if VRAM allows, else the least recently used (nullptr: none)
-VramSlot* vram_slot_for(size_t n, int dev) {
+// a slot index for `n` bytes on `dev`: a free/new one if VRAM allows, else the least recently used (-1: none)
+int vram_slot_for(size_t n, int dev, void*& out_p) {
+    out_p = nullptr;
     VramSlots& v = vram_slots();
-    VramSlot* best = nullptr;
-    for (VramSlot& x : v.s)
-        if (x.dev == dev && x.n == n && (best == nullptr || x.used < best->used)) best = &x;
-    if ((int) v.s.size() < vram_slots_n()) {
+    std::lock_guard<std::mutex> lk(v.mu);
+    int best = -1;
+    int dev_cnt = 0;
+    for (int i = 0; i < (int) v.s.size(); ++i) {
+        VramSlot& x = v.s[(size_t) i];
+        if (x.dev != dev) continue;
+        ++dev_cnt;
+        if (x.n == n && (best < 0 || x.used < v.s[(size_t) best].used)) best = i;
+    }
+    if (dev_cnt < vram_slots_n()) {
         size_t fr = 0, tot = 0;
         if (cudaMemGetInfo(&fr, &tot) == cudaSuccess && fr > n + ((size_t) 3 << 29)) {
             VramSlot x;
-            if (cudaMalloc(&x.p, n) == cudaSuccess) { x.n = n; x.dev = dev; v.s.push_back(x); return &v.s.back(); }
+            if (cudaMalloc(&x.p, n) == cudaSuccess) {
+                x.n = n; x.dev = dev; x.tag = 0; x.used = ++v.clock;
+                v.s.push_back(x);
+                out_p = x.p;
+                return (int) v.s.size() - 1;
+            }
         }
         (void) cudaGetLastError();
+    }
+    if (best >= 0) {
+        v.s[(size_t) best].tag = 0;
+        v.s[(size_t) best].used = ++v.clock;
+        out_p = v.s[(size_t) best].p;
     }
     return best;
 }
@@ -226,7 +245,10 @@ bool ckpt_async_on() {
 // instead of 37.  The same bytes in the same places.  One set of buffers: the mutex serializes the saves a layer
 // split runs on one thread per stage (STRATA_CKPT_THREADS), which otherwise gather through the same buffer.
 struct CkptGather { std::mutex mu; void* stage = nullptr; void* host = nullptr; size_t cap = 0; int dev = -1; };
-CkptGather& ckpt_gather() { static CkptGather a; return a; }
+CkptGather& ckpt_gather(int dev) {
+    static std::array<CkptGather, 8> a;
+    return a[(size_t) std::clamp(dev, 0, 7)];
+}
 bool ckpt_gather_on() {
 #if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
     return false;
@@ -241,10 +263,10 @@ int ckpt_gather_small(ConversationCheckpoint& c, const SessionState& ss, const C
     const size_t ple = c.ple.size(), tails = c.tails.size(), dead = c.dead.size(), block_pos = c.block_pos.size();
     const size_t total = ple + tails + dead + block_pos;
     if (total == 0) return 1;
-    CkptGather& a = ckpt_gather();
-    std::lock_guard<std::mutex> lk(a.mu);
     int dev = 0;
     (void) cudaGetDevice(&dev);
+    CkptGather& a = ckpt_gather(dev);
+    std::lock_guard<std::mutex> lk(a.mu);
     if (a.stage != nullptr && (a.cap < total || a.dev != dev)) {
         const int cur = dev;
         (void) cudaSetDevice(a.dev); (void) cudaFree(a.stage); (void) cudaFreeHost(a.host); (void) cudaSetDevice(cur);
@@ -297,7 +319,11 @@ bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const Mo
                      bool& staged) {
     staged = false;
     const auto j0 = std::chrono::steady_clock::now();
-    conversation_checkpoint_join(nullptr);   // (the staging buffer is reused)
+    {
+        CkptAsync& a = ckpt_async();
+        std::lock_guard<std::mutex> lk(a.mu);
+        join_locked(a, nullptr);
+    }
     if (std::getenv("STRATA_PARK_TRACE")) std::fprintf(stderr, "strata parktrace: save join %.2f ms\n",
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - j0).count());
 #if defined(STRATA_GPU_METAL)
@@ -341,18 +367,18 @@ bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const Mo
         }
         (void) cudaGetLastError();
         const auto q0 = std::chrono::steady_clock::now();
-        VramSlot* slot = vram_slots_n() > 0 ? vram_slot_for(c.gdn.size(), dev) : nullptr;
-        if (slot != nullptr) slot->tag = 0;   // (being rewritten)
-        void* dsrc = slot != nullptr ? slot->p : a.stage;
+        void* slot_p = nullptr;
+        const int slot_idx = vram_slots_n() > 0 ? vram_slot_for(c.gdn.size(), dev, slot_p) : -1;
+        void* dsrc = slot_idx >= 0 ? slot_p : a.stage;
         c.dev_tag = 0;
         // (a VRAM slot without the pinned buffer and stream - their allocation failed - has nowhere to copy to: plain copy)
         if (dsrc != nullptr && a.host != nullptr && a.stream != nullptr &&
             copy(dsrc, ss.gdn_state, c.gdn.size(), error)) {   // device to device: fast
             const auto q1 = std::chrono::steady_clock::now();
-            if (slot != nullptr) {
+            if (slot_idx >= 0) {
                 VramSlots& v = vram_slots();
-                slot->tag = c.dev_tag = ++v.next_tag;
-                slot->used = ++v.clock;
+                std::lock_guard<std::mutex> lk(v.mu);
+                v.s[(size_t) slot_idx].tag = c.dev_tag = ++v.next_tag;
             }
             uint8_t* dst = c.gdn.data();
             const size_t n = c.gdn.size();
@@ -455,13 +481,27 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
             !copy(st.idx_block_pos, c.block_pos.data() + j * z.block_pos, z.block_pos, error)) return false;
         if (!c.ids.empty()) {
             const size_t row = c.ids.size() / strata::kernels::qsa_real_shapes().idx_block;
-            if (!copy(st.idx_pooled + row * g.idx_key_dim, c.dead.data() + j * z.dead, z.dead, error)) return false;
+            if (st.idx_pooled_fp16) {
+                const float* src_f = reinterpret_cast<const float*>(c.dead.data() + j * z.dead);
+                std::vector<__half> h16((size_t) g.idx_key_dim);
+                for (int64_t k = 0; k < g.idx_key_dim; ++k) h16[(size_t) k] = __float2half(src_f[k]);
+                uint16_t* dst16 = reinterpret_cast<uint16_t*>(st.idx_pooled) + row * (size_t) g.idx_key_dim;
+                if (!copy(dst16, h16.data(), (size_t) g.idx_key_dim * sizeof(__half), error)) return false;
+            } else {
+                if (!copy(st.idx_pooled + row * g.idx_key_dim, c.dead.data() + j * z.dead, z.dead, error)) return false;
+            }
         }
     }
     const size_t tokens = c.ids.size();
     ss.ple_prev[0] = tokens >= 2 ? c.ids[tokens - 2] : -1;
     ss.ple_prev[1] = tokens >= 1 ? c.ids[tokens - 1] : -1;
     return sync(error);
+}
+
+bool conversation_sync_copy_stream(std::string& error) {
+    const cudaError_t e = conversation_detail::sync_private_stream();
+    if (e != cudaSuccess) { error = std::string("conversation copy sync: ") + cudaGetErrorString(e); return false; }
+    return true;
 }
 
 bool conversation_checkpoint_copy(const SessionState& from, SessionState& to, const std::vector<int32_t>& ids,
@@ -486,7 +526,15 @@ bool conversation_checkpoint_copy(const SessionState& from, SessionState& to, co
             !acopy(b.idx_block_pos, a.idx_block_pos, zf.block_pos)) return false;
         if (!ids.empty()) {   // restore writes the saved `dead` row into the pooled row the next token fills
             const size_t row = ids.size() / strata::kernels::qsa_real_shapes().idx_block;
-            if (!acopy(b.idx_pooled + row * g.idx_key_dim, a.idx_dead, zf.dead)) return false;
+            if (b.idx_pooled_fp16) {
+                uint16_t* dst16 = reinterpret_cast<uint16_t*>(b.idx_pooled) + row * (size_t) g.idx_key_dim;
+                cudaStream_t pst = nullptr;
+                if (conversation_detail::private_stream(pst) != cudaSuccess) return fail(error, "private stream failed");
+                strata::kernels::copy_f32_to_f16(a.idx_dead, dst16, g.idx_key_dim, pst);
+                if (!queued && !sync(error)) return false;
+            } else {
+                if (!acopy(b.idx_pooled + row * g.idx_key_dim, a.idx_dead, zf.dead)) return false;
+            }
         }
     }
     const size_t tokens = ids.size();

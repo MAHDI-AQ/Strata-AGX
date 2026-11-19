@@ -12,6 +12,28 @@
 
 namespace fnx {
 
+// Dynamic EMA acceptance tracker (Condition 4)
+struct MtpCircuitBreaker {
+    double ema_alpha = 0.70;
+    static constexpr double THRESHOLD = 0.40;
+    static constexpr double DECAY = 0.95;
+
+    void update(int accepted, int offered) {
+        if (offered > 0) {
+            double rate = (double) accepted / (double) offered;
+            ema_alpha = ema_alpha * DECAY + rate * (1.0 - DECAY);
+        }
+    }
+
+    bool active() const { return ema_alpha >= THRESHOLD; }
+
+    int max_drafts(int configured_k) const {
+        if (ema_alpha < 0.30) return 0; // complete bypass
+        if (ema_alpha < 0.50) return std::min(1, configured_k); // conservative 1 draft
+        return configured_k;
+    }
+};
+
 // a lane decoding in batched windows
 struct BatchLane {
     int lane = -1;
@@ -54,11 +76,13 @@ public:
     // the last window's wall time, its verify_rows' share and its drafting's (the draft layer's calls for the next window)
     double last_ms = 0.0, last_verify_ms = 0.0, last_draft_ms = 0.0;
     int last_rows = 0, last_calls = 0;
+    const MtpCircuitBreaker& circuit_breaker() const { return circuit_breaker_; }
 
 private:
     Engine& e_;
     int K_, LK_;
     std::vector<int> eos_;
+    MtpCircuitBreaker circuit_breaker_;
     BatchDrafts mode_;
     bool pen_drafts_, samp_drafts_;   // FNX_DRAFT_PEN, FNX_DRAFT_SAMPLE as Session::generate reads them
     RowCost cost_;

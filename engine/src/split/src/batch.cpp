@@ -9,6 +9,18 @@
 
 namespace fnx {
 
+static bool allow_async_mtp(int batch_groups = 1) {
+    if (const char* env_serial = std::getenv("STRATA_BATCH_MTP_SERIAL")) {
+        if (env_serial[0] == '1' || env_serial[0] == 't' || env_serial[0] == 'T') return false;
+    }
+    const char* env_bg = std::getenv("STRATA_BATCH_GROUPS");
+    int bg = env_bg ? std::atoi(env_bg) : batch_groups;
+    if (bg > 1 && !std::getenv("STRATA_ALLOW_PIPED_MTP")) {
+        return false;
+    }
+    return true;
+}
+
 namespace {
 constexpr double DECAY = 0.99;   // the acceptance statistics follow the text (Session::generate's is 0.97)
 // priors: a chain draft stands 70% of the time (as alone), a lookup 80% (a match tends to run on)
@@ -239,6 +251,8 @@ std::vector<BatchDecoder::Emitted> BatchDecoder::window(const std::vector<BatchL
         out[(size_t) i].n = used;
         L.offered += (long) L.drafts.size();
         L.accepted += used - 1;
+        // Condition 4: Update Dynamic EMA Circuit Breaker
+        circuit_breaker_.update(used - 1, (int) L.drafts.size());
         got[(size_t) i].assign(oi.begin(), oi.begin() + used);
         L.ctx.insert(L.ctx.end(), got[(size_t) i].begin(), got[(size_t) i].end());
         L.drafts.clear();
@@ -247,6 +261,13 @@ std::vector<BatchDecoder::Emitted> BatchDecoder::window(const std::vector<BatchL
         if (!out[(size_t) i].eos && used < limit[(size_t) i]) going.push_back(i);
     }
     e_.commit_rows(keep);
+    // Condition 2: Commit verified speculative KV to primary cache asynchronously
+    for (int i = 0; i < n; ++i) {
+        const int accepted = keep[(size_t) i] - 1;
+        if (accepted > 0) {
+            e_.pl_commit_async(lanes[(size_t) i]->lane, accepted);
+        }
+    }
     const int was = e_.lane();
     const auto td = std::chrono::steady_clock::now();
     last_calls = 0;
@@ -274,7 +295,8 @@ void BatchDecoder::draft_next(const std::vector<BatchLane*>& lanes, const std::v
         // (taking a page here could find the pool empty; the next window's own pages come before it runs). Either way
         // the window's rows take positions pos .. pos + drafts, inside the context (as Session::generate clamps them)
         const int pos = e_.lane_pos(L.lane), ctx_room = std::max(0, e_.max_ctx() - pos - 1);
-        chain_room[g] = std::min({K_, e_.lane_pages(L.lane) * KVP_POS - pos, ctx_room});
+        const int effective_k = circuit_breaker_.max_drafts(K_);
+        chain_room[g] = std::min({effective_k, e_.lane_pages(L.lane) * KVP_POS - pos, ctx_room});
         if (df2) chain_room[g] = std::min({K_, df2::kDrafts, ctx_room});   // DFlash2 writes no cells of the draft layer: only the context bounds its drafts
         RowOffer& of = offers[g];
         if (!look[g].empty() || !mtp) {
@@ -331,7 +353,9 @@ void BatchDecoder::draft_next(const std::vector<BatchLane*>& lanes, const std::v
         draft_df2(lanes, going, r0, got, look, plan, chain_room);
         return;
     }
-    if (mtp && batched_draft_) {
+    // Condition 5: BatchLane serialization gate
+    const bool async_mtp = allow_async_mtp();
+    if (mtp && batched_draft_ && async_mtp) {
         draft_batched(lanes, going, r0, got, look, plan, chain_room);
         return;
     }

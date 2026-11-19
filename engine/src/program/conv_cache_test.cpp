@@ -1,3 +1,4 @@
+#include <algorithm>
 // src/program/conv_cache_test.cpp - the conversation cache's retention policy: the shared root survives,
 // the leaves rotate by least recent use.
 //
@@ -183,6 +184,15 @@ int main() {
         check(!rewind_keep(slot_live.data(), 5000, slot_prompt.data(), 4500, 4096), "the slot's tokens differ below the resume: parks");
         check(!rewind_keep(live.data(), 200, prompt.data(), 200, 4096), "resume at the end: parked (strict bound)");
         check(!rewind_keep(live.data(), 0, prompt.data(), 0, 4096), "empty live session: never skips");
+    }
+    {   // P1-2: sorting checkpoints ascending by token length keeps the 2048 root at index 0
+        struct FakeCk { size_t len; uint64_t stamp; };
+        std::vector<FakeCk> cks = {{8192, 10}, {2048, 1}, {4096, 5}};
+        std::sort(cks.begin(), cks.end(), [](const FakeCk& a, const FakeCk& b) { return a.len < b.len; });
+        std::vector<uint64_t> st;
+        for (const auto& c : cks) st.push_back(c.stamp);
+        const size_t v = eviction_victim(st.data(), st.size(), 2);
+        check(cks[0].len == 2048 && v != 0, "sorted ascending by ids.size(): 2048 root stays at index 0 and is never evicted");
     }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
