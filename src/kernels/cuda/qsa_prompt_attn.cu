@@ -2471,6 +2471,22 @@ bool qsa_prompt_attn_batch_gated(const float* q, const QsaAttnPools& pools, cons
 bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* attn, int64_t n_q, void* stream) {
     if (n_q <= 0) return true;
+    static const int64_t split_kv_min_blocks = []() -> int64_t {
+        const char* v = std::getenv("STRATA_PROMPT_ATTN_SPLIT_KV");
+        if (v == nullptr || *v == '\0') return 0;
+        char* end = nullptr;
+        const long long parsed = std::strtoll(v, &end, 10);
+        if (end == v || *end != '\0' || parsed <= 0) return 0;
+        return parsed == 1 ? 128 : (int64_t) parsed;
+    }();
+    if (split_kv_min_blocks > 0 && n_q * s.n_head_kv < split_kv_min_blocks) {
+        static std::atomic<bool> logged_split{false};
+        if (!logged_split.exchange(true, std::memory_order_relaxed)) {
+            std::fprintf(stderr, "strata prefill: STRATA_PROMPT_ATTN_SPLIT_KV active (min_blocks=%lld, routed n_q=%lld -> split-KV)\n",
+                         (long long) split_kv_min_blocks, (long long) n_q);
+        }
+        return false;
+    }
     bool volta = false, turing = false, t75 = false;   // per call, from the CURRENT device (a layer split can mix Turing with newer cards)
     {   // sm_75 or newer: the MMA above compiles for both.  sm_80+ runs the cp.async kernel (launch_i8); Turing has
         // no cp.async, so it runs the v1 kernel (launch<1>, same accuracy, another summation order).  An older card

@@ -118,7 +118,8 @@ void scores_case(int rows) {
 void attn_case(int rows, bool int8) {
     const k::QsaShapes s = k::qsa_real_shapes();
     const int64_t HD = s.head_dim, NKV = s.n_head_kv, NH = s.n_head, PS = s.page_size;
-    const int64_t ctx_max = 5000, pages = (ctx_max + PS - 1) / PS, prow = pages * NKV * PS;
+    const int64_t ctx_max = std::max<int64_t>(5000, 900 + 641 * std::max(0, rows - 1) + 4),
+                  pages = (ctx_max + PS - 1) / PS, prow = pages * NKV * PS;
     const int64_t cap = k::qsa_selection_width(ctx_max, s);
     std::mt19937 rng(23 + rows + int8);
     std::normal_distribution<float> nd(0.f, 1.f);

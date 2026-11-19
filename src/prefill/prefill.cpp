@@ -1757,10 +1757,58 @@ namespace {
 // streamed run lends the prompt path exactly the slots a resident one does (a lent expert runs on the CPU, which
 // rounds differently: without this an A/B compares two expert placements as well as two KV placements)
 bool stage_own() { static const bool v = std::getenv("STRATA_KV_STAGE_OWN") != nullptr; return v; }
+bool stage_lazy() {
+    static const bool v = [] {
+        const char* e = std::getenv("STRATA_KV_STAGE_LAZY");
+        return e != nullptr && e[0] == '1' && e[1] == '\0';
+    }();
+    return v;
+}
+bool ensure_stage(const core::QsaState& q0, const strata::kernels::QsaShapes& s,
+                  strata::kernels::KvHostPools& st, std::vector<void*>& owned, std::string& err) {
+    if (q0.kv_mode != 1 || !q0.host.present() || st.present()) return true;
+    Alloc a;
+    a.owned = &owned;
+    bool ok = true;
+    const size_t rows = (size_t) q0.n_pages * s.n_head_kv * s.page_size;
+    if (q0.kv_hybrid) {
+        st.k_q = a.take<int8_t>(rows * s.head_dim, ok);
+        st.k_scale = a.take<uint16_t>(rows * (s.head_dim / 64), ok);
+        st.v_q4 = a.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
+    } else if (q0.kv_q4) {
+        st.k_q4 = a.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
+        st.v_q4 = a.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
+    } else if (q0.kv_int8) {
+        st.k_q = a.take<int8_t>(rows * s.head_dim, ok);
+        st.v_q = a.take<int8_t>(rows * s.head_dim, ok);
+        st.k_scale = a.take<uint16_t>(rows * (s.head_dim / 64), ok);
+        st.v_scale = a.take<uint16_t>(rows * (s.head_dim / 64), ok);
+    } else {
+        st.k_pool = a.take<uint16_t>(rows * s.head_dim, ok);
+        st.v_pool = a.take<uint16_t>(rows * s.head_dim, ok);
+    }
+    if (!ok) {
+        err = "prefill: lazy KV staging pool does not fit in VRAM";
+        return false;
+    }
+    static std::atomic<bool> logged_alloc{false};
+    if (!logged_alloc.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr, "strata prefill: STRATA_KV_STAGE_LAZY=1 lazily allocated KV staging pool (rows=%zu)\n", rows);
+    }
+    return true;
+}
 void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::kernels::QsaShapes& s,
                 strata::kernels::KvHostPools& st, bool& ok) {
     const core::QsaState& q0 = ss.qsa_states[ss.qsa_primary()];
     if (q0.kv_mode != 1) return;
+    if (stage_lazy() && !q0.host.present()) {
+        st = strata::kernels::KvHostPools{};
+        static std::atomic<bool> logged_defer{false};
+        if (!logged_defer.exchange(true, std::memory_order_relaxed)) {
+            std::fprintf(stderr, "strata prefill: STRATA_KV_STAGE_LAZY=1 deferred KV staging pool\n");
+        }
+        return;
+    }
     if (stage_own() && o_borrowed.count_only) return;
     Alloc own;
     own.owned = o_borrowed.owned;
@@ -4603,6 +4651,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 if (!core::is_qsa_layer(g, l)) continue;
                 const core::QsaState& state = ss.qsa_states[ordinal];
                 if (state.kv_mode != 1 || !state.host.present()) { ++ordinal; continue; }
+                if (!ensure_stage(state, s, m.stage, m.owned, err)) return false;
                 // Reuse one KV pool only after its last attention reader completes. The next layer's
                 // [0, p0) host prefix is immutable throughout this chunk; its new rows are appended later.
                 if (cudaEventRecord(m.kv_released, cs) != cudaSuccess ||
@@ -5261,6 +5310,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // KV streaming: this layer's cells [0, p0) come in from the host copy to the staging pool, and the
                     // chunk's cells go to the host copy, the staging pool, and the VRAM slots of resident blocks
                     const bool staged = (st.kv_mode == 1 && st.host.present());
+                    if (staged && !ensure_stage(st, s, m.stage, m.owned, err)) return false;
                     static const bool small_t_run = [] {
                         const char* v = std::getenv("STRATA_PF_SMALL_T_RUN");
                         return v != nullptr && v[0] == '1' && v[1] == '\0';
@@ -9120,6 +9170,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                             rope(m.Kc, T, 2, 256, 512, p0, strata::kernels::rope_scaling(), cs);
                         }
                         const bool staged = (st.kv_mode == 1 && st.host.present());
+                        if (staged && !ensure_stage(st, s, m.stage, m.owned, err)) return false;
                         static const bool small_t_resident = [] {
                             const char* v = std::getenv("STRATA_PREFILL_SMALL_T_RESIDENT");
                             return v != nullptr && v[0] == '1' && v[1] == '\0';

@@ -17029,6 +17029,36 @@
       "retired_in": ""
     },
     {
+      "name": "STRATA_KV_STAGE_LAZY",
+      "kind": "env",
+      "code_reads": [
+        {
+          "file": "src/prefill/prefill.cpp",
+          "line": 1762,
+          "fn": "getenv"
+        }
+      ],
+      "parse": "flag",
+      "default_state": "off",
+      "code_default": null,
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "first_commit": "",
+      "first_date": "2026-11-19",
+      "since": null,
+      "last_commit": "",
+      "last_date": "2026-11-19",
+      "status": "opt-in",
+      "owner": "prefill",
+      "note": "Defer ~288 MiB/GPU KV staging pool allocation until a streamed host KV pool is present",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
       "name": "STRATA_KV_STAGE_OWN",
       "backends": [
         "cuda-hip",
@@ -34137,6 +34167,36 @@
       "status": "research",
       "owner": "kernels/cuda",
       "note": "[auto] off unless set, not documented for users",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
+      "name": "STRATA_PROMPT_ATTN_SPLIT_KV",
+      "kind": "env",
+      "code_reads": [
+        {
+          "file": "src/kernels/cuda/qsa_prompt_attn.cu",
+          "line": 2475,
+          "fn": "getenv"
+        }
+      ],
+      "parse": "int",
+      "default_state": "off",
+      "code_default": null,
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "first_commit": "",
+      "first_date": "2026-11-19",
+      "since": null,
+      "last_commit": "",
+      "last_date": "2026-11-19",
+      "status": "opt-in",
+      "owner": "kernels",
+      "note": "Route small-n_q prompt attention (n_q * n_head_kv < min_blocks) through split-KV qsa_decode_attn_batch (0/unset=off, 1=128 blocks, or integer >= 2)",
       "retire_after": "",
       "retired_in": ""
     },
