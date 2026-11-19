@@ -217,6 +217,9 @@ bool draft_vocab_whole_head();       // STRATA_METAL_DRAFT_VOCAB=full
 #include <cstdio>
 #if !defined(_WIN32)
 #include <link.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -3632,6 +3635,18 @@ int main(int argc, char** argv) {
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+#if defined(__linux__) && defined(PR_SET_THP_DISABLE)
+    {
+        const char* thp_off = std::getenv("STRATA_THP_DISABLE");
+        if (thp_off != nullptr && thp_off[0] != '\0' && thp_off[0] != '0') {
+            if (::prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0) == 0) {
+                std::fprintf(stderr, "strata: STRATA_THP_DISABLE=1 disabled transparent huge pages for process\n");
+            } else {
+                std::fprintf(stderr, "strata: STRATA_THP_DISABLE=1 prctl(PR_SET_THP_DISABLE) failed (errno=%d)\n", errno);
+            }
+        }
+    }
+#endif
     strata::platform::restore_normal_io_priority();   // #4733: not the low disk priority of the program that started this one
 #if defined(STRATA_USE_HIP) && defined(_WIN32)
     {   // 0.2.1.2: hipblas / libhipblaslt / rocblas are delay-loaded (CMakeLists.txt) and live in <exe folder>\rocm\bin, which only the
