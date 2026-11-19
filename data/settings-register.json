@@ -16682,6 +16682,36 @@
       "retired_in": ""
     },
     {
+      "name": "STRATA_KV_HOST_LAZY",
+      "kind": "env",
+      "code_reads": [
+        {
+          "file": "src/core/layer.cpp",
+          "line": 1,
+          "fn": "getenv"
+        }
+      ],
+      "parse": "flag",
+      "default_state": "off",
+      "code_default": null,
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "first_commit": "dbe4dbc1f8",
+      "first_date": "2026-11-19",
+      "since": null,
+      "last_commit": "dbe4dbc1f8",
+      "last_date": "2026-11-19",
+      "status": "opt-in",
+      "owner": "",
+      "note": "Defer ~30 GiB KV host pool allocation until crossing kv-resident or parking/snapshot",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
       "name": "STRATA_KV_HOST_REGISTER",
       "backends": [
         "cuda-hip"
@@ -16869,6 +16899,36 @@
       "status": "research",
       "owner": "core",
       "note": "[auto] not documented for users; code default not readable from the call",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
+      "name": "STRATA_KV_RESOLVE_BATCH",
+      "kind": "env",
+      "code_reads": [
+        {
+          "file": "src/core/verify.cpp",
+          "line": 1,
+          "fn": "getenv"
+        }
+      ],
+      "parse": "flag",
+      "default_state": "off",
+      "code_default": null,
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "first_commit": "dbe4dbc1f8",
+      "first_date": "2026-11-19",
+      "since": null,
+      "last_commit": "dbe4dbc1f8",
+      "last_date": "2026-11-19",
+      "status": "opt-in",
+      "owner": "",
+      "note": "Batch streamed QSA KV resolve and copy across up to 8 slots",
       "retire_after": "",
       "retired_in": ""
     },
@@ -36007,6 +36067,36 @@
       "retired_in": ""
     },
     {
+      "name": "STRATA_QSA_IDX_FP16",
+      "kind": "env",
+      "code_reads": [
+        {
+          "file": "src/core/layer.cpp",
+          "line": 1,
+          "fn": "getenv"
+        }
+      ],
+      "parse": "flag",
+      "default_state": "off",
+      "code_default": null,
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "first_commit": "dbe4dbc1f8",
+      "first_date": "2026-11-19",
+      "since": null,
+      "last_commit": "dbe4dbc1f8",
+      "last_date": "2026-11-19",
+      "status": "opt-in",
+      "owner": "",
+      "note": "Store QSA pooled indexer keys as FP16 (__half, 2 B/elem) instead of FP32",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
       "name": "STRATA_QSA_ROWS",
       "backends": [
         "cuda-hip"
@@ -47069,96 +47159,6 @@
       "status": "opt-in",
       "owner": "",
       "note": "",
-      "retire_after": "",
-      "retired_in": ""
-    },
-    {
-      "name": "STRATA_QSA_IDX_FP16",
-      "kind": "env",
-      "code_reads": [
-        {
-          "file": "src/core/layer.cpp",
-          "line": 1,
-          "fn": "getenv"
-        }
-      ],
-      "parse": "flag",
-      "default_state": "off",
-      "code_default": null,
-      "engine_sets": [],
-      "engine_defaults": [],
-      "launch_files": [],
-      "launch_sets": [],
-      "launch_reads": [],
-      "doc_mentions": [],
-      "first_commit": "dbe4dbc1f8",
-      "first_date": "2026-11-19",
-      "since": null,
-      "last_commit": "dbe4dbc1f8",
-      "last_date": "2026-11-19",
-      "status": "opt-in",
-      "owner": "",
-      "note": "Store QSA pooled indexer keys as FP16 (__half, 2 B/elem) instead of FP32",
-      "retire_after": "",
-      "retired_in": ""
-    },
-    {
-      "name": "STRATA_KV_HOST_LAZY",
-      "kind": "env",
-      "code_reads": [
-        {
-          "file": "src/core/layer.cpp",
-          "line": 1,
-          "fn": "getenv"
-        }
-      ],
-      "parse": "flag",
-      "default_state": "off",
-      "code_default": null,
-      "engine_sets": [],
-      "engine_defaults": [],
-      "launch_files": [],
-      "launch_sets": [],
-      "launch_reads": [],
-      "doc_mentions": [],
-      "first_commit": "dbe4dbc1f8",
-      "first_date": "2026-11-19",
-      "since": null,
-      "last_commit": "dbe4dbc1f8",
-      "last_date": "2026-11-19",
-      "status": "opt-in",
-      "owner": "",
-      "note": "Defer ~30 GiB KV host pool allocation until crossing kv-resident or parking/snapshot",
-      "retire_after": "",
-      "retired_in": ""
-    },
-    {
-      "name": "STRATA_KV_RESOLVE_BATCH",
-      "kind": "env",
-      "code_reads": [
-        {
-          "file": "src/core/verify.cpp",
-          "line": 1,
-          "fn": "getenv"
-        }
-      ],
-      "parse": "flag",
-      "default_state": "off",
-      "code_default": null,
-      "engine_sets": [],
-      "engine_defaults": [],
-      "launch_files": [],
-      "launch_sets": [],
-      "launch_reads": [],
-      "doc_mentions": [],
-      "first_commit": "dbe4dbc1f8",
-      "first_date": "2026-11-19",
-      "since": null,
-      "last_commit": "dbe4dbc1f8",
-      "last_date": "2026-11-19",
-      "status": "opt-in",
-      "owner": "",
-      "note": "Batch streamed QSA KV resolve and copy across up to 8 slots",
       "retire_after": "",
       "retired_in": ""
     }
