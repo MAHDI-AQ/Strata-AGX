@@ -1,6 +1,6 @@
 # Strata-AGX
 
-[![Target](https://img.shields.io/badge/target-Ada_Lovelace_sm__89-76b900.svg)](#multi-gpu-sm89-pipeline-recipes)
+[![Target](https://img.shields.io/badge/target-Ada_Lovelace_sm__89-76b900.svg)](#multi-gpu-sm_89-pipeline-recipes)
 [![CUDA Spills](https://img.shields.io/badge/cuda_spills-0_across_sm__89_objects-brightgreen.svg)](#verification-spill-gate--parity-suites)
 [![Upstream](https://img.shields.io/badge/upstream-Niko1221%2FStrata_v0.2.15-lightgrey.svg)](#upstream-attribution--sync)
 
@@ -155,3 +155,15 @@ python3 tools/upstream_sync_audit.py --repo . --upstream-ref upstream/main --fet
 ```
 
 See [`docs/SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md`](docs/SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md) for the full `sm_89` architecture, Wave K1–K17 optimization map, and upstream sync protocol, and [`AGENTS.md`](AGENTS.md) for agent rules.
+
+### Upstream `v0.2.15` Installers & Release Packages
+
+Upstream `Niko1221/Strata` (`Strata-0.2.15-`) binary installers:
+
+```bash
+curl -fsSL --connect-timeout 15 --max-time 120 https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh
+```
+
+```powershell
+irm -TimeoutSec 120 https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 | iex
+```

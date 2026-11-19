@@ -172,6 +172,7 @@ jobs:
     # Cheap and useful (the audit found the host and Python fixtures reading the Mac's own paths), but this job has not run on a
     # Mac runner yet: it reports and does not block until its first green run.
     name: macOS / ${{ matrix.name }}
+    if: github.event_name == 'workflow_dispatch'
     runs-on: macos-15
     timeout-minutes: 60
     continue-on-error: true

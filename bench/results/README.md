@@ -4,7 +4,7 @@ Raw results and short reports from measurement runs, one folder per run, named b
 the Strata version, hardware and method of its own day, and none is a statement about a later release. Current numbers are in the
 [docs](../../docs/README.md) and the [README](../../README.md); how to measure is in [BENCHMARK_PROTOCOL.md](../../docs/BENCHMARK_PROTOCOL.md).
 
-This page is built by `python tools/bench_results_index.py` (`--check` fails when a folder is missing from it). 142 folders and 3 loose files, 2185 files in all.
+This page is built by `python tools/bench_results_index.py` (`--check` fails when a folder is missing from it). 142 folders and 3 loose files, 2151 files in all.
 
 
 ## 2026-09
@@ -25,7 +25,7 @@ This page is built by `python tools/bench_results_index.py` (`--check` fails whe
 | [2026-09-29-rtx3090-epyc-milan](2026-09-29-rtx3090-epyc-milan/) | Preliminary native RTX 3090 / EPYC 7453 results | 60 |
 | [2026-09-29-speed-0122](2026-09-29-speed-0122/) | Speed with engine 0.1.22 | 2 |
 | [2026-09-29-speed-0126](2026-09-29-speed-0126/) | Speed with engine 0.1.26 | 2 |
-| [2026-09-30-community-rtx-5090](2026-09-30-community-rtx-5090/) | Community benchmark: RTX 5090, Core Ultra 9 285K | 18 |
+| [2026-09-30-community-rtx-5090](2026-09-30-community-rtx-5090/) | Community benchmark: RTX 5090, Core Ultra 9 285K | 17 |
 | [2026-09-30-tc-gemv-sm75](2026-09-30-tc-gemv-sm75/) | BF16 GEMV on Turing tensor cores (sm_75): measured negative | 2 |
 
 ## 2026-10
@@ -62,7 +62,7 @@ This page is built by `python tools/bench_results_index.py` (`--check` fails whe
 | [2026-10-03-rx6900xt-coder](2026-10-03-rx6900xt-coder/) | Coder IQ1_M on RX 6900 XT and Threadripper 3990X | 52 |
 | [2026-10-03-v100-kv-int8-read](2026-10-03-v100-kv-int8-read/) | V100 / Swift IQ2_XS / 32k / --kv int8: the KV read path | 1 |
 | [2026-10-03-v100-prompt-attn](2026-10-03-v100-prompt-attn/) | V100 (sm_70): a tensor-core QSA prompt attention (2026-10-03) | 1 |
-| [2026-10-03-windows-groups](2026-10-03-windows-groups/) | Threadripper 3990X / RX 6900 XT: Windows processor-group benchmark | 66 |
+| [2026-10-03-windows-groups](2026-10-03-windows-groups/) | Threadripper 3990X / RX 6900 XT: Windows processor-group benchmark | 65 |
 | [2026-10-04-community-2x-arc-pro-b60](2026-10-04-community-2x-arc-pro-b60/) | Community benchmark on 2x Intel Arc Pro B60 | 14 |
 | [2026-10-04-community-2x-rtx3060](2026-10-04-community-2x-rtx3060/) | Community benchmark: 2× RTX 3060 12 GB (Xeon E5-2678 v3), Qwen3.8-Flash-Next IQ3_S | 30 |
 | [2026-10-04-community-4090-32gb-ram-512k](2026-10-04-community-4090-32gb-ram-512k/) | Community benchmark: RTX 4090 24 GB with 32 GB of system RAM, 512K context (IQ2_XS) | 5 |
@@ -86,9 +86,9 @@ This page is built by `python tools/bench_results_index.py` (`--check` fails whe
 | [2026-10-05-community-2x-p40](2026-10-05-community-2x-p40/) | Community benchmark: 2x Tesla P40 22 GB (Pascal, sm_61), 2x Xeon E5-2698 v4 | 12 |
 | [2026-10-05-community-2x-rtx-4060ti](2026-10-05-community-2x-rtx-4060ti/) | Community benchmark: 2x RTX 4060 Ti 16 GB, Threadripper PRO 3975WX | 20 |
 | [2026-10-05-community-2x-rx-6900xt](2026-10-05-community-2x-rx-6900xt/) | Community benchmark: 2x AMD Radeon RX 6900 XT 16 GB (gfx1030), Ryzen 5 5600X, 128 GB RAM | 67 |
-| [2026-10-05-community-arc-b65](2026-10-05-community-arc-b65/) | Community benchmark: Intel Arc Pro B65, PCIe Gen4 x16 | 45 |
+| [2026-10-05-community-arc-b65](2026-10-05-community-arc-b65/) | Community benchmark: Intel Arc Pro B65, PCIe Gen4 x16 | 41 |
 | [2026-10-05-community-e5-2673v3-rtx-4060ti](2026-10-05-community-e5-2673v3-rtx-4060ti/) | Community benchmark: RTX 4060 Ti 16 GB, Xeon E5-2673 v3 (AVX2), DDR3, PCIe 3.0 x8 | 6 |
-| [2026-10-05-community-gfx1151](2026-10-05-community-gfx1151/) | Community report: Radeon 8060S (gfx1151), Ryzen AI Max+ 395 | 17 |
+| [2026-10-05-community-gfx1151](2026-10-05-community-gfx1151/) | Community report: Radeon 8060S (gfx1151), Ryzen AI Max+ 395 | 12 |
 | [2026-10-05-community-rtx-4070-ti-super](2026-10-05-community-rtx-4070-ti-super/) | Community benchmark: RTX 4070 Ti SUPER, Ryzen 7 9800X3D | 6 |
 | [2026-10-05-community-rtx-5060-ti-x2](2026-10-05-community-rtx-5060-ti-x2/) | Community benchmark (rerun): 2x RTX 5060 Ti (16 GB), Xeon E5-2690 v4 | 10 |
 | [2026-10-05-community-rtx-5090-9700x-iq3s](2026-10-05-community-rtx-5090-9700x-iq3s/) | Community benchmark: RTX 5090, Ryzen 7 9700X, IQ3_S | 11 |
@@ -116,16 +116,16 @@ This page is built by `python tools/bench_results_index.py` (`--check` fails whe
 | [2026-10-07-community-2x-rtx-4000](2026-10-07-community-2x-rtx-4000/) | Community benchmark: 2x NVIDIA Quadro RTX 4000 8 GB, Xeon E5-2620 v3, 64 GB RAM | 1 |
 | [2026-10-07-community-arc-b65-v01402](2026-10-07-community-arc-b65-v01402/) | Arc Pro B65: Strata v0.1.40.2 on PCIe Gen4 | 28 |
 | [2026-10-07-community-gfx1150](2026-10-07-community-gfx1150/) | Radeon 890M (gfx1150): a hipBLASLt table, and the gfx1151 exact switches (2026-10-07) | 4 |
-| [2026-10-07-community-rtx-5080-docker-wsl2](2026-10-07-community-rtx-5080-docker-wsl2/) | Community benchmark: RTX 5080 in Docker Desktop on Windows (WSL2) | 35 |
+| [2026-10-07-community-rtx-5080-docker-wsl2](2026-10-07-community-rtx-5080-docker-wsl2/) | Community benchmark: RTX 5080 in Docker Desktop on Windows (WSL2) | 33 |
 | [2026-10-07-community-rtx-5090-laptop-ud-iq4xs](2026-10-07-community-rtx-5090-laptop-ud-iq4xs/) | Community benchmark: RTX 5090 Laptop, Core Ultra 9 275HX, 188 GB RAM — Unsloth UD-IQ4_XS (first NVIDIA measurement) | 3 |
 | [2026-10-07-community-rtx5090-pro4000-helper](2026-10-07-community-rtx5090-pro4000-helper/) | Community benchmark: RTX 5090 + RTX PRO 4000 Blackwell, UD-Q4_K_XL on the helper-cache config, engine 0.1.40.3 | 5 |
 | [2026-10-07-community-v100-p100-helper](2026-10-07-community-v100-p100-helper/) | Community benchmark: Tesla V100-PCIE-32GB + Tesla P100-PCIE-16GB, P100 as expert-helper card (mixed Volta/Pascal) | 7 |
-| [2026-10-07-community-xtx-6800xt-1m-helper](2026-10-07-community-xtx-6800xt-1m-helper/) | RX 7900 XTX + RX 6800 XT helper cache, Xeon E5-2696 v4, 1M context | 22 |
+| [2026-10-07-community-xtx-6800xt-1m-helper](2026-10-07-community-xtx-6800xt-1m-helper/) | RX 7900 XTX + RX 6800 XT helper cache, Xeon E5-2696 v4, 1M context | 20 |
 | [2026-10-07-rdna2-qsa-select-simt](2026-10-07-rdna2-qsa-select-simt/) | RX 6900 XT (gfx1030): the FP32 tiled QSA block scorer on HIP (2026-10-07) | 1 |
 | [2026-10-07-v100-decode-kernels](2026-10-07-v100-decode-kernels/) | V100 (sm_70): three decode kernels that were built for other cards (2026-10-07) | 3 |
 | [2026-10-07-v100-prompt-experts](2026-10-07-v100-prompt-experts/) | V100 (sm_70): the prompt's experts on FP16 tensor cores (2026-10-07) | 2 |
 | [2026-10-08-community-2x-rtx3080-20gb-ud-q4-k-xl-512k-pool](2026-10-08-community-2x-rtx3080-20gb-ud-q4-k-xl-512k-pool/) | Community benchmark: 2x RTX 3080 20 GB, Xeon E5-2696 v4, UD-Q4_K_XL, 512k-token shared KV pool | 32 |
-| [2026-10-08-community-2x-titan-rtx-0.1.40.3](2026-10-08-community-2x-titan-rtx-0.1.40.3/) | Community benchmark: 2x TITAN RTX (sm_75, NVLink), Xeon E5-2696 v4 | 10 |
+| [2026-10-08-community-2x-titan-rtx-0.1.40.3](2026-10-08-community-2x-titan-rtx-0.1.40.3/) | Community benchmark: 2x TITAN RTX (sm_75, NVLink), Xeon E5-2696 v4 | 9 |
 | [2026-10-08-community-r9700-linux](2026-10-08-community-r9700-linux/) | Single R9700 Flash Next speed and short prefill measurements | 30 |
 | [2026-10-08-community-rtx-5090-laptop-engine-0.1.40.3](2026-10-08-community-rtx-5090-laptop-engine-0.1.40.3/) | Community benchmark: RTX 5090 Laptop GPU (24 GB), engine 0.1.40.3 | 13 |
 | [2026-10-08-community-rtx4070-iq2-xs](2026-10-08-community-rtx4070-iq2-xs/) | Community benchmark: Flash-Next IQ2_XS on RTX 4070 12 GB / 32 GB DDR4 | 6 |
@@ -134,10 +134,10 @@ This page is built by `python tools/bench_results_index.py` (`--check` fails whe
 | [2026-10-08-community-v100-sm70-table](2026-10-08-community-v100-sm70-table/) | Community benchmark on Tesla V100-SXM2-32GB (sm_70): the opt-in Volta decode kernels | 3 |
 | [2026-10-08-gfx906-qsa-query-swizzle](2026-10-08-gfx906-qsa-query-swizzle/) | QSA query LDS swizzle qualification | 3 |
 | [2026-10-09-community-2x-rx-6900xt-0.1.41](2026-10-09-community-2x-rx-6900xt-0.1.41/) | Community benchmark: 2x AMD Radeon RX 6900 XT 16 GB (gfx1030), Ryzen 5 5600X, 128 GB RAM - Strata 0.1.41: one card, layer split, expert helper, and... | 47 |
-| [2026-10-09-community-4x-rx-7900-xt](2026-10-09-community-4x-rx-7900-xt/) | Community benchmark on 4x AMD Radeon RX 7900 XT | 14 |
-| [2026-10-09-community-gfx1151-ud-iq4xs-0.1.41](2026-10-09-community-gfx1151-ud-iq4xs-0.1.41/) | Community benchmark: EVO-X2, Ryzen AI Max+ 395 / Radeon 8060S (gfx1151), 128 GB UMA | 51 |
-| [2026-10-09-community-p4-prefill-roofline](2026-10-09-community-p4-prefill-roofline/) | Tesla P4 prefill: transfer reuse and chunk sizing | 22 |
-| [2026-10-09-community-radeon-pro-vii-16gb](2026-10-09-community-radeon-pro-vii-16gb/) | Community benchmark: AMD Radeon Pro VII 16 GB (gfx906), Xeon E5-2666 v3 | 37 |
+| [2026-10-09-community-4x-rx-7900-xt](2026-10-09-community-4x-rx-7900-xt/) | Community benchmark on 4x AMD Radeon RX 7900 XT | 12 |
+| [2026-10-09-community-gfx1151-ud-iq4xs-0.1.41](2026-10-09-community-gfx1151-ud-iq4xs-0.1.41/) | Community benchmark: EVO-X2, Ryzen AI Max+ 395 / Radeon 8060S (gfx1151), 128 GB UMA | 45 |
+| [2026-10-09-community-p4-prefill-roofline](2026-10-09-community-p4-prefill-roofline/) | Tesla P4 prefill: transfer reuse and chunk sizing | 19 |
+| [2026-10-09-community-radeon-pro-vii-16gb](2026-10-09-community-radeon-pro-vii-16gb/) | Community benchmark: AMD Radeon Pro VII 16 GB (gfx906), Xeon E5-2666 v3 | 31 |
 | [2026-10-09-community-rtx-3060-0141](2026-10-09-community-rtx-3060-0141/) | Community benchmark: RTX 3060 12 GB, Strata 0.1.41 | 26 |
 | [2026-10-09-community-rtx-5060-ti-e5-2680-v4](2026-10-09-community-rtx-5060-ti-e5-2680-v4/) | Community benchmark: RTX 5060 Ti 16 GB + Xeon E5-2680 v4, Strata 0.1.41 | 12 |
 | [2026-10-09-community-rtx-5060ti-wsl2-iq3_s-0141](2026-10-09-community-rtx-5060ti-wsl2-iq3_s-0141/) | Community benchmark on RTX 5060 Ti 16 GB (WSL2) + GSQ-RCO IQ3_S | 8 |
@@ -148,7 +148,7 @@ This page is built by `python tools/bench_results_index.py` (`--check` fails whe
 | [2026-10-09-rope-yarn-long-context](2026-10-09-rope-yarn-long-context/) | Existing RoPE and YaRN at 512K and 1M | 6 |
 | [2026-10-10-community-2x-p40-iq3_s](2026-10-10-community-2x-p40-iq3_s/) | 2026-10-10 — community 2× Tesla P40, Qwen3.8-Flash-Next IQ3_S, 131K context | 2 |
 | [2026-10-10-community-rx-9060-xt](2026-10-10-community-rx-9060-xt/) | Community benchmark on RX 9060 XT with IQ2_XS and IQ3_XXS | 70 |
-| [2026-10-10-community-rx-9070](2026-10-10-community-rx-9070/) | Community benchmark on AMD Radeon RX 9070 16 GB (gfx1201), Windows 11, Ryzen 7 5800X3D | 8 |
+| [2026-10-10-community-rx-9070](2026-10-10-community-rx-9070/) | Community benchmark on AMD Radeon RX 9070 16 GB (gfx1201), Windows 11, Ryzen 7 5800X3D | 7 |
 | [2026-10-11-community-rtx3090-5600x-arena-async](2026-10-11-community-rtx3090-5600x-arena-async/) | --adapt-async 1 in the arena mode — community report, RTX 3090 + Ryzen 5 5600X (Windows 11) | 7 |
 | [2026-10-11-community-rtx3090-5600x-arena-pin-by-need](2026-10-11-community-rtx3090-5600x-arena-pin-by-need/) | Pin by need (STRATA_PIN_BY_NEED=1) — community report, RTX 3090 + Ryzen 5 5600X (Windows 11) | 8 |
 | [2026-10-11-gfx1100-qsa-scores](2026-10-11-gfx1100-qsa-scores/) | Exact gfx1100 QSA scorer: measured prefill benefit, opt-in only | 7 |
