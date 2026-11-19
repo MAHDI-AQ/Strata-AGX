@@ -638,6 +638,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
             <span class="card-title" style="font-weight:700;color:${accent}">Slot ${sId} State</span>
             <span class="badges" id="state-badges-${sId}">
               <span class="st-badge" data-s="idle">Idle</span>
+              <span class="st-badge" data-s="unloaded">Unloaded</span>
               <span class="st-badge st-badge--reading" data-s="reading">Reading</span>
               <span class="st-badge st-badge--generating" data-s="generating">Generating</span>
               <span class="st-badge st-badge--queued" data-s="queued">Queued</span>
@@ -805,7 +806,38 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   // power and temperature averages (#4968); after the cards block above so that block stays self-contained
   sampleHw(hw, !!live.state && live.state !== "idle" && live.state !== "unloaded", `${totals && totals.since}|${eng.model || ""}`);
 
-  // context fill & parallel slot rendering
+  // the model card (#4968, from PR #4968 by noahark): which model this is (the name appears nowhere else on this tab) and the averages of
+  // the server's own totals since it started. Tooltips are plain title= text, like the rest of this tab.
+  $("ml-model").title = "Which model this server runs. Apps ask for it by this exact name.";
+  $("mv-model").textContent = eng.model || "–";
+  $("mv-model").title = eng.model || "";
+  $("ms-model").textContent = [eng.max_context ? `${ctxfmt(eng.max_context)} context` : null,
+                               eng.version ? `engine v${eng.version}` : null].filter(Boolean).join(" · ");
+  $("ms-model").title = "The context window this model runs with, and the engine's version.";
+  const avg = [];
+  if (totals && totals.requests) {
+    const read = totals.prompt_tokens - totals.reused;
+    avg.push(["Decode avg", totals.decode_ms > 0 && totals.output_tokens ? `${fmt(totals.output_tokens / (totals.decode_ms / 1000), 1)} t/s` : "–",
+              "Average answer speed since the server started: answer tokens divided by the time spent writing them. Waiting in the queue and reading the prompt are not counted."]);
+    avg.push(["Prefill avg", totals.prompt_ms > 0 && read > 0 ? `${fmt(read / (totals.prompt_ms / 1000))} t/s` : "–",
+              "Average prompt speed since the server started, counting only the tokens that were really read. What came from the cache is left out."]);
+    avg.push(["Per request", `${fmt(totals.prompt_tokens / totals.requests)} in · ${fmt(totals.output_tokens / totals.requests, 1)} out`,
+              "The average prompt and answer length of one request."]);
+    avg.push(["Prompt reused", totals.prompt_tokens ? `${fmt((100 * totals.reused) / totals.prompt_tokens)}%` : "–",
+              "How much of each prompt came from the engine's cache instead of being read again. High means follow-ups are fast."]);
+    const t0 = new Date(totals.since * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+    avg.push(["Since", `${t0} · ${fmt(totals.requests)} requests`,
+              "When this server began counting, and how many requests it has served. Loading or unloading the model does not reset it."]);
+  }
+  $("model-facts").innerHTML = avg.length
+    ? avg.map(([k, v, tip]) => `<span class="mf-k" title="${esc(tip)}">${esc(k)}</span><span class="mf-v">${esc(v)}</span>`).join("")
+    : `<span class="mf-k mf-k--wide">Averages start with the first request.</span>`;
+
+  // context fill (#4636): the running request in its parts, else the last one
+  const on = !modelOp && live.queued > 0 ? "queued" : live.state;
+  renderContext(live, eng, last, on);
+
+  // parallel slot rendering
   const ctx = eng.max_context || 786432;
   const numSlots = slotList.length > 0 ? slotList.length : 1;
   const totalClusterCapacity = ctx * numSlots;
@@ -822,13 +854,6 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   } else if (last) {
     totalAggregateTokens = (last.prompt_tokens || 0) + (last.output_tokens || 0);
   }
-
-  // Circular gauge shows cluster total context fill across all parallel slots
-  const frac = totalClusterCapacity ? Math.min(1, totalAggregateTokens / totalClusterCapacity) : 0;
-  $("ctx-fill").setAttribute("stroke-dasharray", `${(235.6 * frac).toFixed(1)} 314.2`);
-  $("ctx-fill").style.opacity = 235.6 * frac >= 3 ? "1" : "0";
-  $("ctx-pct").textContent = `${Math.round(frac * 100)}%`;
-  $("ctx-sub").textContent = totalClusterCapacity ? `${kfmt(totalAggregateTokens)} / ${ctxfmt(totalClusterCapacity)}` : "–";
 
   const slotsCtxSum = $("slots-ctx-summary");
   if (slotsCtxSum) {
@@ -887,7 +912,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   const anyHit = requests.some((r) => r.hit_rate != null);
   $("req-hit").hidden = !anyHit;
   if (!requests.length) {
-    body.innerHTML = `<tr><td colspan="10" class="muted">No requests yet</td></tr>`;
+    body.innerHTML = `<tr><td colspan="${anyHit ? 9 : 8}" class="muted">No requests yet</td></tr>`;
   } else {
     const badge = {stop: ["", "Done"], length: ["", "Max tokens"], cancel: ["st-badge--queued", "Stopped"],
                    disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"],
@@ -902,22 +927,9 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
       // Reused tokens are not prefetched again. Match the Monitor's existing Prefill metric.
       const fresh = r.prompt_tokens == null ? null : Math.max(0, r.prompt_tokens - (r.reused || 0));
       const prefillRate = fresh > 0 && r.prompt_ms > 0 ? fresh / (r.prompt_ms / 1000) : null;
-      const sId = r.slot != null ? r.slot : (r.slot_id != null ? r.slot_id : null);
-      const slotAccent = sId != null ? (sId < slotAccents.length ? slotAccents[sId] : "#f59e0b") : "var(--st-accent)";
-      const slotLabel = sId != null ? `Slot ${sId}` : "Slot 0";
-      const slotPill = `<span class="st-badge" style="border-left:3px solid ${slotAccent};font-weight:600;font-size:11px;">${slotLabel}</span>`;
-      return `<tr>
-        <td>${esc(t)}</td>
-        <td><span class="st-badge ${cls}">${esc(text)}</span>${proj}</td>
-        <td>${slotPill}</td>
-        <td class="num">${fmt(r.prompt_tokens)}</td>
-        <td class="num">${fmt(r.reused)}</td>
-        <td class="num">${fmt(r.output_tokens)}</td>
-        <td class="num">${fmt(prefillRate)}</td>
-        <td class="num">${fmt(r.decode_tok_s, 1)}</td>
-        <td class="num">${hit}</td>
-        <td class="num">${fmt(r.duration_s, 1)} s</td>
-      </tr>`;
+      return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${proj}</td><td class="num">${fmt(r.prompt_tokens)}</td>
+        <td class="num">${fmt(r.reused)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(prefillRate)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
+        ${anyHit ? `<td class="num">${hit}</td>` : ""}<td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
     }).join("");
   }
   const all = $("req-all");
@@ -1981,10 +1993,17 @@ async function start() {
   if (settings.chatList) await setChatList(true, false);       // the saved-chats list is read before the first draw
   setBusy(false);
   renderChat();
-  const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)
-  if (startQuestion) history.replaceState(null, "", location.pathname + location.hash);
-  loadHealth().then(loadMcp).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
+  // /?q=... fills the question in and focuses the box; it is never sent from the address (#4221): any page can link here,
+  // and a send would go out with the API key and the MCP tools saved in this browser. The person presses Send.
+  const startQuestion = new URLSearchParams(location.search).get("q");
+  if (startQuestion) {
+    history.replaceState(null, "", location.pathname + location.hash);
+    $("input").value = startQuestion;
+    autosize();
+  }
+  loadHealth().then(loadMcp);
   showTab(location.hash.slice(1) || "chat");
+  if (startQuestion && tab === "chat") $("input").focus();
   poll();
   requestAnimationFrame(fitHeader);
 }
