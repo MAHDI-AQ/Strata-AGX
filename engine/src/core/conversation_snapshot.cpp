@@ -478,7 +478,7 @@ bool copy_residency(const QsaState& from, const QsaState& to, const ModelGeometr
     static const bool on = [] { const char* e = std::getenv("STRATA_KV_COPY_RESIDENT"); return e != nullptr && e[0] != '\0' && e[0] != '0'; }();
     const auto& mf = from.map;
     const auto& mt = to.map;
-    if (!on || from.kv_mode != 1 || to.kv_mode != 1 || from.n_slots != to.n_slots || mf.n_slots != mt.n_slots ||
+    if (!on || !from.host.present() || !to.host.present() || from.kv_mode != 1 || to.kv_mode != 1 || from.n_slots != to.n_slots || mf.n_slots != mt.n_slots ||
         mf.n_blocks != mt.n_blocks || mf.n_slots <= 0 || !mf.page_table || !mt.page_table || !mf.slot_block ||
         !mt.slot_block || !mf.slot_stamp || !mt.slot_stamp || !mf.slot_ref || !mt.slot_ref || !mf.ctl || !mt.ctl)
         return true;
@@ -564,7 +564,7 @@ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelG
         if (e != cudaSuccess) { error = std::string("conversation snapshot direct copy: ") + cudaGetErrorString(e); return false; }
     }
     bool resident = false;
-    if (!copy_residency(from, to, g, queued, resident, error)) return false;
+    if (from_token == 0 && !copy_residency(from, to, g, queued, resident, error)) return false;
     if (resident) {
         const auto status = cudaGetLastError();
         if (status == cudaSuccess) return true;
