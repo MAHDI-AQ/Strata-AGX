@@ -336,6 +336,7 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream);
 bool kv_host_lazy_enabled();
 struct SessionState;
 bool session_ensure_host(SessionState& ss, const ModelGeometry& g, int64_t upto, bool& allocated, std::string& error);
+uint64_t session_kv_host_bytes(const SessionState& ss, const ModelGeometry& g);
 
 // ================================ PER-STAGE TIMING, DEBUG ONLY ================================
 //

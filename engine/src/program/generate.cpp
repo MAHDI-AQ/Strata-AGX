@@ -7773,14 +7773,20 @@ int main(int argc, char** argv) {
             const char* re = std::getenv("STRATA_SLOT_RAM_RESERVE_GIB");
             const bool reserve_asked = re != nullptr && re[0] != '\0';   // the slots are cut only when it is given
             const double reserve_gib = reserve_asked ? std::atof(re) : 8.0;
-            const uint64_t slot_host = (uint64_t) strata::core::qsa_kv_host_bytes();
+            uint64_t slot_host = (uint64_t) strata::core::qsa_kv_host_bytes();
+            if (slot_host == 0 && strata::core::kv_host_lazy_enabled() && o.kv_resident > 0 && o.max_context > o.kv_resident) {
+                slot_host = strata::core::session_kv_host_bytes(ss, g);
+                for (const auto& st : stages) slot_host += strata::core::session_kv_host_bytes(st->ss, g);
+            }
             strata::core::detail::HostMemory hm;
             if (reserve_gib > 0.0 && slot_host > 0 && strata::core::detail::host_available_memory(hm)) {
-                // (the arena holds every expert once: each layer's blobs at that layer's size)
-                const strata::kernels::cpu::ExpertLayout& xl = strata::kernels::cpu::expert_layout();
+                // (the arena holds every expert once: each layer's blobs at that layer's size, omitted when all experts stay in VRAM)
                 uint64_t later = 0;
-                for (int64_t l = 0; l < g.n_layers; ++l)
-                    later += (uint64_t) g.n_expert * (!xl.native || (size_t) l < xl.bytes.size() ? xl.blob_bytes(l) : xl.max_blob);
+                if (!o.resident_experts_only && !strata::prefill::Prefill::resident_experts_only()) {
+                    const strata::kernels::cpu::ExpertLayout& xl = strata::kernels::cpu::expert_layout();
+                    for (int64_t l = 0; l < g.n_layers; ++l)
+                        later += (uint64_t) g.n_expert * (!xl.native || (size_t) l < xl.bytes.size() ? xl.blob_bytes(l) : xl.max_blob);
+                }
                 if (o.prompt_cache > 0 && o.conversation_cache_mib > 0) later += (uint64_t) o.conversation_cache_mib << 20;
                 const uint64_t base = (uint64_t) (reserve_gib * 1073741824.0);
                 const uint64_t avail = (uint64_t) hm.available;
@@ -16066,6 +16072,50 @@ int main(int argc, char** argv) {
             }
         }
 #endif
+#ifdef __linux__
+        static const bool drop_gguf_pagecache_on = [] {
+            const char* v = std::getenv("STRATA_DROP_GGUF_PAGECACHE");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        if (drop_gguf_pagecache_on && strata::prefill::Prefill::resident_experts_only()) {
+            uint64_t mmap_dropped_bytes = 0;
+            if (srcp == &src) {
+                mmap_dropped_bytes = src.drop_cached_pages([](int64_t, int64_t) { return false; });
+            }
+            const std::string ple_base = o.ple_gguf.empty() ? std::string() : std::filesystem::path(o.ple_gguf).filename().string();
+            std::vector<std::string> seen_ggufs;
+            size_t dropped_fds = 0;
+            uint64_t file_bytes = 0;
+            auto drop_gguf_fd = [&](const std::string& p) {
+                if (p.empty()) return;
+                if (!o.ple_gguf.empty()) {
+                    if (p == o.ple_gguf) return;
+                    if (!ple_base.empty() && std::filesystem::path(p).filename().string() == ple_base) return;
+                    std::error_code eq_ec;
+                    if (std::filesystem::equivalent(p, o.ple_gguf, eq_ec)) return;
+                }
+                std::error_code ec;
+                std::string key = std::filesystem::weakly_canonical(p, ec).string();
+                if (ec || key.empty()) key = p;
+                if (std::find(seen_ggufs.begin(), seen_ggufs.end(), key) != seen_ggufs.end()) return;
+                seen_ggufs.push_back(key);
+                const int fd = ::open(p.c_str(), O_RDONLY | O_CLOEXEC);
+                if (fd >= 0) {
+                    struct stat st{};
+                    if (::fstat(fd, &st) == 0 && st.st_size > 0) file_bytes += (uint64_t) st.st_size;
+                    if (::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) == 0) ++dropped_fds;
+                    ::close(fd);
+                }
+            };
+            for (const std::string& p : o.native_shards) drop_gguf_fd(p);
+            for (const std::string& p : o.native_dense_gguf) drop_gguf_fd(p);
+            for (const std::string& p : o.native_head_shards) drop_gguf_fd(p);
+            if (!o.embd_gguf.empty()) drop_gguf_fd(o.embd_gguf);
+            std::fprintf(stderr, "strata serve: STRATA_DROP_GGUF_PAGECACHE=1 evicted %zu non-PLE GGUF fd(s) "
+                                 "(%.2f GiB file bytes, %.2f GiB expert mmap pages)\n",
+                         dropped_fds, (double) file_bytes / 1073741824.0, (double) mmap_dropped_bytes / 1073741824.0);
+        }
+#endif
         std::printf("READY %lld stop hold holdb\n", (long long) o.max_context);   // "stop": this engine honours STOP; "hold": GEN hold=N:ID; "holdb": the --batch slots end at the hold too (BDONE hold)
         std::fflush(stdout);
         std::string line;
@@ -17937,6 +17987,19 @@ int main(int argc, char** argv) {
                             if (!sl.active) sl.cached = false;   // its pad row writes its state
                         }
                     }
+                    if (o.kv_resident > 0) {
+                        for (int t = 0; t < G.S; ++t) {
+                            if (G.pos[t] + 1 > o.kv_resident) {
+                                const int sb = pmtp ? G.rows[t] : (pick * GS + t);
+                                if (!pmtp && !bs[(size_t) sb].active) continue;
+                                if (pmtp && t > 0 && G.rows[t - 1] == sb) continue;
+                                if (!ensure_all_stages_host(sb, G.pos[t] + 1, err)) {
+                                    std::printf("ERR %s\n", err.c_str());
+                                    return false;
+                                }
+                            }
+                        }
+                    }
                     G.inflight = true;
                     G.stage = 0;
                     if (batch_telemetry_enabled) G.started = Clock::now();
@@ -19143,6 +19206,12 @@ int main(int argc, char** argv) {
                     BSlot& sl = bs[(size_t) b];
                     const bool from_ck = rd_ck != nullptr;
                     if (!pmtp_settle()) return 1;   // (what the slots' last windows queued - commits, chains - has run)
+                    if (o.kv_resident > 0 && n > o.kv_resident) {
+                        if (!ensure_all_stages_host(b, n, err)) {
+                            std::printf("ERR %s\n", err.c_str());
+                            return 1;
+                        }
+                    }
                     if (from_ck)
                         for (size_t k = 0; k < bslot_ss.size(); ++k) {
                             const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);

@@ -786,6 +786,17 @@ int64_t qsa_kv_resident_min() {
 }
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
 
+uint64_t session_kv_host_bytes(const SessionState& ss, const ModelGeometry& g) {
+    const QsaShapes s = qsa_shapes(g);
+    uint64_t total = 0;
+    for (int64_t j = 0; j < ss.qsa_alloc; ++j) {
+        const QsaState& st = ss.qsa_states[ss.qsa_ord0 + j];
+        if (st.kv_mode != 1) continue;
+        total += (uint64_t) st.n_pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
+    }
+    return total;
+}
+
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
