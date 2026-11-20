@@ -23,6 +23,12 @@ bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& 
 // No CUDA calls or destination writes. Used for whole-session prevalidation.
 bool conversation_kv_validate(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                               int64_t upto, bool include_index, std::string& error);
+// K21: no CUDA calls or destination writes. Whether a retained K/V image still holds the reusable prefix the
+// new layout's kept extent needs (every part's live size >= keep, extent-independent geometry unchanged).
+// False (with `why`) means eviction / pool reclaim / a re-carved state lost the prefix: the caller degrades to
+// a full cold re-park (unchanged_tokens = 0) instead of a fatal "missing reusable prefix".
+bool conversation_kv_prefix_reusable(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
+                                     int64_t upto, bool include_index, int64_t unchanged_tokens, std::string& why);
 bool conversation_kv_restore(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                              int64_t upto, bool include_index, std::string& error);
 // conversation_kv_save(from) + conversation_kv_restore(to) without a host image, for two states of the same layout.

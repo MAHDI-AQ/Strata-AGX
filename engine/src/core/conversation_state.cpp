@@ -648,13 +648,38 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
             captured.checkpoints.push_back(std::move(c));
         }
     const auto p2 = now();
-    const int64_t unchanged = reuse.kv.empty() ? 0 : reuse.unchanged_tokens;
+    int64_t unchanged = reuse.kv.empty() ? 0 : reuse.unchanged_tokens;
     captured.kv = std::move(reuse.kv);
     const size_t layers = owned_qsa(ss);
     captured.kv.resize(layers + (draft ? 1 : 0));
     // STRATA_PARK_VRAM_MIB: the retained layers' tokens go now (joined above, so no wait): held past the launch below,
     // their replacement would join the copy just launched
     for (auto& k : captured.kv) k.pending.reset();
+    // K21 lifecycle invalidation: a retained claim is trimmed by token prefix alone (limit_reuse / take_reuse_for);
+    // eviction / segment-pool reclaim between the caller's token-count validation and this save can leave a layer's
+    // buffers shorter than the kept extent, or change its layout.  Verify EVERY retained layer (and the draft) here,
+    // before any incremental copy, and degrade the WHOLE park to a cold re-park (unchanged = 0) on any loss, with one
+    // concise line.  A stale/evicted/shrunk prefix thus never masquerades as valid storage in conversation_kv_save.
+    if (unchanged > 0) {
+        const int64_t upto_chk = (int64_t) view.ids.size();
+        for (size_t j = 0; j < layers; ++j) {
+            std::string why;
+            if (!conversation_kv_prefix_reusable(captured.kv[j], owned(ss, j), g, upto_chk, true, unchanged, why)) {
+                unchanged = 0;
+                std::fprintf(stderr, "strata park: retained K/V prefix lost at layer %zu (%s); cold re-park\n",
+                             j, why.c_str());
+                break;
+            }
+        }
+        if (draft && unchanged > 0) {
+            std::string why;
+            if (!conversation_kv_prefix_reusable(captured.kv.back(), *draft, g, upto_chk, false,
+                                                 std::max<int64_t>(0, unchanged - 1), why)) {
+                unchanged = 0;
+                std::fprintf(stderr, "strata park: retained draft K/V prefix lost (%s); cold re-park\n", why.c_str());
+            }
+        }
+    }
     bool live_staged = false;
     const bool live_saved = checkpoint_save(captured.live, ss, g, error, live_staged);
     // STRATA_CKPT_ASYNC: the running state lands in live.gdn after the save returns; the image waits for that copy

@@ -869,5 +869,88 @@ int main() {
             check(refused > 0 && evicted_any > 0 && pool.shrinks > 0, "the workload refused, evicted and trimmed the pool at least once");
         }
     }
+    {
+        // K21: the eviction-park crash regression ("conversation snapshot: missing reusable prefix").  An
+        // incremental park (unchanged_tokens > 0) against a retained ConversationBuffer that eviction / pool
+        // reclaim truncated or emptied must degrade to a cold re-park (conversation_kv_prefix_holds == false),
+        // never a fatal error.  An intact retained prefix stays reusable and bit-exact.  The predicate is the
+        // pure-CPU decision conversation_kv_save and conversation_snapshot_save act on; the full device copy is
+        // exercised by the GPU parity batteries (Task 4).
+        auto layer = [](int64_t cells, int format, int64_t page, int heads, int hdim, int idx_dim, size_t per_cell) {
+            ConversationKv k;
+            k.format = format; k.cells = cells; k.page_size = page;
+            k.heads = heads; k.head_dim = hdim; k.idx_dim = idx_dim; k.pooled_rows = 0;
+            k.k.resize(size_t(cells) * per_cell, 0xAB);
+            k.v.resize(size_t(cells) * per_cell, 0xCD);
+            return k;
+        };
+        // new layout: 64 cells, page 16, unchanged 32 -> whole_cells 32; 8 bytes/cell -> keep = (512/64)*32 = 256
+        ConversationKvPrefixLayout nl;
+        nl.cells = 64; nl.whole_cells = 32; nl.page_size = 16; nl.idx_block = 16;
+        nl.format = 1; nl.heads = 4; nl.head_dim = 8; nl.idx_dim = 8; nl.index = false; nl.unchanged_tokens = 32;
+        nl.sizes = {64 * 8, 64 * 8, 0, 0, 0};
+        std::string why;
+        // intact retained buffer (captured at 48 cells = 384 bytes >= keep 256): reusable, prefix untouched
+        ConversationKv good = layer(48, 1, 16, 4, 8, 8, 8);
+        check(conversation_kv_prefix_holds(good, nl, why), "intact retained prefix is reusable (cells may differ)");
+        const size_t good_k = good.k.size();
+        // truncated retained buffer (a reclaim shrank it below keep): degrade, not fatal
+        ConversationKv trunc = layer(48, 1, 16, 4, 8, 8, 8);
+        trunc.k.resize(100);   // < keep 256
+        check(!conversation_kv_prefix_holds(trunc, nl, why), "truncated retained prefix degrades to cold re-park");
+        check(!why.empty(), "the degradation names a reason");
+        // emptied retained buffer: degrade
+        ConversationKv empty = layer(48, 1, 16, 4, 8, 8, 8);
+        empty.k.resize(0); empty.v.resize(0);
+        check(!conversation_kv_prefix_holds(empty, nl, why), "emptied retained prefix degrades to cold re-park");
+        // a changed K/V format/mode: degrade even when the buffers are large
+        ConversationKv fmt = layer(48, 2, 16, 4, 8, 8, 8);   // format 2 != nl.format 1
+        check(!conversation_kv_prefix_holds(fmt, nl, why), "a changed K/V format degrades to cold re-park");
+        ConversationKv pg = layer(48, 1, 32, 4, 8, 8, 8);    // page_size 32 != nl.page_size 16
+        check(!conversation_kv_prefix_holds(pg, nl, why), "a changed page size degrades to cold re-park");
+        // unchanged_tokens == 0 (a cold park): always reusable, whatever the buffers hold
+        ConversationKvPrefixLayout cold = nl; cold.unchanged_tokens = 0; cold.whole_cells = 0;
+        check(conversation_kv_prefix_holds(empty, cold, why), "a cold park keeps nothing and is always reusable");
+        // bit-exact: the predicate only reads; the intact prefix bytes and size are unchanged
+        check(good.k.size() == good_k, "the reusability check does not mutate the retained buffer");
+        bool prefix_intact = true;
+        good.k.visit(0, good.k.size(), [&](const uint8_t* p, size_t n, size_t) {
+            for (size_t i = 0; i < n; ++i) if (p[i] != 0xAB) prefix_intact = false;
+            return true;
+        });
+        check(prefix_intact, "the retained prefix bytes stay bit-exact through the check");
+        // the indexer's pooled part (i == 4): keep = (unchanged/idx_block)*idx_dim*4 = (32/16)*8*4 = 64
+        ConversationKvPrefixLayout pi = nl; pi.index = true; pi.sizes = {64 * 8, 64 * 8, 0, 0, 128};
+        ConversationKv pooled_ok = layer(48, 1, 16, 4, 8, 8, 8);
+        pooled_ok.pooled.resize(128, 0x11);
+        check(conversation_kv_prefix_holds(pooled_ok, pi, why), "an intact pooled indexer prefix is reusable");
+        pooled_ok.pooled.resize(32);   // < keep 64
+        check(!conversation_kv_prefix_holds(pooled_ok, pi, why), "a truncated pooled indexer prefix degrades");
+
+        // eviction-pressure rotation through the cache: retain K/V, park conversations until the slot cap evicts,
+        // take the reuse claim, then truncate its backing buffer as a reclaim would: the predicate catches the loss.
+        ConversationCache cache(1 << 20, 2);
+        std::vector<ConversationKv> kv(1);
+        kv[0] = layer(48, 1, 16, 4, 8, 8, 8);
+        const std::vector<int32_t> ids = {1, 2, 3, 4, 5, 6, 7, 8};
+        cache.retain(std::move(kv), 8, {}, ids);
+        check(cache.put(image({9, 9, 9})) && cache.put(image({8, 8, 8})), "park two conversations beside the retained K/V");
+        check(cache.put(image({7, 7, 7})) && cache.evictions() >= 1, "the slot cap evicts under pressure");
+        auto reuse = cache.take_reuse_for(ids);
+        check(!reuse.kv.empty() && reuse.unchanged_tokens == 8, "the retained claim survives slot-cap eviction");
+        ConversationKvPrefixLayout rl = nl;   // unchanged 32 -> keep 256, as above
+        reuse.kv[0].k.resize(64);             // a reclaim truncated it below keep 256
+        check(!conversation_kv_prefix_holds(reuse.kv[0], rl, why),
+              "after eviction-pressure rotation a truncated retained buffer degrades, never fatal");
+        // and the same claim with its buffer intact is still reusable (no spurious degradation from eviction alone)
+        ConversationCache cache2(1 << 20, 2);
+        std::vector<ConversationKv> kv2(1);
+        kv2[0] = layer(48, 1, 16, 4, 8, 8, 8);
+        cache2.retain(std::move(kv2), 8, {}, ids);
+        cache2.put(image({9, 9, 9})); cache2.put(image({8, 8, 8})); cache2.put(image({7, 7, 7}));
+        auto reuse2 = cache2.take_reuse_for(ids);
+        check(!reuse2.kv.empty() && conversation_kv_prefix_holds(reuse2.kv[0], rl, why),
+              "eviction alone does not degrade an intact retained prefix (reuse preserved)");
+    }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }

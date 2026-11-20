@@ -316,7 +316,30 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         error = "conversation snapshot: invalid unchanged prefix";
         return false;
     }
-    const int64_t whole_cells = (unchanged_tokens / l.page_size) * l.page_size;
+    int64_t whole_cells = (unchanged_tokens / l.page_size) * l.page_size;
+    // K21 defense-in-depth: a retained prefix lost to eviction / segment-pool reclaim / a re-carved state is a
+    // cache miss, not a fatal error.  Validate EVERY part (and the retained geometry, still the captured one here)
+    // before the metadata overwrite and the copy loop; the per-part guard below would otherwise return false and
+    // the serve loop exit(1) on "missing reusable prefix".  On any loss degrade this layer to a full cold re-park
+    // (unchanged_tokens = 0).  One concise line, rate-limited across layers and parks (no per-layer spam).  The
+    // healthy retained path is unchanged: the predicate returns true and the copy proceeds byte-identically.
+    if (unchanged_tokens > 0) {
+        ConversationKvPrefixLayout nl;
+        nl.sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+        nl.cells = l.cells; nl.whole_cells = whole_cells; nl.page_size = l.page_size;
+        nl.idx_block = strata::kernels::qsa_real_shapes().idx_block;
+        nl.format = l.format; nl.heads = g.n_head_kv; nl.head_dim = g.head_dim; nl.idx_dim = g.idx_key_dim;
+        nl.index = index; nl.unchanged_tokens = unchanged_tokens;
+        std::string why;
+        if (!conversation_kv_prefix_holds(image, nl, why)) {
+            unchanged_tokens = 0; whole_cells = 0;
+            static std::atomic<uint64_t> cold_falls{0};
+            const uint64_t n = cold_falls.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n == 1 || (n & (n - 1)) == 0)
+                std::fprintf(stderr, "strata park: retained K/V prefix lost (%s); cold re-park [%llu]\n",
+                             why.c_str(), (unsigned long long) n);
+        }
+    }
     image.format = l.format;
     image.cells = l.cells;
     image.heads = g.n_head_kv;
@@ -419,6 +442,24 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, c
     for (size_t i = 0; i < src.size(); ++i)
         if (sizes[i] && !dst[i]) { error = "conversation snapshot: missing target state buffer"; return false; }
     return true;
+}
+
+// K21: whole-session prevalidation of a retained K/V prefix before incremental reuse.  Computes the new layout
+// (no CUDA, no destination write, like conversation_kv_validate) and delegates to the header-only predicate.
+// False (with `why`) when a layer's retained buffers no longer hold the kept extent or the layout/mode changed:
+// the caller degrades the whole park to a cold re-park (unchanged_tokens = 0) rather than failing fatally.
+bool conversation_kv_prefix_reusable(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
+                                     int64_t upto, bool index, int64_t unchanged_tokens, std::string& why) {
+    if (unchanged_tokens <= 0) return true;
+    Layout l{};
+    if (!layout(st, g, upto, index, l, why)) return false;
+    ConversationKvPrefixLayout nl;
+    nl.sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    nl.cells = l.cells; nl.whole_cells = (unchanged_tokens / l.page_size) * l.page_size; nl.page_size = l.page_size;
+    nl.idx_block = strata::kernels::qsa_real_shapes().idx_block;
+    nl.format = l.format; nl.heads = g.n_head_kv; nl.head_dim = g.head_dim; nl.idx_dim = g.idx_key_dim;
+    nl.index = index; nl.unchanged_tokens = unchanged_tokens;
+    return conversation_kv_prefix_holds(image, nl, why);
 }
 
 namespace {

@@ -11,6 +11,7 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -132,6 +133,46 @@ struct ConversationKvReuse {
         return n;
     }
 };
+
+// K21 (eviction-park crash): the new layout's kept-extent figures a retained K/V prefix is checked against.
+// Filled by the caller from the layout it is about to save (conversation_kv_save) or from a fresh layout
+// computation (conversation_kv_prefix_reusable); the predicate itself does no CUDA and reads no device pool.
+struct ConversationKvPrefixLayout {
+    std::array<size_t, 5> sizes{};   // the new layout's k, v, k_scale, v_scale, pooled bytes
+    int64_t cells = 0, whole_cells = 0, page_size = 0, idx_block = 0;
+    int format = 0, heads = 0, head_dim = 0, idx_dim = 0;
+    bool index = false;
+    int64_t unchanged_tokens = 0;
+};
+
+// Whether a retained K/V image still holds the reusable prefix the new layout's kept extent would skip
+// recopying.  A retained claim is trimmed by token prefix alone (limit_reuse / take_reuse_for); eviction,
+// segment-pool reclaim or a re-carved state can leave a part shorter than that extent, or change the layout,
+// AFTER the caller's token-count validation.  False (with `why`) means the prefix is lost: the caller degrades
+// to a full cold re-park (unchanged_tokens = 0) instead of failing fatally with "missing reusable prefix".
+// Only extent-INDEPENDENT geometry is compared (format / page_size / heads / head_dim / idx_dim): cells and
+// pooled_rows grow with the conversation and are not a mismatch.  Pure CPU; never mutates the image.
+inline bool conversation_kv_prefix_holds(const ConversationKv& image, const ConversationKvPrefixLayout& nl,
+                                         std::string& why) {
+    if (nl.unchanged_tokens <= 0) return true;   // a cold park keeps nothing: always reusable
+    if (image.format != nl.format || image.page_size != nl.page_size || image.heads != nl.heads ||
+        image.head_dim != nl.head_dim || image.idx_dim != nl.idx_dim) {
+        why = "retained K/V layout/mode changed";
+        return false;
+    }
+    const std::array<const ConversationBuffer*, 5> dst = {
+        &image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
+    for (size_t i = 0; i < dst.size(); ++i) {
+        const size_t keep = i == 4
+            ? (nl.index && nl.idx_block > 0 ? size_t(nl.unchanged_tokens / nl.idx_block) * size_t(nl.idx_dim) * 4 : 0)
+            : (nl.cells ? (nl.sizes[i] / size_t(nl.cells)) * size_t(nl.whole_cells) : 0);
+        if (keep > dst[i]->size()) {
+            why = "retained K/V part " + std::to_string(i) + " shorter than the kept prefix";
+            return false;
+        }
+    }
+    return true;
+}
 
 /// Layer-split parking: each running checkpoint holds the first stage's state and, in `stage_parts`, one part per
 /// later stage; a parked conversation keeps them in one image per stage.  `split` MOVES the checkpoints apart (no
