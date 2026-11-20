@@ -5993,7 +5993,10 @@ class Service:
                             src = fetched[item["source"]] = Vision.download(src)   # outside the FIFO, as in prepare()
                         with self._turn(cancel):  # the encoder takes its turn with the requests (see below)
                             self._vision_up()         # an elastic encoder is not running until a picture needs it
-                            self.vision.encode(src)
+                            try:
+                                self.vision.encode(src)
+                            finally:
+                                self.last_image_at = time.time()   # K21 4A: a tool image keeps the elastic encoder warm, as a user image does
                     except (ValueError, OSError, RuntimeError) as e:    # RuntimeError: the encoder did not start
                         why = str(e)
                 if why is not None:
@@ -9350,6 +9353,23 @@ def vision_on_demand_by_default(cfg: dict) -> bool:
     return name in (vision_reader.CPU_READER, vision_reader.CPU_READER + ".exe")
 
 
+def apply_vision_lazy_env(cfg: dict) -> dict:
+    """K21 Lever 4A (opt-in, default OFF): STRATA_VISION_LAZY=1 makes the image reader elastic with a long idle
+    (STRATA_VISION_IDLE_S, default 300 s) so a tool-image turn does not unload it on the next idle poll.  Unset or
+    anything but "1": cfg is returned untouched (the same object), so the default path stays byte-identical.  Runs
+    outside apply_vision_defaults so the chosen idle is the final word; the platform elastic/reserve defaults still
+    apply underneath it."""
+    if os.environ.get("STRATA_VISION_LAZY") != "1":
+        return cfg
+    try:
+        idle = float(os.environ.get("STRATA_VISION_IDLE_S", "300.0"))
+    except (TypeError, ValueError):
+        idle = 300.0
+    v = cfg.get("vision") or {}
+    cfg["vision"] = {**v, "elastic": True, "elastic_idle_s": idle}
+    return cfg
+
+
 def apply_vision_defaults(cfg: dict) -> dict:
     """cfg with the on-demand reader switched on (vision.elastic) where vision_on_demand_by_default says so; the same dict.
     NVIDIA (owner 11-11, "picture reader loaded on demand with no memory reserve": Ok): no room is held back for the reader before the first
@@ -9670,7 +9690,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     if a.engine == "strata":
         if not cfg:
             ap.error("--engine strata needs --config")
-        cfg = apply_vision_defaults(with_component_engine(cfg))
+        cfg = apply_vision_lazy_env(apply_vision_defaults(with_component_engine(cfg)))
         vision = None
         # The engine's own environment. It carries the offline policy too: an engine that fetched a
         # missing shard or a plugin would break the promise the flag makes.
