@@ -10,7 +10,7 @@ debugging and are kept in `terminal/data/settings-register.json`.
 A number or a word is set like any environment variable, for example `STRATA_KVA=1`. In the Terminal, `strata launch --set NAME=value`
 puts it in the model's run configuration.
 
-## Switches you can turn on (355)
+## Switches you can turn on (358)
 
 Off unless you set them. The last column says where each one is described.
 
@@ -146,6 +146,9 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_KV_GROW_HOLD` | number | NVIDIA and AMD | - |
 | `STRATA_KV_HOST_LAZY` | number | NVIDIA and AMD | - |
 | `STRATA_KV_HOST_REGISTER` | on / off | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
+| `STRATA_KV_HOST_TRIM_IDLE` | on / off | NVIDIA and AMD | - |
+| `STRATA_KV_HOST_TRIM_IDLE_S` | number | NVIDIA and AMD | - |
+| `STRATA_KV_HOST_TRIM_MAIN` | on / off | NVIDIA and AMD | - |
 | `STRATA_KV_PARTIAL_INVALIDATE` | number | NVIDIA and AMD | - |
 | `STRATA_KV_PREFETCH` | number | NVIDIA and AMD, Intel Arc | [KV_PREFETCH.md](KV_PREFETCH.md), [README.md](bench-results/README.md), [README.md](bench-results/2026-10-06-community-rtx4090-opt-ins/README.md) |
 | `STRATA_KV_RESOLVE_BATCH` | number | NVIDIA and AMD | - |
@@ -464,3 +467,13 @@ version made it the default.
 | `STRATA_UMA_PIN_CAP` | on / off | AMD | - | [BATCHING.md](BATCHING.md) |
 | `STRATA_UMA_RESERVE_GIB` | on / off | NVIDIA and AMD | - | [release-notes-0.2.2.md](release-notes-0.2.2.md), [STRIX_HALO.md](STRIX_HALO.md) |
 | `STRATA_XN_F16` | on / off | NVIDIA and AMD | - | [DETAILS.md](DETAILS.md) |
+
+## Serve-side image reader switches (Terminal)
+
+These two are read by the Terminal's serve loop (`terminal/serve/server.py`), not the C++ engine, so they are not in the
+engine settings register above. They are off unless set; with them unset the image reader behaves exactly as before.
+
+| Setting | Value | Default | Effect |
+|---|---|---|---|
+| `STRATA_VISION_LAZY` | on / off | off | `1` makes the image reader elastic: it starts with the first picture and stops after an idle window, instead of staying resident. |
+| `STRATA_VISION_IDLE_S` | number | `300` | With `STRATA_VISION_LAZY=1`, the idle seconds before the elastic image reader stops. A tool-image turn refreshes the idle clock just as a user-image turn does, so a tool picture no longer unloads the reader on the next idle poll. |

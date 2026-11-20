@@ -13423,6 +13423,43 @@ int main(int argc, char** argv) {
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
             (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens);
+        // K21 4C-i: evict parked conversations down to the RAM floor (+ extra_bytes a pin is about to charge),
+        // reusing the checkpoint path's floor logic (release_free_heap, then evict_oldest while available < floor).
+        // Gated behind STRATA_CONV_CACHE_MEM_FLOOR; a no-op when off, so the default path is unchanged.  Called before
+        // a lazy host pin (ensure_ss_host / ensure_all_stages_host) only when session_needs_host says a pin is due.
+        auto conv_floor_evict = [&](uint64_t extra_bytes = 0) {
+            static const bool conv_mem_floor = [] {
+                const char* v = std::getenv("STRATA_CONV_CACHE_MEM_FLOOR");
+                return v != nullptr && v[0] == '1' && v[1] == '\0';
+            }();
+            if (!conv_mem_floor || o.conversation_cache_min_free_mib <= 0) return;
+            const uint64_t floor_bytes = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024 + extra_bytes;
+            auto mem = strata::core::sample_host_memory();
+            if (mem && mem->available < floor_bytes) {
+                (void) strata::core::release_free_heap();
+                mem = strata::core::sample_host_memory();
+                size_t ev = 0;
+                while (mem && mem->available < floor_bytes && conversations.size() > 0 &&
+                       ev < conversations.slots() && conversations.evict_oldest()) {
+                    ++ev;
+                    mem = strata::core::sample_host_memory();
+                }
+            }
+        };
+        // K21 4C-ii / 4B-lite opt-in switches (default OFF: unset / 0 keeps the host K/V resident exactly as before).
+        static const bool kv_host_trim_idle_on = [] {
+            const char* v = std::getenv("STRATA_KV_HOST_TRIM_IDLE");
+            return v != nullptr && v[0] == '1' && v[1] == '\0';
+        }();
+        static const double kv_host_trim_idle_s = [] {
+            const char* v = std::getenv("STRATA_KV_HOST_TRIM_IDLE_S");
+            const double s = v != nullptr ? std::atof(v) : 120.0;
+            return s > 0.0 ? s : 120.0;
+        }();
+        static const bool kv_host_trim_main_on = [] {
+            const char* v = std::getenv("STRATA_KV_HOST_TRIM_MAIN");
+            return v != nullptr && v[0] == '1' && v[1] == '\0';
+        }();
         // The park pools (park_pool_policy.hpp): memory held idle between parks so a park does not pay the first touch of fresh pages.
         //   * the segment pool: one arena for the K/V buffers of parked conversations (STRATA_PARK_SEGPOOL_MIB=N sets its size, 0 turns it
         //     off; unset: min(2 GiB, a quarter of the cache); Linux only, the OS layer of Windows and macOS is not written yet: inert there);
@@ -16606,6 +16643,8 @@ int main(int argc, char** argv) {
         };
         auto ensure_ss_host = [&](strata::core::SessionState& sref, int64_t upto, std::string& e) -> bool {
             if (!strata::core::kv_host_lazy_enabled()) return true;
+            uint64_t pin_bytes = 0;   // K21 4C-i: make room for the pin before it is charged (no-op unless the floor is on)
+            if (strata::core::session_needs_host(sref, g, upto, &pin_bytes)) conv_floor_evict(pin_bytes);
             bool alloc = false;
             if (!strata::core::session_ensure_host(sref, g, upto, alloc, e)) return false;
             if (alloc) invalidate_all_graphs();
@@ -16616,10 +16655,29 @@ int main(int argc, char** argv) {
             bool alloc = false;
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 strata::core::SessionState& sref = b >= 0 ? *bslot_ss[k][(size_t) b] : (k == 0 ? ss : stages[k - 1]->ss);
+                uint64_t pin_bytes = 0;   // K21 4C-i: per stage, make room before the pin
+                if (strata::core::session_needs_host(sref, g, upto, &pin_bytes)) conv_floor_evict(pin_bytes);
                 if (!strata::core::session_ensure_host(sref, g, upto, alloc, e)) return false;
             }
             if (alloc) invalidate_all_graphs();
             return true;
+        };
+        // K21 4C-ii / 4B-lite: give back the host K/V of every stage session of slot b (b = -1: the main session and
+        // its stages), then invalidate the captured graphs — they bake the host pointers, so a release without this
+        // would replay a graph reading freed pages.  The caller guarantees the slot is dead (!active && !cached, no
+        // async park/ckpt in flight, not a reuse source) or, for main, !live_ok.  The VRAM pools are never touched.
+        auto release_all_stages_host = [&](int b) -> bool {
+            bool any = false, ok = true;
+            std::string e;
+            for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                strata::core::SessionState& sref = b >= 0 ? *bslot_ss[k][(size_t) b] : (k == 0 ? ss : stages[k - 1]->ss);
+                bool freed = false;
+                if (!strata::core::session_release_host(sref, g, e, freed)) { ok = false; break; }
+                any = any || freed;
+            }
+            if (any) invalidate_all_graphs();   // MANDATORY after a host release
+            if (!ok) std::fprintf(stderr, "strata serve: host-KV trim: %s\n", e.c_str());
+            return ok;
         };
         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e, int64_t from_token = 0) -> bool {
             const int64_t upto = (int64_t) ids.size();
@@ -16689,6 +16747,19 @@ int main(int argc, char** argv) {
                         return false;
                 }
                 slot_mtp[(size_t) b]->set_prompt_len(upto);
+            }
+            // K21 4B-lite (opt-in STRATA_KV_HOST_TRIM_MAIN, default OFF): after a streaming copy into the slot, give
+            // the main session's host K/V back and invalidate the main live state, so the next turn restores from the
+            // slot / conv cache rather than continuing from main (in_main becomes false; a slot overwrite then parks
+            // into the conv cache).  release_all_stages_host(-1) invalidates the captured graphs too.  Default OFF
+            // leaves the main session resident exactly as before.
+            if (kv_host_trim_main_on && upto > o.kv_resident) {
+                release_all_stages_host(-1);
+                live_ok = false;
+                live.clear();
+                live_imgs.clear();
+                checks.clear();          // the main checkpoints described the trimmed state
+                cvec_cached = true;      // reset to the default control-vector state
             }
             return true;
         };
@@ -18164,13 +18235,34 @@ int main(int argc, char** argv) {
                 if (!pump(false)) return false;
             return pmtp_settle();
         };
+        // K21 4C-ii: idle host-KV trim bookkeeping — the last activity (a request in flight or a line consumed) and
+        // whether this idle period's trim already ran.  Reset on activity; the trim fires once per idle period.
+        Clock::time_point kv_trim_last_active = Clock::now();
+        bool kv_trim_done = false;
         for (;;) {
             line_drain_ms = 0.0;
             strata::core::manifest::instance().flush_if_dirty("request");   // STRATA_MANIFEST: what the last request added (a no-op when off)
             // Between requests (nothing in flight): the park pools' upkeep, which the park and the prompt read leave alone
-            if (!batch_on() && !(piped && pipe_inflight()) && !strata::core::progress().busy.load()) {
+            const bool kv_idle_now = !batch_on() && !(piped && pipe_inflight()) && !strata::core::progress().busy.load();
+            if (!kv_idle_now) { kv_trim_last_active = Clock::now(); kv_trim_done = false; }   // K21: activity resets the idle trim
+            if (kv_idle_now) {
                 pool_topup();
                 segpool_kick();
+                // K21 4C-ii: once per idle period, after STRATA_KV_HOST_TRIM_IDLE_S without a request, give back the
+                // host K/V of dead slots (!active && !cached && !partial; when idle no request references a slot as a
+                // reuse source) and of the main session only when !live_ok.  Never mid-burst: this runs only with
+                // nothing in flight.  ckpt_threads.run is synchronous and conversation_park_join lands the last park.
+                if (kv_host_trim_idle_on && !kv_trim_done &&
+                    std::chrono::duration<double>(Clock::now() - kv_trim_last_active).count() >= kv_host_trim_idle_s) {
+                    kv_trim_done = true;
+                    strata::core::conversation_park_join();
+                    for (size_t b = 0; b < bs.size(); ++b) {
+                        const BSlot& sl = bs[b];
+                        if (sl.active || sl.cached || sl.partial) continue;
+                        release_all_stages_host((int) b);
+                    }
+                    if (!live_ok) release_all_stages_host(-1);
+                }
             }
             if (batch_on() || (piped && pipe_inflight())) {
                 if (!try_next_line(line)) {
@@ -18196,9 +18288,21 @@ int main(int argc, char** argv) {
                         std::fflush(stderr);
                     }
                 }
-            } else if (!next_line(line)) {
-                break;
+            } else {
+                // K21 4C-ii: when the idle host-KV trim is on, wake periodically while idle so the trim runs during
+                // the idle window (not only when the next request arrives); the default blocking wait is unchanged.
+                if (kv_host_trim_idle_on) {
+                    std::unique_lock<std::mutex> lk(in_mu);
+                    const double wake_s = std::min(30.0, std::max(1.0, kv_host_trim_idle_s / 4.0));
+                    in_cv.wait_for(lk, std::chrono::duration<double>(wake_s),
+                                   [&] { return !in_lines.empty() || in_eof; });
+                    const bool timed_out = in_lines.empty() && !in_eof;
+                    lk.unlock();
+                    if (timed_out) continue;   // re-run the idle upkeep (and the trim when due)
+                }
+                if (!next_line(line)) break;
             }
+            kv_trim_last_active = Clock::now(); kv_trim_done = false;   // K21: a request line arrived — activity
             // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
             // request's prompt and first token as a GEN 1, then continues it in that slot
             if (line.rfind("BSTOP ", 0) == 0) {

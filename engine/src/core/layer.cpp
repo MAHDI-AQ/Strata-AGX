@@ -46,6 +46,7 @@
 #ifndef _WIN32
 #include <sys/mman.h>
 #endif
+#include <atomic>
 #include <memory>
 #include <vector>
 namespace strata::core {
@@ -573,7 +574,9 @@ struct Cursor {    uint8_t* p;    uint64_t used = 0;    template <typename T>   
 namespace {
 // KV streaming (docs/kv-streaming-design.md): 0 keeps every cell in VRAM.
 int64_t g_kv_resident = 0;
-uint64_t g_kv_host_bytes = 0;
+// K21: guarded — the idle host-KV trim (session_release_host) decrements it from the serve loop while a pin
+// (session_ensure_host / qsa_state_init) may charge it; an atomic keeps the running total exact across them.
+std::atomic<uint64_t> g_kv_host_bytes{0};
 
 // The KV host copy: pinned and device-mapped. cudaHostAlloc is the default, but under WSL2 the driver caps what
 // cudaHostAlloc(Mapped) may pin at about 1 GiB in all, while cudaHostRegister of ordinary memory is not capped there:
@@ -583,7 +586,8 @@ uint64_t g_kv_host_bytes = 0;
 // staging buffers. Elsewhere cudaHostAlloc stays first. Either way the other method is the fallback when the first
 // is refused. STRATA_KV_HOST_REGISTER=1/0 forces registering first or cudaHostAlloc first. Like the cudaHostAlloc
 // copy it lives as long as the process.
-uint8_t* kv_host_alloc(uint64_t bytes) {
+uint8_t* kv_host_alloc(uint64_t bytes, bool& registered) {
+    registered = false;   // K21: cudaHostAlloc path; register_anon sets true (cudaHostRegister over an mmap)
     auto host_alloc = [](uint64_t n) -> uint8_t* {
         uint8_t* h = nullptr;
         if (strata::core::host_alloc_guarded((void**) &h, n, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess) return h;
@@ -598,7 +602,7 @@ uint8_t* kv_host_alloc(uint64_t bytes) {
         if (e != nullptr && (e[0] == '0' || e[0] == '1')) return e[0] == '1';
         return std::filesystem::exists("/dev/dxg");
     }();
-    auto register_anon = [](uint64_t n) -> uint8_t* {
+    auto register_anon = [&](uint64_t n) -> uint8_t* {
         void* m = mmap(nullptr, (size_t) n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (m == MAP_FAILED) return nullptr;
         if (cudaHostRegister(m, (size_t) n, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
@@ -611,6 +615,7 @@ uint8_t* kv_host_alloc(uint64_t bytes) {
             std::fprintf(stderr, "strata: KV streaming: the host copy is pinned with cudaHostRegister\n");
             said = true;
         }
+        registered = true;
         return (uint8_t*) m;
     };
     if (register_first) {
@@ -784,7 +789,7 @@ int64_t qsa_kv_resident_min() {
     }();
     return v;
 }
-uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
+uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes.load(); }
 
 uint64_t session_kv_host_bytes(const SessionState& ss, const ModelGeometry& g) {
     const QsaShapes s = qsa_shapes(g);
@@ -947,16 +952,18 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         const uint64_t bytes = (uint64_t) pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
         uint8_t* h = nullptr;
         uint8_t* d = nullptr;
-        if ((h = kv_host_alloc(bytes)) == nullptr ||
+        bool reg = false;
+        if ((h = kv_host_alloc(bytes, reg)) == nullptr ||
             cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
             // both cudaHostRegister and cudaHostAlloc were refused (kv_host_alloc): usually not enough free RAM
             if (p.mode == 1) std::fprintf(stderr, "strata: KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
                                  "(%.2f GiB pinned so far): RAM or the driver refused to pin it - lower the context, "
                                  "or run without --kv-resident\n", (double) bytes / 1073741824.0,
-                                 (double) g_kv_host_bytes / 1073741824.0);
+                                 (double) g_kv_host_bytes.load() / 1073741824.0);
             return 0;
         }
-        g_kv_host_bytes += bytes;
+        g_kv_host_bytes.fetch_add(bytes);
+        st.host_base = h; st.host_bytes = bytes; st.host_registered = reg;   // K21: tracked for the idle trim
         Cursor hc{d};
         if (st.kv_hybrid) {
             st.host.k_q = hc.take<int8_t>(hrows * s.head_dim);
@@ -1095,13 +1102,15 @@ bool session_ensure_host(SessionState& ss, const ModelGeometry& g, int64_t upto,
         const uint64_t bytes = (uint64_t) pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
         uint8_t* h = nullptr;
         uint8_t* d = nullptr;
-        if ((h = kv_host_alloc(bytes)) == nullptr ||
+        bool reg = false;
+        if ((h = kv_host_alloc(bytes, reg)) == nullptr ||
             cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
             cudaStreamDestroy(cs);
             error = "session_ensure_host: cannot pin RAM for lazy KV host copy";
             return false;
         }
-        g_kv_host_bytes += bytes;
+        g_kv_host_bytes.fetch_add(bytes);
+        st.host_base = h; st.host_bytes = bytes; st.host_registered = reg;   // K21: tracked for the idle trim
         Cursor hc{d};
         if (st.kv_hybrid) {
             st.host.k_q = hc.take<int8_t>(hrows * s.head_dim);
@@ -1130,6 +1139,71 @@ bool session_ensure_host(SessionState& ss, const ModelGeometry& g, int64_t upto,
             return false;
         }
         allocated = true;
+    }
+    return true;
+}
+
+// K21 4C-i: pure sizing — does any owned streamed layer still lack its host copy at `upto`, and what would the
+// pin charge (the same pages * kv_block_bytes + 1 KiB figure session_ensure_host uses)?  No allocation, no CUDA.
+bool session_needs_host(const SessionState& ss, const ModelGeometry& g, int64_t upto, uint64_t* pin_bytes_out) {
+    if (pin_bytes_out) *pin_bytes_out = 0;
+    if (upto <= 0) return false;
+    const QsaShapes s = qsa_shapes(g);
+    bool needs = false;
+    uint64_t total = 0;
+    for (int64_t j = 0; j < ss.qsa_alloc; ++j) {
+        const QsaState& st = ss.qsa_states[ss.qsa_ord0 + j];
+        if (st.kv_mode != 1 || st.host.present()) continue;
+        needs = true;
+        total += (uint64_t) st.n_pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
+    }
+    if (pin_bytes_out) *pin_bytes_out = total;
+    return needs;
+}
+
+// K21 4C-ii: give back the host K/V copy of every owned streamed layer.  The VRAM pools are NEVER touched.  The
+// caller guarantees no live conversation is held (an idle dead slot, or main only when !live_ok).  Each distinct
+// target device is synchronized first (the DevGuard pattern of session_ensure_host; cudaDeviceSynchronize drains
+// every stream on the device, the conversation copy stream included), the stream map is reset to identity, the
+// host pools dropped, and the host allocation freed (cudaHostUnregister + munmap when registered, else
+// cudaFreeHost), decrementing g_kv_host_bytes.  Idempotent: a layer with no host copy is skipped.  A later
+// session_ensure_host backfills the resident blocks bit-exact.
+bool session_release_host(SessionState& ss, const ModelGeometry& g, std::string& error, bool& freed) {
+    freed = false;
+    uint64_t synced_dev_mask = 0;
+    for (int64_t j = 0; j < ss.qsa_alloc; ++j) {
+        QsaState& st = ss.qsa_states[ss.qsa_ord0 + j];
+        if (st.kv_mode != 1 || !st.host.present()) continue;
+        int prev_dev = 0;
+        (void) cudaGetDevice(&prev_dev);
+        cudaPointerAttributes pattr{};
+        const int target_dev = (st.page_table && cudaPointerGetAttributes(&pattr, st.page_table) == cudaSuccess) ? pattr.device : prev_dev;
+        if (target_dev >= 0 && target_dev != prev_dev) (void) cudaSetDevice(target_dev);
+        struct DevGuard { int prev; int cur; ~DevGuard() { if (cur >= 0 && cur != prev) (void) cudaSetDevice(prev); } } dev_guard{prev_dev, target_dev};
+        const int dev_bit = (target_dev >= 0 && target_dev < 64) ? target_dev : 0;
+        if ((synced_dev_mask & (1ULL << dev_bit)) == 0) {
+            if (cudaDeviceSynchronize() != cudaSuccess) { error = "session_release_host: device sync failed"; return false; }
+            synced_dev_mask |= (1ULL << dev_bit);
+        }
+        strata::kernels::kv_stream_reset(st.map, nullptr);
+        st.host = strata::kernels::KvHostPools{};
+        strata::kernels::kv_stream_init_identity(st.map, nullptr);
+        if (cudaDeviceSynchronize() != cudaSuccess) { error = "session_release_host: post-reset sync failed"; return false; }
+        if (st.host_base != nullptr) {
+            if (st.host_registered) {
+#ifndef _WIN32
+                (void) cudaHostUnregister(st.host_base);
+                munmap(st.host_base, (size_t) st.host_bytes);
+#else
+                (void) cudaFreeHost(st.host_base);   // the registered path is Linux-only; Windows pins with cudaHostAlloc
+#endif
+            } else {
+                (void) cudaFreeHost(st.host_base);
+            }
+            g_kv_host_bytes.fetch_sub(st.host_bytes);
+            st.host_base = nullptr; st.host_bytes = 0; st.host_registered = false;
+            freed = true;
+        }
     }
     return true;
 }

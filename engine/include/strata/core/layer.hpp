@@ -240,6 +240,13 @@ struct QsaState {
     /// context needs - its index in layer.cpp's registry; -1: carved from the arena as before.
     int32_t kv_elastic = -1;
     strata::kernels::KvHostPools host;
+    /// K21 host-KV trim (4C): the single host allocation behind `host` (kv_host_alloc), tracked so an idle dead
+    /// session can give its pinned RAM back.  host_registered: pinned with cudaHostRegister over an anonymous mmap
+    /// (STRATA_KV_HOST_REGISTER=1), released with cudaHostUnregister + munmap; otherwise cudaHostAlloc, released
+    /// with cudaFreeHost.  host_bytes is what g_kv_host_bytes was charged.  nullptr/0/false: no host copy held.
+    uint8_t* host_base = nullptr;
+    uint64_t host_bytes = 0;
+    bool host_registered = false;
     strata::kernels::KvStreamMap map;
     int64_t idx_pooled_rows = 0;     ///< rows of `idx_pooled` (a ring, which has no indexer, keeps 2)
 
@@ -336,6 +343,18 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream);
 bool kv_host_lazy_enabled();
 struct SessionState;
 bool session_ensure_host(SessionState& ss, const ModelGeometry& g, int64_t upto, bool& allocated, std::string& error);
+/// K21 4C-i: whether any owned streamed (kv_mode 1) layer still lacks its host copy at `upto` (> 0), and the
+/// pinned bytes session_ensure_host would charge for them (pages * kv_block_bytes + 1 KiB per state).  Pure
+/// sizing: no allocation, no CUDA.  pin_bytes_out may be null.  Used to evict parked conversations down to the
+/// RAM floor BEFORE a pin, so the pin never fails for want of room the cache could give back.
+bool session_needs_host(const SessionState& ss, const ModelGeometry& g, int64_t upto, uint64_t* pin_bytes_out);
+/// K21 4C-ii: give back the host K/V copy of every owned streamed layer (the VRAM pools are NEVER touched).
+/// Precondition: the caller guarantees no live conversation is held in this session (an idle dead slot, or the
+/// main session only when !live_ok).  Synchronizes each target device and the copy stream, resets the stream map
+/// to identity, frees the host allocation (cudaHostUnregister + munmap when registered, else cudaFreeHost) and
+/// decrements g_kv_host_bytes.  `freed` is set when any host copy was released.  Idempotent: a session with no
+/// host copy frees nothing and returns true.  A re-ensure backfills the resident blocks bit-exact afterwards.
+bool session_release_host(SessionState& ss, const ModelGeometry& g, std::string& error, bool& freed);
 uint64_t session_kv_host_bytes(const SessionState& ss, const ModelGeometry& g);
 
 // ================================ PER-STAGE TIMING, DEBUG ONLY ================================
