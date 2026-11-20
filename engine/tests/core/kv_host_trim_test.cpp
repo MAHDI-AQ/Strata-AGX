@@ -94,7 +94,10 @@ int gpu_part() {
         return 77;
     }
     (void) cudaSetDevice(0);
-    // streamed + lazy host: the boot path leaves the host copy unpinned, session_ensure_host pins it on demand
+    // streamed + lazy host: the boot path leaves the host copy unpinned, session_ensure_host pins it on demand.
+    // The resident floor is 4096 cells, so a 4096-cell geometry can never stream (r == pages => kv_mode 0, and the
+    // stream map stays null).  Lower the floor first -- it is read once, on the first kv_plan of this process.
+    setenv("STRATA_KV_RESIDENT_MIN", "1024", 1);
     setenv("STRATA_KV_HOST_LAZY", "1", 1);
     qsa_set_kv_resident(1024);
     ModelGeometry g;
@@ -174,8 +177,13 @@ int gpu_part() {
 
     // STRATA_KV_HOST_REGISTER=1: the host copy is pinned with cudaHostRegister over an mmap; release must
     // cudaHostUnregister + munmap it (host_registered true), and the bytes still come back to baseline.
-    setenv("STRATA_KV_HOST_REGISTER", "1", 1);
-    {
+    // kv_host_alloc() reads the switch once per process (a function-local static), so this leg only runs when the
+    // whole process was started with it:  STRATA_KV_HOST_REGISTER=1 ./kv_host_trim_test  (the plain run covers the
+    // cudaHostAlloc path, which is what this host deploys).
+    const char* reg_env = std::getenv("STRATA_KV_HOST_REGISTER");
+    const bool reg_leg = reg_env != nullptr && reg_env[0] == "1"[0];
+    if (!reg_leg) std::printf("kv_host_trim_test(gpu): register leg skipped (start with STRATA_KV_HOST_REGISTER=1)\n");
+    if (reg_leg) {
         QsaState st2{};
         void* arena2 = nullptr;
         if (cudaMalloc(&arena2, arena_bytes) == cudaSuccess && qsa_state_init(g, max_cells, arena2, st2) != 0) {
