@@ -116,18 +116,33 @@ def pack_header(session_id: str, total_payload_size: int, num_tokens: int = 0,
                 model_name: str = "Qwen3.8-Flash-Next-IQ3_S-Stock",
                 token_ids: list = None) -> bytes:
     """Pack 2MiB aligned binary header."""
-    meta_json = json.dumps({
+    meta = {
         "session_id": session_id,
         "model": model_name,
         "tokens": num_tokens,
-        "token_ids": token_ids or [],
         "gdn_bytes": gdn_bytes,
         "qsa_bytes": qsa_bytes,
         "payload_size": total_payload_size,
         "total_file_size": total_payload_size + HEADER_SIZE,
         "timestamp": time.time(),
-        "format": "strata_v1_direct_nvme"
-    }).encode("utf-8")
+        "format": "strata_v1_direct_nvme",
+    }
+    meta["token_ids"] = list(token_ids or [])
+    meta_json = json.dumps(meta).encode("utf-8")
+    # The on-disk layout is fixed: the payload begins at HEADER_SIZE and readers
+    # index raw_ptr + HEADER_SIZE. A long token list must never grow this block --
+    # writing a larger buffer past the 2 MiB alignment corrupts the heap.
+    if len(meta_json) > HEADER_SIZE - 32:
+        meta.pop("token_ids", None)
+        meta["token_ids_elided"] = True
+        meta_json = json.dumps(meta).encode("utf-8")
+        logger.warning(
+            "session %s: token list does not fit the %d-byte header; elided "
+            "(restore will re-prefill)", session_id, HEADER_SIZE)
+    if len(meta_json) > HEADER_SIZE - 32:
+        raise ValueError(
+            "session header metadata (%d bytes) exceeds HEADER_SIZE (%d)"
+            % (len(meta_json), HEADER_SIZE))
 
     hdr = bytearray(HEADER_SIZE)
     hdr[:len(MAGIC)] = MAGIC
@@ -223,6 +238,9 @@ def write_session_checkpoint(session_id: str,
     total_size = HEADER_SIZE + aligned_payload
 
     hdr_bytes = pack_header(session_id, aligned_payload, num_tokens=num_tokens, model_name=model_name, token_ids=token_ids)
+    if len(hdr_bytes) != HEADER_SIZE:
+        raise ValueError("pack_header returned %d bytes, expected %d"
+                         % (len(hdr_bytes), HEADER_SIZE))
 
     if payload_buf is None:
         # Ring buffer mode: write full file using thread ring buffers, then write header
