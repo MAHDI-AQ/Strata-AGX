@@ -142,6 +142,7 @@ struct ConversationKvPrefixLayout {
     int64_t cells = 0, whole_cells = 0, page_size = 0, idx_block = 0;
     int format = 0, heads = 0, head_dim = 0, idx_dim = 0;
     bool index = false;
+    bool idx_fp16 = false;   ///< pooled index rows are __half (STRATA_QSA_IDX_FP16): 2 B/elem, not 4
     int64_t unchanged_tokens = 0;
 };
 
@@ -164,7 +165,9 @@ inline bool conversation_kv_prefix_holds(const ConversationKv& image, const Conv
         &image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     for (size_t i = 0; i < dst.size(); ++i) {
         const size_t keep = i == 4
-            ? (nl.index && nl.idx_block > 0 ? size_t(nl.unchanged_tokens / nl.idx_block) * size_t(nl.idx_dim) * 4 : 0)
+            ? (nl.index && nl.idx_block > 0
+                   ? size_t(nl.unchanged_tokens / nl.idx_block) * size_t(nl.idx_dim) * (nl.idx_fp16 ? 2 : 4)
+                   : 0)
             : (nl.cells ? (nl.sizes[i] / size_t(nl.cells)) * size_t(nl.whole_cells) : 0);
         if (keep > dst[i]->size()) {
             why = "retained K/V part " + std::to_string(i) + " shorter than the kept prefix";

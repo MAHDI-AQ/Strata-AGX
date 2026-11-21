@@ -330,6 +330,7 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         nl.idx_block = strata::kernels::qsa_real_shapes().idx_block;
         nl.format = l.format; nl.heads = g.n_head_kv; nl.head_dim = g.head_dim; nl.idx_dim = g.idx_key_dim;
         nl.index = index; nl.unchanged_tokens = unchanged_tokens;
+        nl.idx_fp16 = st.idx_pooled_fp16;
         std::string why;
         if (!conversation_kv_prefix_holds(image, nl, why)) {
             unchanged_tokens = 0; whole_cells = 0;
@@ -355,7 +356,7 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
     for (size_t i = 0; i < dst.size(); ++i) {
         // Recopy the partial page and the indexer's moving spare row. Completed
         // pages/rows strictly before the first rewritten token remain identical.
-        const size_t keep = i == 4 ? (index ? size_t(unchanged_tokens / strata::kernels::qsa_real_shapes().idx_block) * g.idx_key_dim * 4 : 0)
+        const size_t keep = i == 4 ? (index ? size_t(unchanged_tokens / strata::kernels::qsa_real_shapes().idx_block) * g.idx_key_dim * (st.idx_pooled_fp16 ? 2 : 4) : 0)
                                   : l.cells ? (sizes[i] / size_t(l.cells)) * size_t(whole_cells) : 0;
         if (keep > dst[i]->size()) { error = "conversation snapshot: missing reusable prefix"; return false; }
         {   // STRATA_PARK_VRAM_MIB: with a slot, the whole part goes device to device into it (a restore of this image
@@ -459,6 +460,7 @@ bool conversation_kv_prefix_reusable(const ConversationKv& image, const QsaState
     nl.idx_block = strata::kernels::qsa_real_shapes().idx_block;
     nl.format = l.format; nl.heads = g.n_head_kv; nl.head_dim = g.head_dim; nl.idx_dim = g.idx_key_dim;
     nl.index = index; nl.unchanged_tokens = unchanged_tokens;
+    nl.idx_fp16 = st.idx_pooled_fp16;
     return conversation_kv_prefix_holds(image, nl, why);
 }
 
