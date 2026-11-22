@@ -439,6 +439,278 @@ __global__ void __launch_bounds__(256, 1) l2_scratchpad_epilogue_reduction_kerne
     }
 }
 
+/**
+ * K25b Opt-In Fast Non-Gumbel LM Head FP8 GEMV + Parallel Argmax Kernel
+ * XOR-swizzled smem_W/smem_X (zero SMEM bank conflicts) + single-barrier parallel argmax epilogue.
+ */
+__global__ void __launch_bounds__(128, 2) fused_lm_head_gemv_fast_argmax_kernel(
+    const uint8_t* __restrict__ W_head,
+    const uint8_t* __restrict__ X_act,
+    SoftmaxArgmaxTuple* __restrict__ L2_scratchpad,
+    float* __restrict__ out_logits,
+    const int32_t T,
+    const int32_t V,
+    const int32_t K,
+    const float temperature,
+    const float scale_w,
+    const float scale_x,
+    const float* __restrict__ scale_w_ptr = nullptr,
+    const float* __restrict__ scale_x_ptr = nullptr
+) {
+    __shared__ alignas(16) uint8_t smem_W[2][128 * 128];
+    __shared__ alignas(16) uint8_t smem_X[2][16 * 128];
+    __shared__ float smem_best_v[4][16];
+    __shared__ int32_t smem_best_i[4][16];
+    __shared__ float smem_scale_w[128];
+    __shared__ float smem_scale_x[16];
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane_id = tid & 31;
+    const int group = lane_id >> 2;       // 0..7
+    const int tid_in_grp = lane_id & 3;   // 0..3
+    const int block_n = blockIdx.x;
+    const int global_n_base = block_n * 128;
+
+    if (global_n_base >= V) return;
+
+    if (scale_w_ptr != nullptr) {
+        const int g_col = global_n_base + tid;
+        smem_scale_w[tid] = (g_col < V) ? scale_w_ptr[g_col] : 1.0f;
+    }
+    if (scale_x_ptr != nullptr && tid < 16) {
+        smem_scale_x[tid] = (tid < T) ? scale_x_ptr[tid] : 1.0f;
+    }
+
+    float accum[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            accum[i][j] = 0.0f;
+        }
+    }
+
+    const int num_k_tiles = K / 128;
+    int smem_buf = 0;
+
+    // Prologue: Prefetch tile 0 with XOR bank-conflict-free swizzle
+    {
+        #pragma unroll
+        for (int step = 0; step < 8; ++step) {
+            const int r = (tid / 8) + step * 16;
+            const int c = (tid % 8) * 16;
+            const int c_sw = c ^ ((r & 7) << 4);
+            const int g_row = global_n_base + r;
+            const uint8_t* src_ptr = (g_row < V) ? (W_head + static_cast<size_t>(g_row) * K + c) : nullptr;
+            if (src_ptr) {
+                cp_async_16(&smem_W[0][r * 128 + c_sw], src_ptr);
+            }
+        }
+        const int x_row = tid / 8;
+        const int x_col = (tid % 8) * 16;
+        const int x_sw = x_col ^ ((x_row & 7) << 4);
+        void* dst_x = &smem_X[0][x_row * 128 + x_sw];
+        if (x_row < T) {
+            const uint8_t* src_x = X_act + static_cast<size_t>(x_row) * K + x_col;
+            cp_async_16(dst_x, src_x);
+        } else {
+            *reinterpret_cast<uint4*>(dst_x) = make_uint4(0, 0, 0, 0);
+        }
+        cp_async_commit();
+    }
+
+    // Main K-loop over tiles
+    #pragma unroll 1
+    for (int k_tile = 0; k_tile < num_k_tiles; ++k_tile) {
+        cp_async_wait<0>();
+        __syncthreads();
+
+        const int next_buf = smem_buf ^ 1;
+        const int next_k_tile = k_tile + 1;
+
+        if (next_k_tile < num_k_tiles) {
+            const int k_offset = next_k_tile * 128;
+            #pragma unroll
+            for (int step = 0; step < 8; ++step) {
+                const int r = (tid / 8) + step * 16;
+                const int c = (tid % 8) * 16;
+                const int c_sw = c ^ ((r & 7) << 4);
+                const int g_row = global_n_base + r;
+                const uint8_t* src_ptr = (g_row < V) ? (W_head + static_cast<size_t>(g_row) * K + k_offset + c) : nullptr;
+                if (src_ptr) {
+                    cp_async_16(&smem_W[next_buf][r * 128 + c_sw], src_ptr);
+                }
+            }
+            const int x_row = tid / 8;
+            const int x_col = (tid % 8) * 16;
+            const int x_sw = x_col ^ ((x_row & 7) << 4);
+            void* dst_x = &smem_X[next_buf][x_row * 128 + x_sw];
+            if (x_row < T) {
+                const uint8_t* src_x = X_act + static_cast<size_t>(x_row) * K + k_offset + x_col;
+                cp_async_16(dst_x, src_x);
+            } else {
+                *reinterpret_cast<uint4*>(dst_x) = make_uint4(0, 0, 0, 0);
+            }
+            cp_async_commit();
+        }
+
+        const int x_lane_sw = group << 4;
+        #pragma unroll
+        for (int k_sub = 0; k_sub < 4; ++k_sub) {
+            uint32_t a_regs[4];
+            const int k_base = k_sub * 32;
+            const int k0 = k_base ^ x_lane_sw;
+            const int k1 = (k_base + 16) ^ x_lane_sw;
+
+            const uint32_t* smem_x_r0_0 = reinterpret_cast<const uint32_t*>(&smem_X[smem_buf][group * 128 + k0]);
+            const uint32_t* smem_x_r0_1 = reinterpret_cast<const uint32_t*>(&smem_X[smem_buf][group * 128 + k1]);
+            const uint32_t* smem_x_r1_0 = reinterpret_cast<const uint32_t*>(&smem_X[smem_buf][(group + 8) * 128 + k0]);
+            const uint32_t* smem_x_r1_1 = reinterpret_cast<const uint32_t*>(&smem_X[smem_buf][(group + 8) * 128 + k1]);
+
+            a_regs[0] = smem_x_r0_0[tid_in_grp];
+            a_regs[1] = smem_x_r1_0[tid_in_grp];
+            a_regs[2] = smem_x_r0_1[tid_in_grp];
+            a_regs[3] = smem_x_r1_1[tid_in_grp];
+
+            #pragma unroll
+            for (int n_sub = 0; n_sub < 4; ++n_sub) {
+                uint32_t b_regs[2];
+                const int col_in_tile = warp_id * 32 + n_sub * 8 + group;
+                const int w_lane_sw = (col_in_tile & 7) << 4;
+                const uint32_t* smem_w_0 = reinterpret_cast<const uint32_t*>(&smem_W[smem_buf][col_in_tile * 128 + (k_base ^ w_lane_sw)]);
+                const uint32_t* smem_w_1 = reinterpret_cast<const uint32_t*>(&smem_W[smem_buf][col_in_tile * 128 + ((k_base + 16) ^ w_lane_sw)]);
+
+                b_regs[0] = smem_w_0[tid_in_grp];
+                b_regs[1] = smem_w_1[tid_in_grp];
+
+                mma_m16n8k32_fp8(accum[n_sub], a_regs, b_regs, accum[n_sub]);
+            }
+        }
+
+        smem_buf = next_buf;
+    }
+
+    const float temp_scale = (temperature > 0.0f) ? (1.0f / temperature) : 1.0f;
+
+    #pragma unroll
+    for (int hi = 0; hi < 2; ++hi) {
+        const int t = hi * 8 + group;
+        float best_v = -1e30f;
+        int32_t best_i = -1;
+
+        if (t < T) {
+            const int d0 = hi * 2;
+            const int d1 = hi * 2 + 1;
+            const float cur_sx = (scale_x_ptr != nullptr) ? smem_scale_x[t] : scale_x;
+            const size_t row_offset = static_cast<size_t>(t) * V;
+
+            #pragma unroll
+            for (int n_sub = 0; n_sub < 4; ++n_sub) {
+                const int local_col0 = warp_id * 32 + n_sub * 8 + (tid_in_grp * 2);
+                const int local_col1 = local_col0 + 1;
+                const int col0 = global_n_base + local_col0;
+                const int col1 = col0 + 1;
+
+                float raw0 = 0.0f;
+                float raw1 = 0.0f;
+                if (col0 < V) {
+                    const float cur_sw0 = (scale_w_ptr != nullptr) ? smem_scale_w[local_col0] : scale_w;
+                    raw0 = accum[n_sub][d0] * (cur_sw0 * cur_sx);
+                    const float l0 = raw0 * temp_scale;
+                    if (l0 > best_v || (l0 == best_v && (best_i < 0 || col0 < best_i))) {
+                        best_v = l0;
+                        best_i = col0;
+                    }
+                }
+                if (col1 < V) {
+                    const float cur_sw1 = (scale_w_ptr != nullptr) ? smem_scale_w[local_col1] : scale_w;
+                    raw1 = accum[n_sub][d1] * (cur_sw1 * cur_sx);
+                    const float l1 = raw1 * temp_scale;
+                    if (l1 > best_v || (l1 == best_v && (best_i < 0 || col1 < best_i))) {
+                        best_v = l1;
+                        best_i = col1;
+                    }
+                }
+                if (out_logits != nullptr) {
+                    if (col1 < V && ((reinterpret_cast<uintptr_t>(out_logits + row_offset + col0) & 7u) == 0u)) {
+                        *reinterpret_cast<float2*>(out_logits + row_offset + col0) = make_float2(raw0, raw1);
+                    } else {
+                        if (col0 < V) out_logits[row_offset + col0] = raw0;
+                        if (col1 < V) out_logits[row_offset + col1] = raw1;
+                    }
+                }
+            }
+        }
+
+        // Uniform warp-4 argmax reduction across lanes sharing the same token group
+        #pragma unroll
+        for (int mask = 2; mask >= 1; mask >>= 1) {
+            const float pv = __shfl_xor_sync(0xffffffff, best_v, mask);
+            const int32_t pi = __shfl_xor_sync(0xffffffff, best_i, mask);
+            if (pv > best_v || (pv == best_v && pi >= 0 && (best_i < 0 || pi < best_i))) {
+                best_v = pv;
+                best_i = pi;
+            }
+        }
+        if (t < T && tid_in_grp == 0) {
+            smem_best_v[warp_id][t] = best_v;
+            smem_best_i[warp_id][t] = best_i;
+        }
+    }
+
+    __syncthreads();
+    if (tid < T) {
+        float fv = smem_best_v[0][tid];
+        int32_t fi = smem_best_i[0][tid];
+        #pragma unroll
+        for (int w = 1; w < 4; ++w) {
+            const float wv = smem_best_v[w][tid];
+            const int32_t wi = smem_best_i[w][tid];
+            if (wv > fv || (wv == fv && wi >= 0 && (fi < 0 || wi < fi))) {
+                fv = wv;
+                fi = wi;
+            }
+        }
+        L2_scratchpad[static_cast<size_t>(tid) * gridDim.x + block_n] = SoftmaxArgmaxTuple{fv, 0.0f, fi};
+    }
+}
+
+inline cudaError_t launch_fused_lm_head_gemv_fast_argmax(
+    const uint8_t* W_head,
+    const uint8_t* X_act,
+    SoftmaxArgmaxTuple* L2_scratchpad,
+    int32_t* d_out_tokens,
+    float* d_out_normalizers,
+    float* out_logits,
+    int32_t T,
+    int32_t V,
+    int32_t K,
+    float temperature,
+    float scale_w,
+    float scale_x,
+    const float* scale_w_ptr,
+    const float* scale_x_ptr,
+    cudaStream_t stream = nullptr
+) {
+    if (T <= 0 || V <= 0 || K <= 0) return cudaSuccess;
+    const int num_blocks = (V + 127) / 128;
+
+    fused_lm_head_gemv_fast_argmax_kernel<<<num_blocks, 128, 0, stream>>>(
+        W_head, X_act, L2_scratchpad, out_logits, T, V, K, temperature, scale_w, scale_x,
+        scale_w_ptr, scale_x_ptr
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+
+    l2_scratchpad_epilogue_reduction_kernel<<<T, 256, 0, stream>>>(
+        L2_scratchpad, d_out_tokens, d_out_normalizers, num_blocks, T
+    );
+
+    return cudaGetLastError();
+}
+
 inline cudaError_t launch_fused_lm_head_gemv_softmax(
     const uint8_t* W_head,
     const uint8_t* X_act,

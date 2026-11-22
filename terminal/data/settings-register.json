@@ -16700,7 +16700,7 @@
       "reads": [
         {
           "file": "engine/src/core/conversation_snapshot.cpp",
-          "line": 519,
+          "line": 521,
           "backend": "cuda-hip",
           "fn": "getenv"
         }
@@ -17188,7 +17188,7 @@
       "reads": [
         {
           "file": "engine/src/core/conversation_snapshot.cpp",
-          "line": 470,
+          "line": 472,
           "backend": "cuda-hip",
           "fn": "getenv"
         }
@@ -18061,6 +18061,34 @@
       "status": "opt-in",
       "owner": "",
       "note": "",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
+      "name": "STRATA_LM_HEAD_FP8_FAST",
+      "backends": [
+        "cuda-hip"
+      ],
+      "reads": [
+        {
+          "file": "engine/src/core/native_fp8.cu",
+          "line": 293,
+          "backend": "cuda-hip",
+          "fn": "getenv"
+        }
+      ],
+      "parse": "flag",
+      "default_state": "off",
+      "code_default": null,
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "status": "opt-in",
+      "owner": "",
+      "note": "K25b-4: XOR-swizzled bank-conflict-free SMEM + parallel fast-argmax epilogue for non-Gumbel FP8 LM head (default off).",
       "retire_after": "",
       "retired_in": ""
     },
@@ -41507,7 +41535,7 @@
         },
         {
           "file": "engine/include/strata/kernels/native_head_gemv.cuh",
-          "line": 499,
+          "line": 771,
           "backend": "cuda-hip",
           "fn": "getenv"
         }
@@ -48232,7 +48260,7 @@
         },
         {
           "file": "engine/include/strata/kernels/native_head_gemv.cuh",
-          "line": 500,
+          "line": 772,
           "backend": "cuda-hip",
           "fn": "getenv"
         }

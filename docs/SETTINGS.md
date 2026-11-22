@@ -10,7 +10,7 @@ debugging and are kept in `terminal/data/settings-register.json`.
 A number or a word is set like any environment variable, for example `STRATA_KVA=1`. In the Terminal, `strata launch --set NAME=value`
 puts it in the model's run configuration.
 
-## Switches you can turn on (358)
+## Switches you can turn on (359)
 
 Off unless you set them. The last column says where each one is described.
 
@@ -160,6 +160,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_L2_PERSIST_MIB` | number | NVIDIA and AMD | - |
 | `STRATA_LEND_MIRROR` | number | Intel Arc | [INTEL.md](INTEL.md) |
 | `STRATA_LM_HEAD_FP8` | on / off | NVIDIA and AMD | - |
+| `STRATA_LM_HEAD_FP8_FAST` | on / off | NVIDIA and AMD | - |
 | `STRATA_LM_HIP` | on / off | AMD | - |
 | `STRATA_LOGITS` | text | NVIDIA and AMD | - |
 | `STRATA_LOGITS_DUMP` | on / off | NVIDIA and AMD, Intel Arc | [KVA.md](KVA.md) |

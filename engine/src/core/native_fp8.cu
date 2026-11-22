@@ -289,22 +289,40 @@ bool run_native_head_fp8(const NativeHeadFp8State& state, const float* mixed, fl
     }
 
     int32_t* target_out_tokens = (out_tokens != nullptr) ? out_tokens : state.d_out_tokens;
-    cudaError_t kerr = strata::kernels::launch_fused_lm_head_gemv_softmax(
-        static_cast<const uint8_t*>(state.d_W_head),
-        static_cast<const uint8_t*>(state.d_X_act),
-        static_cast<strata::kernels::SoftmaxArgmaxTuple*>(state.d_scratchpad),
-        target_out_tokens,
-        state.d_out_norms,
-        logits,
-        T, state.V, state.K,
-        temperature, 1.0f, 1.0f,
-        state.d_scale_w,
-        state.d_scale_x,
-        gumbel_enabled,
-        seed,
-        counter,
-        cs
-    );
+    static const bool fast_lm_head = [] {
+        const char* v = std::getenv("STRATA_LM_HEAD_FP8_FAST");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    cudaError_t kerr = (fast_lm_head && !gumbel_enabled)
+        ? strata::kernels::launch_fused_lm_head_gemv_fast_argmax(
+            static_cast<const uint8_t*>(state.d_W_head),
+            static_cast<const uint8_t*>(state.d_X_act),
+            static_cast<strata::kernels::SoftmaxArgmaxTuple*>(state.d_scratchpad),
+            target_out_tokens,
+            state.d_out_norms,
+            logits,
+            T, state.V, state.K,
+            temperature, 1.0f, 1.0f,
+            state.d_scale_w,
+            state.d_scale_x,
+            cs
+        )
+        : strata::kernels::launch_fused_lm_head_gemv_softmax(
+            static_cast<const uint8_t*>(state.d_W_head),
+            static_cast<const uint8_t*>(state.d_X_act),
+            static_cast<strata::kernels::SoftmaxArgmaxTuple*>(state.d_scratchpad),
+            target_out_tokens,
+            state.d_out_norms,
+            logits,
+            T, state.V, state.K,
+            temperature, 1.0f, 1.0f,
+            state.d_scale_w,
+            state.d_scale_x,
+            gumbel_enabled,
+            seed,
+            counter,
+            cs
+        );
 
     if (kerr != cudaSuccess) {
         err = "run_native_head_fp8 kernel error: " + std::string(cudaGetErrorString(kerr));
