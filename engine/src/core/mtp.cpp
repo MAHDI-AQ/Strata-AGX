@@ -174,6 +174,14 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out) {
     return n == 0 || std::fread(out.data(), 1, (size_t) n, f) == (size_t) n;
 }
 
+bool mtp_q4_shared_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_MTP_Q4_SHARED");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return on;
+}
+
 }  // namespace
 
 MtpDrafter::~MtpDrafter() {
@@ -181,7 +189,7 @@ MtpDrafter::~MtpDrafter() {
     for (auto& e : prefill_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : prefill_dev_exec_) if (e) cudaGraphExecDestroy(e);
     if (pf_dev_) cudaFree(pf_dev_);
-    if (dense4_) cudaFree(dense4_);
+    if (owns_weights_ && dense4_) cudaFree(dense4_);
     for (auto& e : round_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : chain_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : step_exec_) if (e) cudaGraphExecDestroy(e);
@@ -327,6 +335,10 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         dense_ = shared->dense_;
         experts_ = shared->experts_;
         tensors_ = shared->tensors_;
+        if (mtp_q4_shared_on() && shared->dense4_ != nullptr) {
+            dense4_ = shared->dense4_;
+            q4_off_ = shared->q4_off_;
+        }
         owns_weights_ = false;
         owns_draft_head_ = false;
     }

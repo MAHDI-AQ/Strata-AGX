@@ -1543,7 +1543,7 @@
         },
         {
           "file": "engine/src/core/mtp.cpp",
-          "line": 2217,
+          "line": 2229,
           "backend": "cuda-hip",
           "fn": "getenv"
         }
@@ -6798,7 +6798,7 @@
       "reads": [
         {
           "file": "engine/src/core/mtp.cpp",
-          "line": 1783,
+          "line": 1795,
           "backend": "cuda-hip",
           "fn": "getenv"
         },
@@ -9215,7 +9215,7 @@
         },
         {
           "file": "engine/src/core/mtp.cpp",
-          "line": 1269,
+          "line": 1281,
           "backend": "cuda-hip",
           "fn": "getenv"
         },
@@ -13118,13 +13118,13 @@
         },
         {
           "file": "engine/src/core/mtp.cpp",
-          "line": 1046,
+          "line": 1058,
           "backend": "hip",
           "fn": "getenv"
         },
         {
           "file": "engine/src/core/mtp.cpp",
-          "line": 1052,
+          "line": 1064,
           "backend": "cuda-hip",
           "fn": "getenv"
         },
@@ -22701,7 +22701,7 @@
       "reads": [
         {
           "file": "engine/src/core/mtp.cpp",
-          "line": 586,
+          "line": 598,
           "backend": "cuda-hip",
           "fn": "getenv"
         },
@@ -22752,7 +22752,7 @@
       "reads": [
         {
           "file": "engine/src/core/mtp.cpp",
-          "line": 1513,
+          "line": 1525,
           "backend": "cuda-hip",
           "fn": "getenv"
         }
@@ -22787,7 +22787,7 @@
       "reads": [
         {
           "file": "engine/src/core/mtp.cpp",
-          "line": 1521,
+          "line": 1533,
           "backend": "cuda-hip",
           "fn": "getenv"
         }
@@ -22820,7 +22820,7 @@
       "reads": [
         {
           "file": "engine/src/core/mtp.cpp",
-          "line": 529,
+          "line": 541,
           "backend": "cuda-hip",
           "fn": "getenv"
         }
@@ -23027,7 +23027,7 @@
       "reads": [
         {
           "file": "engine/src/core/mtp.cpp",
-          "line": 1629,
+          "line": 1641,
           "backend": "cuda-hip",
           "fn": "getenv"
         },
@@ -23067,7 +23067,7 @@
       "reads": [
         {
           "file": "engine/src/core/mtp.cpp",
-          "line": 515,
+          "line": 527,
           "backend": "cuda",
           "fn": "getenv"
         },
@@ -23106,7 +23106,7 @@
       "reads": [
         {
           "file": "engine/src/core/mtp.cpp",
-          "line": 921,
+          "line": 933,
           "backend": "cuda-hip",
           "fn": "getenv"
         }
@@ -23128,6 +23128,34 @@
       "status": "research",
       "owner": "core",
       "note": "[auto] diagnostic / trace / measurement switch by name or by code, not documented for users",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
+      "name": "STRATA_MTP_Q4_SHARED",
+      "backends": [
+        "cuda-hip"
+      ],
+      "reads": [
+        {
+          "file": "engine/src/core/mtp.cpp",
+          "line": 179,
+          "backend": "cuda-hip",
+          "fn": "getenv"
+        }
+      ],
+      "parse": "flag",
+      "default_state": null,
+      "code_default": null,
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "status": "opt-in",
+      "owner": "core/mtp.cpp",
+      "note": "Share the Q4_0 MTP dense projection table (dense4_/q4_off_) from slot 0 to shared --batch-mtp slots; opt-in.",
       "retire_after": "",
       "retired_in": ""
     },
@@ -23222,7 +23250,7 @@
       "reads": [
         {
           "file": "engine/src/core/mtp.cpp",
-          "line": 1279,
+          "line": 1291,
           "backend": "cuda-hip",
           "fn": "getenv"
         },
@@ -23261,7 +23289,7 @@
       "reads": [
         {
           "file": "engine/src/core/mtp.cpp",
-          "line": 561,
+          "line": 573,
           "backend": "hip",
           "fn": "getenv"
         }
@@ -23340,7 +23368,7 @@
       "reads": [
         {
           "file": "engine/src/core/mtp.cpp",
-          "line": 592,
+          "line": 604,
           "backend": "cuda-hip",
           "fn": "getenv"
         },
@@ -23768,7 +23796,7 @@
         },
         {
           "file": "engine/src/core/mtp.cpp",
-          "line": 1136,
+          "line": 1148,
           "backend": "cuda-hip",
           "fn": "getenv"
         },
@@ -24232,7 +24260,7 @@
         },
         {
           "file": "engine/src/core/mtp.cpp",
-          "line": 1334,
+          "line": 1346,
           "backend": "cuda-hip",
           "fn": "getenv"
         },
@@ -36387,7 +36415,7 @@
         },
         {
           "file": "engine/src/core/mtp.cpp",
-          "line": 1024,
+          "line": 1036,
           "backend": "cuda-hip",
           "fn": "getenv"
         }
@@ -37123,7 +37151,7 @@
         },
         {
           "file": "engine/src/core/mtp.cpp",
-          "line": 1230,
+          "line": 1242,
           "backend": "cuda-hip",
           "fn": "getenv"
         }
@@ -47328,7 +47356,7 @@
         },
         {
           "file": "engine/src/core/mtp.cpp",
-          "line": 972,
+          "line": 984,
           "backend": "cuda-hip",
           "fn": "getenv"
         },
