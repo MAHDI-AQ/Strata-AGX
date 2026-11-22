@@ -1679,7 +1679,7 @@
         },
         {
           "file": "engine/src/kernels/cuda/qsa_decode_attn.cu",
-          "line": 1355,
+          "line": 1383,
           "backend": "cuda-hip",
           "fn": "getenv"
         },
@@ -1777,6 +1777,34 @@
       "status": "default",
       "owner": "kernels/cuda",
       "note": "[auto] on by default for some GPU architectures only (gfx12 src/core/arch_defaults.cpp:52=1); opt-in elsewhere; the variable overrides it",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
+      "name": "STRATA_ATTN_NOSPLIT_MIN_CHUNKS",
+      "backends": [
+        "cuda-hip"
+      ],
+      "reads": [
+        {
+          "file": "engine/src/kernels/cuda/qsa_decode_attn.cu",
+          "line": 1108,
+          "backend": "cuda-hip",
+          "fn": "getenv"
+        }
+      ],
+      "parse": "int",
+      "default_state": null,
+      "code_default": "0",
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "status": "opt-in",
+      "owner": "kernels/cuda/qsa_decode_attn.cu",
+      "note": "Minimum n_chunks threshold above which SPLIT_HEAD is disabled (halving K/V DRAM reads when SM count is already saturated); 0 disables (default).",
       "retire_after": "",
       "retired_in": ""
     },
@@ -10920,13 +10948,13 @@
       "reads": [
         {
           "file": "engine/src/kernels/cuda/qsa_decode_attn.cu",
-          "line": 1142,
+          "line": 1150,
           "backend": "hip",
           "fn": "getenv"
         },
         {
           "file": "engine/src/kernels/cuda/qsa_decode_attn.cu",
-          "line": 1299,
+          "line": 1327,
           "backend": "hip",
           "fn": "getenv"
         }
@@ -10962,7 +10990,7 @@
       "reads": [
         {
           "file": "engine/src/kernels/cuda/qsa_decode_attn.cu",
-          "line": 1146,
+          "line": 1154,
           "backend": "hip",
           "fn": "getenv"
         }
@@ -10995,7 +11023,7 @@
       "reads": [
         {
           "file": "engine/src/kernels/cuda/qsa_decode_attn.cu",
-          "line": 1166,
+          "line": 1174,
           "backend": "hip",
           "fn": "getenv"
         }
