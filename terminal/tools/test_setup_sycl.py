@@ -109,8 +109,11 @@ class CMakeOption(unittest.TestCase):
 
 class SyclVersion(unittest.TestCase):
     def setUp(self):
-        from sycl import setup_intel
-        self.mod = setup_intel
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("setup_intel", ROOT.parent / "engine" / "sycl" / "setup_intel.py")
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        self.mod = m
 
     def test_version_matches_the_source_and_satisfies_native_models(self):
         version = self.mod.sycl_version()
