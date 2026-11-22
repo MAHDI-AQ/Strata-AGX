@@ -36586,7 +36586,7 @@
       "reads": [
         {
           "file": "engine/src/kernels/cuda/qsa_select.cu",
-          "line": 3161,
+          "line": 3185,
           "backend": "cuda-hip",
           "fn": "getenv"
         },
@@ -36803,7 +36803,7 @@
         },
         {
           "file": "engine/src/kernels/cuda/qsa_select.cu",
-          "line": 2418,
+          "line": 2442,
           "backend": "cuda-hip",
           "fn": "getenv"
         },
@@ -37042,6 +37042,34 @@
       "retired_in": ""
     },
     {
+      "name": "STRATA_QSA_ROWS_RUNS",
+      "backends": [
+        "cuda-hip"
+      ],
+      "reads": [
+        {
+          "file": "engine/src/kernels/cuda/qsa_select.cu",
+          "line": 2419,
+          "backend": "cuda-hip",
+          "fn": "getenv"
+        }
+      ],
+      "parse": "flag",
+      "default_state": null,
+      "code_default": null,
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "status": "opt-in",
+      "owner": "kernels/cuda/qsa_select.cu",
+      "note": "Split contiguous same-slot runs (<=4 rows) in qsa_block_scores_rows onto block_scores_rows_kernel<1..4>; opt-in.",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
       "name": "STRATA_QSA_SLOTS",
       "backends": [
         "cuda-hip"
@@ -37254,13 +37282,13 @@
       "reads": [
         {
           "file": "engine/src/kernels/cuda/qsa_select.cu",
-          "line": 2509,
+          "line": 2533,
           "backend": "cuda-hip",
           "fn": "getenv"
         },
         {
           "file": "engine/src/kernels/cuda/qsa_select.cu",
-          "line": 4028,
+          "line": 4052,
           "backend": "cuda-hip",
           "fn": "getenv"
         },
@@ -39059,7 +39087,7 @@
         },
         {
           "file": "engine/src/kernels/cuda/qsa_select.cu",
-          "line": 3250,
+          "line": 3274,
           "backend": "cuda",
           "fn": "getenv"
         }
@@ -39308,7 +39336,7 @@
         },
         {
           "file": "engine/src/kernels/cuda/qsa_select.cu",
-          "line": 2458,
+          "line": 2482,
           "backend": "hip",
           "fn": "getenv"
         }
@@ -39525,13 +39553,13 @@
       "reads": [
         {
           "file": "engine/src/kernels/cuda/qsa_select.cu",
-          "line": 2448,
+          "line": 2472,
           "backend": "hip",
           "fn": "getenv"
         },
         {
           "file": "engine/src/kernels/cuda/qsa_select.cu",
-          "line": 2517,
+          "line": 2541,
           "backend": "cuda-hip",
           "fn": "getenv"
         }
@@ -39593,13 +39621,13 @@
         },
         {
           "file": "engine/src/kernels/cuda/qsa_select.cu",
-          "line": 4046,
+          "line": 4070,
           "backend": "cuda-hip",
           "fn": "getenv"
         },
         {
           "file": "engine/src/kernels/cuda/qsa_select.cu",
-          "line": 4169,
+          "line": 4193,
           "backend": "hip",
           "fn": "getenv"
         },
@@ -39649,7 +39677,7 @@
       "reads": [
         {
           "file": "engine/src/kernels/cuda/qsa_select.cu",
-          "line": 4055,
+          "line": 4079,
           "backend": "cuda-hip",
           "fn": "getenv"
         }
@@ -39684,7 +39712,7 @@
       "reads": [
         {
           "file": "engine/src/kernels/cuda/qsa_select.cu",
-          "line": 4062,
+          "line": 4086,
           "backend": "cuda-hip",
           "fn": "getenv"
         }
@@ -39757,7 +39785,7 @@
         },
         {
           "file": "engine/src/kernels/cuda/qsa_select.cu",
-          "line": 2438,
+          "line": 2462,
           "backend": "hip",
           "fn": "getenv"
         },
@@ -40307,7 +40335,7 @@
       "reads": [
         {
           "file": "engine/src/kernels/cuda/qsa_select.cu",
-          "line": 2524,
+          "line": 2548,
           "backend": "cuda-hip",
           "fn": "getenv"
         }
@@ -45487,7 +45515,7 @@
       "reads": [
         {
           "file": "engine/src/kernels/cuda/qsa_select.cu",
-          "line": 3189,
+          "line": 3213,
           "backend": "cuda-hip",
           "fn": "getenv"
         },
@@ -45543,7 +45571,7 @@
       "reads": [
         {
           "file": "engine/src/kernels/cuda/qsa_select.cu",
-          "line": 3190,
+          "line": 3214,
           "backend": "cuda-hip",
           "fn": "getenv"
         }
@@ -45580,7 +45608,7 @@
       "reads": [
         {
           "file": "engine/src/kernels/cuda/qsa_select.cu",
-          "line": 3186,
+          "line": 3210,
           "backend": "cuda-hip",
           "fn": "getenv"
         },
@@ -45626,7 +45654,7 @@
         },
         {
           "file": "engine/src/kernels/cuda/qsa_select.cu",
-          "line": 3320,
+          "line": 3344,
           "backend": "cuda",
           "fn": "getenv"
         }
@@ -45674,7 +45702,7 @@
         },
         {
           "file": "engine/src/kernels/cuda/qsa_select.cu",
-          "line": 3342,
+          "line": 3366,
           "backend": "cuda",
           "fn": "getenv"
         }
@@ -45709,13 +45737,13 @@
       "reads": [
         {
           "file": "engine/src/kernels/cuda/qsa_select.cu",
-          "line": 3155,
+          "line": 3179,
           "backend": "cuda-hip",
           "fn": "getenv"
         },
         {
           "file": "engine/src/kernels/cuda/qsa_select.cu",
-          "line": 3374,
+          "line": 3398,
           "backend": "cuda",
           "fn": "getenv"
         },
@@ -45756,7 +45784,7 @@
       "reads": [
         {
           "file": "engine/src/kernels/cuda/qsa_select.cu",
-          "line": 3200,
+          "line": 3224,
           "backend": "hip",
           "fn": "getenv"
         }
@@ -45798,7 +45826,7 @@
       "reads": [
         {
           "file": "engine/src/kernels/cuda/qsa_select.cu",
-          "line": 3136,
+          "line": 3160,
           "backend": "cuda-hip",
           "fn": "getenv"
         }
@@ -45833,7 +45861,7 @@
       "reads": [
         {
           "file": "engine/src/kernels/cuda/qsa_select.cu",
-          "line": 2904,
+          "line": 2928,
           "backend": "cuda-hip",
           "fn": "getenv"
         }
@@ -45869,7 +45897,7 @@
       "reads": [
         {
           "file": "engine/src/kernels/cuda/qsa_select.cu",
-          "line": 3224,
+          "line": 3248,
           "backend": "cuda-hip",
           "fn": "getenv"
         },

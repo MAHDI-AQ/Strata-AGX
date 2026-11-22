@@ -2415,6 +2415,30 @@ void qsa_block_scores_rows(const QsaScoreRows& rows, const float* q_idx, const i
         std::fprintf(stderr, "qsa_block_scores_rows: unsupported geometry\n");
         std::exit(1);
     }
+    static const bool rows_runs_on = [] {
+        const char* v = std::getenv("STRATA_QSA_ROWS_RUNS");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    if (rows_runs_on) {
+        for (int64_t r0 = 0; r0 < nq;) {
+            int64_t r1 = r0 + 1;
+            while (r1 < nq && r1 - r0 < 4 &&
+                   rows.pooled[r1] == rows.pooled[r0] &&
+                   rows.dead[r1] == rows.dead[r0]) {
+                ++r1;
+            }
+            const int64_t m = r1 - r0;
+            if (!qsa_block_scores_rows(rows.pooled[r0], rows.dead[r0],
+                                       q_idx + r0 * IDX_HEADS * IDX_DIM,
+                                       steps + r0 * kStepCount, m, max_blocks, s,
+                                       scores + r0 * max_blocks, stream, rows.pooled_fp16)) {
+                std::fprintf(stderr, "qsa_block_scores_rows (runs): unsupported geometry\n");
+                std::exit(1);
+            }
+            r0 = r1;
+        }
+        return;
+    }
     static const bool early = [] { const char* v = std::getenv("STRATA_QSA_EARLY_EXIT"); return v == nullptr || std::atoi(v) != 0; }();
     if (rows.pooled_fp16)
         block_scores_multi_kernel<true><<<256, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(
