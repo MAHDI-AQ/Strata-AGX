@@ -26,6 +26,7 @@ Use the guide for your GPU and operating system. Model and feature support can d
 | Intel Arc on Linux | [Intel Arc](INTEL_ARC.md) |
 | Apple Silicon | [Mac / Metal](MAC.md) |
 | More than one GPU | [Multiple GPUs](MULTI_GPU.md) |
+| Ada Lovelace (`sm_89`) multi-GPU & Waves K1–K26 optimizations | [SM89 architecture & sync guide](SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md) |
 | Two cards: one reads the prompt, one makes the answer (opt-in) | [Split serving](SPLIT_SERVE.md) |
 | Older GPUs | [Experimental hardware](OLDER_GPUS.md) |
 

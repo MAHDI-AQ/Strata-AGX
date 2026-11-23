@@ -136,6 +136,13 @@ Follow the prompts to download and start a model. [Terminal guide](docs/TERMINAL
 
 Run **`strata connect`** to see setup instructions for your tool. [Connection guide](docs/TERMINAL_LAUNCH.md#connect-your-apps-strata-connect).
 
+## Strata-AGX (Ada Lovelace `sm_89` Fork)
+
+`MAHDI-AQ/Strata-AGX` `main` tracks upstream `Niko1221/Strata` `v0.2.16` (engine `0.1.62`, zero-GGML) with opt-in NVIDIA Ada Lovelace (`sm_89`) multi-GPU, FP8 prefill, QSA, MTP, and session-memory optimizations through Wave K26 Phase 1 (default upstream execution stays byte-identical when opt-in switches are unset).
+
+- Architecture, verified `1×` / `2×` / `4× sm_89` flag profiles, spill/parity gates, and wave progression: [docs/SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md](docs/SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md)
+- Complete opt-in environment switch reference: [docs/SETTINGS.md](docs/SETTINGS.md)
+
 <a id="guides"></a>
 <a id="how-fast-is-it"></a>
 <a id="how-does-it-work"></a>
