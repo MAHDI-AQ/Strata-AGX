@@ -783,6 +783,427 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* 
 }
 #endif  // STRATA_ATTN_PRE75_BUILT
 
+// ---- STRATA_QSA_ATTN_FAST (SM89 coalesced Q4_0 chunk + 2-stage merge) ----
+__device__ __forceinline__ uint32_t qsa_shf_r16(uint32_t lo, uint32_t hi) {
+#if defined(__CUDA_ARCH__)
+    return __funnelshift_r(lo, hi, 16);
+#else
+    return (lo >> 16) | (hi << 16);
+#endif
+}
+
+// Load one 144-byte Q4_0 head row into 36 uint32_t words in SMEM using aligned vectorized __ldg loads
+// (handles 16B, 4B, and odd 2B offsets without scalar LDG.U8).
+__device__ __forceinline__ void load_q4_row_smem36(const uint8_t* __restrict__ row_ptr, uint32_t* dst36, int lane) {
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(row_ptr);
+    if ((addr & 15u) == 0u) {
+        if (lane < 9) {
+            const uint4 v = __ldg(reinterpret_cast<const uint4*>(row_ptr) + lane);
+            reinterpret_cast<uint4*>(dst36)[lane] = v;
+        }
+    } else if ((addr & 3u) == 0u) {
+        const uint32_t* p32 = reinterpret_cast<const uint32_t*>(row_ptr);
+        dst36[lane] = __ldg(p32 + lane);
+        if (lane < 4) dst36[32 + lane] = __ldg(p32 + 32 + lane);
+    } else if ((addr & 1u) == 0u) {
+        const uint16_t* p16 = reinterpret_cast<const uint16_t*>(row_ptr);
+        const uint32_t* p32 = reinterpret_cast<const uint32_t*>(row_ptr + 2);
+        uint16_t* dst16 = reinterpret_cast<uint16_t*>(dst36);
+        if (lane == 0) dst16[0] = __ldg(p16);
+        if (lane == 1) dst16[71] = __ldg(p16 + 71);
+        const uint32_t mid = __ldg(p32 + lane);
+        dst16[1 + 2 * lane] = (uint16_t) (mid & 0xFFFFu);
+        dst16[1 + 2 * lane + 1] = (uint16_t) (mid >> 16);
+        if (lane < 3) {
+            const uint32_t tail = __ldg(p32 + 32 + lane);
+            dst16[65 + 2 * lane] = (uint16_t) (tail & 0xFFFFu);
+            dst16[65 + 2 * lane + 1] = (uint16_t) (tail >> 16);
+        }
+    } else {
+        uint8_t* dst8 = reinterpret_cast<uint8_t*>(dst36);
+        for (int i = lane; i < 144; i += 32) dst8[i] = __ldg(row_ptr + i);
+    }
+}
+
+__device__ __forceinline__ void load8_q4_smem(const uint32_t* sk, int lane, float* out) {
+    const int kp = lane >> 3;
+    const int sub = lane & 7;
+    const int base_w = kp * 9;
+    const bool odd_blk = (sub & 4) != 0;
+    const bool hi_nib = (sub & 2) != 0;
+    const bool hi_half = (sub & 1) != 0;
+    uint16_t d_bits;
+    uint32_t wa, wb;
+    if (!odd_blk) {
+        const uint32_t w0 = sk[base_w + 0];
+        d_bits = (uint16_t) (w0 & 0xFFFFu);
+        if (!hi_half) {
+            const uint32_t w1 = sk[base_w + 1];
+            const uint32_t w2 = sk[base_w + 2];
+            wa = qsa_shf_r16(w0, w1);
+            wb = qsa_shf_r16(w1, w2);
+        } else {
+            const uint32_t w2 = sk[base_w + 2];
+            const uint32_t w3 = sk[base_w + 3];
+            const uint32_t w4 = sk[base_w + 4];
+            wa = qsa_shf_r16(w2, w3);
+            wb = qsa_shf_r16(w3, w4);
+        }
+    } else {
+        d_bits = (uint16_t) (sk[base_w + 4] >> 16);
+        if (!hi_half) {
+            wa = sk[base_w + 5];
+            wb = sk[base_w + 6];
+        } else {
+            wa = sk[base_w + 7];
+            wb = sk[base_w + 8];
+        }
+    }
+    const float d = __half2float(__ushort_as_half(d_bits));
+    const int sh = hi_nib ? 4 : 0;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int q0 = (int) ((wa >> (k * 8 + sh)) & 0xFu) - 8;
+        const int q1 = (int) ((wb >> (k * 8 + sh)) & 0xFu) - 8;
+        out[k] = (float) q0 * d;
+        out[k + 4] = (float) q1 * d;
+    }
+}
+
+template <int GG>
+__device__ __forceinline__ void fold_cell_fast(float (&acc)[GG], const float* w, float v) {
+    if constexpr (GG == 12) {
+        const float4 w0 = *reinterpret_cast<const float4*>(&w[0]);
+        acc[0] = fmaf(w0.x, v, acc[0]);
+        acc[1] = fmaf(w0.y, v, acc[1]);
+        acc[2] = fmaf(w0.z, v, acc[2]);
+        acc[3] = fmaf(w0.w, v, acc[3]);
+        const float4 w1 = *reinterpret_cast<const float4*>(&w[4]);
+        acc[4] = fmaf(w1.x, v, acc[4]);
+        acc[5] = fmaf(w1.y, v, acc[5]);
+        acc[6] = fmaf(w1.z, v, acc[6]);
+        acc[7] = fmaf(w1.w, v, acc[7]);
+        const float4 w2 = *reinterpret_cast<const float4*>(&w[8]);
+        acc[8] = fmaf(w2.x, v, acc[8]);
+        acc[9] = fmaf(w2.y, v, acc[9]);
+        acc[10] = fmaf(w2.z, v, acc[10]);
+        acc[11] = fmaf(w2.w, v, acc[11]);
+    } else if constexpr (GG == 6) {
+        const float4 w0 = *reinterpret_cast<const float4*>(&w[0]);
+        const float2 w1 = *reinterpret_cast<const float2*>(&w[4]);
+        acc[0] = fmaf(w0.x, v, acc[0]);
+        acc[1] = fmaf(w0.y, v, acc[1]);
+        acc[2] = fmaf(w0.z, v, acc[2]);
+        acc[3] = fmaf(w0.w, v, acc[3]);
+        acc[4] = fmaf(w1.x, v, acc[4]);
+        acc[5] = fmaf(w1.y, v, acc[5]);
+    } else {
+        fold_cell<GG>(acc, w, v);
+    }
+}
+
+template <bool SPLIT_HEAD, bool ROT>
+__device__ __forceinline__ void attn_chunk_q4_fast_body(
+    const float* __restrict__ q, QsaAttnPools p, const int32_t* __restrict__ ids, const int32_t* __restrict__ step,
+    int n_kv_heads, int page_size, float scale, float* __restrict__ part_acc, float* __restrict__ part_m,
+    float* __restrict__ part_l, int n_chunks, int cap, long long scratch_stride) {
+    q += (size_t) blockIdx.z * (size_t) (n_kv_heads * G) * HD;
+    ids += (size_t) blockIdx.z * (size_t) cap;
+    step += (size_t) blockIdx.z * kStepCount;
+    part_acc += (size_t) blockIdx.z * (size_t) scratch_stride;
+    part_m += (size_t) blockIdx.z * (size_t) scratch_stride;
+    part_l += (size_t) blockIdx.z * (size_t) scratch_stride;
+
+    constexpr int G_ACT = SPLIT_HEAD ? (G / 2) : G;
+    constexpr int SPT_STRIDE = (G_ACT + 3) & ~3;
+    const int kvh = SPLIT_HEAD ? (blockIdx.y / 2) : blockIdx.y;
+    const int sub_head = SPLIT_HEAD ? (blockIdx.y % 2) : 0;
+    const int head_offset = sub_head * G_ACT;
+
+    union SharedMem {
+        struct {
+            __align__(16) float sq[G_ACT][HD];
+            __align__(16) uint32_t sk[WARPS][4][36];
+        } score;
+        struct {
+            __align__(16) float spt[CHUNK][SPT_STRIDE];
+            __align__(16) uint32_t sv[8][36];
+        } val;
+    };
+    __shared__ SharedMem sm;
+    __shared__ float sp[G_ACT][CHUNK];
+    __shared__ long long srow[CHUNK];
+
+    const int n_ids = __ldg(step + kStepWidth);
+    const int chunk = blockIdx.x;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int c0 = chunk * CHUNK;
+    const int n_here = min(CHUNK, n_ids - c0);
+    const int slot = kvh * n_chunks + chunk;
+    if (n_here <= 0) {
+        if (t < G_ACT) {
+            part_m[slot * G + head_offset + t] = -FLT_MAX;
+            part_l[slot * G + head_offset + t] = 0.0f;
+        }
+        return;
+    }
+
+    const float* q_sub = q + ((size_t) (kvh * G + head_offset)) * HD;
+    if constexpr (ROT) {
+        if (warp < G_ACT) {
+            const float* q_head = q_sub + (size_t) warp * HD;
+            float reg[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) reg[i] = q_head[i * 32 + lane] * (1.0f / 16.0f);
+#pragma unroll
+            for (int h = 1; h < 32; h *= 2) {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float val = reg[j];
+                    const float val2 = __shfl_xor_sync(0xffffffffu, val, h, 32);
+                    reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
+                }
+            }
+#pragma unroll
+            for (int h = 32; h < 256; h *= 2) {
+                const int step_fwht = h / 32;
+#pragma unroll
+                for (int j = 0; j < 8; j += 2 * step_fwht) {
+#pragma unroll
+                    for (int k = 0; k < step_fwht; ++k) {
+                        const float x = reg[j + k];
+                        const float y = reg[j + k + step_fwht];
+                        reg[j + k] = x + y;
+                        reg[j + k + step_fwht] = x - y;
+                    }
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int d = i * 32 + lane;
+                const int sd = d ^ ((d >> 3) & 4);
+                sm.score.sq[warp][sd] = reg[i];
+            }
+        }
+    } else {
+        for (int i = t; i < G_ACT * HD; i += THREADS) {
+            const int d = i % HD;
+            const int sd = d ^ ((d >> 3) & 4);
+            sm.score.sq[i / HD][sd] = __ldg(&q_sub[i]);
+        }
+    }
+    if (t < CHUNK) {
+        long long r = -1;
+        if (t < n_here) {
+            const int cell = __ldg(&ids[c0 + t]);
+            const long long page = (long long) __ldg(&p.page_table[cell / page_size]);
+            if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+        }
+        srow[t] = r;
+    }
+    __syncthreads();
+
+    // Score phase: 8 cells per warp in two 4-cell coalesced batches + reduce12 + bank-conflict-free swizzled sq
+    const int hd = head_of_lane(lane);
+    const bool k_aligned16 = ((reinterpret_cast<uintptr_t>(p.k_q4) & 15u) == 0u);
+    auto score_q_head = [&](int h, const float (&k8)[8]) __attribute__((always_inline)) {
+        const int qflip = lane & 4;
+        const float4 qa = *reinterpret_cast<const float4*>(&sm.score.sq[h][lane * 8 + qflip]);
+        const float4 qb = *reinterpret_cast<const float4*>(&sm.score.sq[h][lane * 8 + (qflip ^ 4)]);
+        return k8[0] * qa.x + k8[1] * qa.y + k8[2] * qa.z + k8[3] * qa.w +
+               k8[4] * qb.x + k8[5] * qb.y + k8[6] * qb.z + k8[7] * qb.w;
+    };
+    for (int b_idx = 0; b_idx < 2; ++b_idx) {
+        const int base_c = b_idx * 32 + warp;
+        const bool all_ok = (srow[base_c + 0] >= 0) && (srow[base_c + 8] >= 0) &&
+                            (srow[base_c + 16] >= 0) && (srow[base_c + 24] >= 0);
+        unsigned valid_mask = 0u;
+        if (all_ok) {
+            if (k_aligned16) {
+                const int j_a = lane / 9;
+                const int w4_a = lane % 9;
+                const long long r_a = srow[base_c + j_a * 8];
+                const uint4 va = __ldg(reinterpret_cast<const uint4*>(p.k_q4 + r_a * 144) + w4_a);
+                uint4 vb{};
+                if (lane < 4) vb = __ldg(reinterpret_cast<const uint4*>(p.k_q4 + srow[base_c + 24] * 144) + (5 + lane));
+                uint4* sk4 = reinterpret_cast<uint4*>(&sm.score.sk[warp][0][0]);
+                sk4[lane] = va;
+                if (lane < 4) sk4[32 + lane] = vb;
+            } else {
+#pragma unroll 1
+                for (int j = 0; j < 4; ++j) {
+                    load_q4_row_smem36(p.k_q4 + srow[base_c + j * 8] * 144, sm.score.sk[warp][j], lane);
+                }
+            }
+            valid_mask = 0xFu;
+        } else {
+#pragma unroll 1
+            for (int j = 0; j < 4; ++j) {
+                const int c = base_c + j * 8;
+                const long long rc = srow[c];
+                if (rc >= 0) {
+                    load_q4_row_smem36(p.k_q4 + rc * 144, sm.score.sk[warp][j], lane);
+                    valid_mask |= (1u << j);
+                } else if (lane < G_ACT) {
+                    sp[lane][c] = -FLT_MAX;
+                }
+            }
+        }
+        __syncwarp();
+#pragma unroll 1
+        for (int j = 0; j < 4; ++j) {
+            if ((valid_mask & (1u << j)) == 0u) continue;
+            float k8[8];
+            load8_q4_smem(sm.score.sk[warp][j], lane, k8);
+            float part[16];
+            if constexpr (G_ACT == 12) {
+#pragma unroll
+                for (int hb = 0; hb < 12; hb += 2) {
+                    if (hb > 0) __syncwarp();
+                    part[hb + 0] = score_q_head(hb + 0, k8);
+                    part[hb + 1] = score_q_head(hb + 1, k8);
+                }
+            } else {
+#pragma unroll
+                for (int h = 0; h < G_ACT; ++h) part[h] = score_q_head(h, k8);
+            }
+#pragma unroll
+            for (int h = G_ACT; h < 16; ++h) part[h] = 0.0f;
+            const float sj = reduce12<false>(part, lane);
+            if ((lane & 1) == 0 && hd < G_ACT) sp[hd][base_c + j * 8] = sj * scale;
+        }
+    }
+    __syncthreads();
+
+    // Softmax phase: writes cell-major probabilities into sm.val.spt (leaving sq/sk dead)
+    for (int h = warp; h < G_ACT; h += WARPS) {
+        const float a = sp[h][lane], b = sp[h][lane + 32];
+        const float m = warp_max(fmaxf(a, b));
+        const float ea = (lane < n_here && srow[lane] >= 0) ? __expf(a - m) : 0.0f;
+        const float eb = (lane + 32 < n_here && srow[lane + 32] >= 0) ? __expf(b - m) : 0.0f;
+        sm.val.spt[lane][h] = ea;
+        sm.val.spt[lane + 32][h] = eb;
+        const float l = warp_sum(ea + eb);
+        if (lane == 0) {
+            part_m[slot * G + head_offset + h] = m;
+            part_l[slot * G + head_offset + h] = l;
+        }
+    }
+    __syncthreads();
+
+    // Value phase: 8 cells in flight per batch + register prefetch of next 8 cells, zero bank conflicts
+    float acc[G_ACT];
+#pragma unroll
+    for (int h = 0; h < G_ACT; ++h) acc[h] = 0.0f;
+
+    const int b_v = t >> 5;
+    const int rem_v = t & 31;
+    const int kp_v = b_v >> 1;
+    const int odd_v = b_v & 1;
+    const int base_wv = kp_v * 9;
+    const int d_word_idx = base_wv + (odd_v ? 4 : 0);
+    const int d_shift = odd_v ? 16 : 0;
+    const int byte_off = (odd_v ? 20 : 2) + (rem_v & 15);
+    const int q_word_idx = base_wv + (byte_off >> 2);
+    const int q_shift = (byte_off & 3) * 8 + (rem_v >= 16 ? 4 : 0);
+
+    if ((reinterpret_cast<uintptr_t>(p.v_q4) & 15u) == 0u) {
+        if (warp < n_here && srow[warp] >= 0 && lane < 9) {
+            const uint4 v4 = __ldg(reinterpret_cast<const uint4*>(p.v_q4 + srow[warp] * 144) + lane);
+            reinterpret_cast<uint4*>(&sm.val.sv[warp][0])[lane] = v4;
+        }
+        __syncthreads();
+        for (int c_beg = 0; c_beg < n_here; c_beg += 8) {
+            uint4 nxt_v4{};
+            const int c_nxt = c_beg + 8 + warp;
+            const bool has_nxt = (c_nxt < n_here) && (srow[c_nxt] >= 0) && (lane < 9);
+            if (has_nxt) {
+                nxt_v4 = __ldg(reinterpret_cast<const uint4*>(p.v_q4 + srow[c_nxt] * 144) + lane);
+            }
+            if (c_beg + 8 <= n_here &&
+                (srow[c_beg] | srow[c_beg + 1] | srow[c_beg + 2] | srow[c_beg + 3] |
+                 srow[c_beg + 4] | srow[c_beg + 5] | srow[c_beg + 6] | srow[c_beg + 7]) >= 0) {
+#pragma unroll 2
+                for (int k = 0; k < 8; ++k) {
+                    const uint32_t* sv = sm.val.sv[k];
+                    const uint16_t d_bits = (uint16_t) ((sv[d_word_idx] >> d_shift) & 0xFFFFu);
+                    const float dd = __half2float(__ushort_as_half(d_bits));
+                    const int nibble = (int) ((sv[q_word_idx] >> q_shift) & 0xFu) - 8;
+                    fold_cell_fast<G_ACT>(acc, sm.val.spt[c_beg + k], (float) nibble * dd);
+                }
+            } else {
+                const int klim = min(8, n_here - c_beg);
+#pragma unroll 1
+                for (int k = 0; k < klim; ++k) {
+                    if (srow[c_beg + k] < 0) continue;
+                    const uint32_t* sv = sm.val.sv[k];
+                    const uint16_t d_bits = (uint16_t) ((sv[d_word_idx] >> d_shift) & 0xFFFFu);
+                    const float dd = __half2float(__ushort_as_half(d_bits));
+                    const int nibble = (int) ((sv[q_word_idx] >> q_shift) & 0xFu) - 8;
+                    fold_cell_fast<G_ACT>(acc, sm.val.spt[c_beg + k], (float) nibble * dd);
+                }
+            }
+            if (c_beg + 8 < n_here) {
+                __syncthreads();
+                if (has_nxt) {
+                    reinterpret_cast<uint4*>(&sm.val.sv[warp][0])[lane] = nxt_v4;
+                }
+                __syncthreads();
+            }
+        }
+    } else {
+        for (int c_beg = 0; c_beg < n_here; c_beg += 8) {
+            const int c_cur = c_beg + warp;
+            if (c_cur < n_here && srow[c_cur] >= 0) {
+                load_q4_row_smem36(p.v_q4 + srow[c_cur] * 144, sm.val.sv[warp], lane);
+            }
+            __syncthreads();
+            const int klim = min(8, n_here - c_beg);
+#pragma unroll 1
+            for (int k = 0; k < klim; ++k) {
+                if (srow[c_beg + k] < 0) continue;
+                const uint32_t* sv = sm.val.sv[k];
+                const uint16_t d_bits = (uint16_t) ((sv[d_word_idx] >> d_shift) & 0xFFFFu);
+                const float dd = __half2float(__ushort_as_half(d_bits));
+                const int nibble = (int) ((sv[q_word_idx] >> q_shift) & 0xFu) - 8;
+                fold_cell_fast<G_ACT>(acc, sm.val.spt[c_beg + k], (float) nibble * dd);
+            }
+            if (c_beg + 8 < n_here) __syncthreads();
+        }
+    }
+
+#pragma unroll
+    for (int h = 0; h < G_ACT; ++h)
+        part_acc[((size_t) slot * G + head_offset + h) * HD + t] = acc[h];
+}
+
+template <bool SPLIT_HEAD, bool ROT>
+__global__ void __launch_bounds__(THREADS, 4) attn_chunk_q4_fast_kernel(
+    const float* __restrict__ q, QsaAttnPools p, const int32_t* __restrict__ ids, const int32_t* __restrict__ step,
+    int n_kv_heads, int page_size, float scale, float* __restrict__ part_acc, float* __restrict__ part_m,
+    float* __restrict__ part_l, int n_chunks, int cap = 0, long long scratch_stride = 0) {
+    attn_chunk_q4_fast_body<SPLIT_HEAD, ROT>(q, p, ids, step, n_kv_heads, page_size, scale,
+                                             part_acc, part_m, part_l, n_chunks, cap, scratch_stride);
+}
+
+template <bool SPLIT_HEAD>
+__global__ void __launch_bounds__(THREADS, 4) attn_chunk_slots_q4_fast_kernel(
+    const float* __restrict__ q, QsaAttnSlotPools ps, const int32_t* __restrict__ ids, const int32_t* __restrict__ step,
+    int n_kv_heads, int page_size, float scale, float* __restrict__ part_acc, float* __restrict__ part_m,
+    float* __restrict__ part_l, int n_chunks, int cap, long long scratch_stride) {
+    attn_chunk_q4_fast_body<SPLIT_HEAD, false>(q, ps.p[blockIdx.z], ids, step, n_kv_heads, page_size, scale,
+                                               part_acc, part_m, part_l, n_chunks, cap, scratch_stride);
+}
+
+template <bool SPLIT_HEAD>
+__global__ void __launch_bounds__(THREADS, 4) attn_chunk_rows_q4_fast_kernel(
+    const float* __restrict__ q, QsaAttnPoolsRows rows, const int32_t* __restrict__ ids, const int32_t* __restrict__ step,
+    int n_kv_heads, int page_size, float scale, float* __restrict__ part_acc, float* __restrict__ part_m,
+    float* __restrict__ part_l, int n_chunks, int cap, long long scratch_stride) {
+    attn_chunk_q4_fast_body<SPLIT_HEAD, false>(q, rows.p[blockIdx.z], ids, step, n_kv_heads, page_size, scale,
+                                               part_acc, part_m, part_l, n_chunks, cap, scratch_stride);
+}
+
 
 __device__ __forceinline__ void fwht256_warp_inplace(float* smem, int lane) {
     constexpr float scale = 1.0f / 16.0f;
@@ -967,6 +1388,111 @@ __global__ void __launch_bounds__(HD) attn_merge_v2_kernel(const float* __restri
     merge_epilogue_fwht_gate(acc, L, h, gridDim.x, blockIdx.y, d, attn, q_full, attn_gated, rot);
 }
 
+constexpr int kMergeFastSplits = 16;
+constexpr int kMergeFastU1 = 8;
+
+template <int S_MAX, int U>
+__global__ void __launch_bounds__(HD) attn_merge_v2_split1_kernel(
+    float* __restrict__ part_acc, float* __restrict__ part_m, float* __restrict__ part_l,
+    int n_chunks, const int32_t* __restrict__ steps, long long scratch_stride) {
+    part_acc += (size_t) blockIdx.y * (size_t) scratch_stride;
+    part_m   += (size_t) blockIdx.y * (size_t) scratch_stride;
+    part_l   += (size_t) blockIdx.y * (size_t) scratch_stride;
+    const int width = __ldg(steps + (size_t) blockIdx.y * kStepCount + kStepWidth);
+    const int n_act = width > 0 ? min(n_chunks, (width - 1) / CHUNK + 1) : 0;
+    const int split_chunks = n_act > 0 ? max(1, (n_act + S_MAX - 1) / S_MAX) : 1;
+    const int s = blockIdx.z;
+    const int c_beg = s * split_chunks;
+    if (c_beg >= n_act) return;
+    const int c_end = min(n_act, c_beg + split_chunks);
+    const int len = c_end - c_beg;
+
+    const int h = blockIdx.x;
+    const int kvh = h / G, hl = h % G;
+    const int d = threadIdx.x;
+    const size_t base = (size_t) kvh * (size_t) n_chunks * G + (size_t) hl;
+    float* pm_all = part_m + base;
+    float* pl_all = part_l + base;
+    float* pa_all = part_acc + base * HD + (size_t) d;
+
+    const float* pm = pm_all + (size_t) c_beg * G;
+    const float* pl = pl_all + (size_t) c_beg * G;
+    const float* pa = pa_all + (size_t) c_beg * G * HD;
+
+    const int n_full = len - len % U;
+    float M = -FLT_MAX;
+    for (int c0 = 0; c0 < n_full; c0 += U) merge_max_block<U, false>(pm, c0, len, M);
+    if (n_full < len) merge_max_block<U, true>(pm, n_full, len, M);
+    float L = 0.0f, acc = 0.0f;
+    for (int c0 = 0; c0 < n_full; c0 += U) merge_sum_block<U, false>(pm, pl, pa, c0, len, M, L, acc);
+    if (n_full < len) merge_sum_block<U, true>(pm, pl, pa, n_full, len, M, L, acc);
+
+    __syncthreads();
+    if (d == 0) {
+        pm_all[(size_t) c_beg * G] = M;
+        pl_all[(size_t) c_beg * G] = L;
+    }
+    pa_all[(size_t) c_beg * G * HD] = acc;
+}
+
+template <int S_MAX>
+__global__ void __launch_bounds__(HD, 4) attn_merge_v2_split2_kernel(
+    const float* __restrict__ part_acc, const float* __restrict__ part_m, const float* __restrict__ part_l,
+    int n_chunks, const int32_t* __restrict__ steps, float* __restrict__ attn, long long scratch_stride,
+    const float* __restrict__ q_full = nullptr, float* __restrict__ attn_gated = nullptr, bool rot = false) {
+    part_acc += (size_t) blockIdx.y * (size_t) scratch_stride;
+    part_m   += (size_t) blockIdx.y * (size_t) scratch_stride;
+    part_l   += (size_t) blockIdx.y * (size_t) scratch_stride;
+    attn     += (size_t) blockIdx.y * (size_t) gridDim.x * HD;
+    const int width = __ldg(steps + (size_t) blockIdx.y * kStepCount + kStepWidth);
+    const int n_act = width > 0 ? min(n_chunks, (width - 1) / CHUNK + 1) : 0;
+    const int split_chunks = n_act > 0 ? max(1, (n_act + S_MAX - 1) / S_MAX) : 1;
+
+    const int h = blockIdx.x;
+    const int kvh = h / G, hl = h % G;
+    const int d = threadIdx.x;
+    const size_t base = (size_t) kvh * (size_t) n_chunks * G + (size_t) hl;
+    const float* pm = part_m + base;
+    const float* pl = part_l + base;
+    const float* pa = part_acc + base * HD + (size_t) d;
+
+    float M = -FLT_MAX;
+#pragma unroll 1
+    for (int s0 = 0; s0 < S_MAX; s0 += 4) {
+        float mm[4];
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const int c_beg = (s0 + u) * split_chunks;
+            mm[u] = (c_beg < n_act) ? pm[(size_t) c_beg * G] : -FLT_MAX;
+        }
+#pragma unroll
+        for (int u = 0; u < 4; ++u) M = fmaxf(M, mm[u]);
+    }
+    float L = 0.0f, acc = 0.0f;
+#pragma unroll 1
+    for (int s0 = 0; s0 < S_MAX; s0 += 4) {
+        float mm[4], ll[4], aa[4];
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const int c_beg = (s0 + u) * split_chunks;
+            const bool in = (c_beg < n_act);
+            mm[u] = in ? pm[(size_t) c_beg * G] : -FLT_MAX;
+            ll[u] = in ? pl[(size_t) c_beg * G] : 0.0f;
+            aa[u] = in ? pa[(size_t) c_beg * G * HD] : 0.0f;
+        }
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const float w = __expf(mm[u] - M);
+            const float L_next = fmaf(ll[u], w, L);
+            const float acc_next = fmaf(aa[u], w, acc);
+            const bool live = !(mm[u] == -FLT_MAX);
+            L = live ? L_next : L;
+            acc = live ? acc_next : acc;
+        }
+    }
+    merge_epilogue_fwht_gate(acc, L, h, gridDim.x, blockIdx.y, d, attn, q_full, attn_gated, rot);
+}
+
 #if defined(STRATA_HIP_GFX906)
 // The compat backend can target other architectures. Check the calling thread's current device,
 // caching only its last ordinal so a layer split or another thread cannot reuse the wrong answer.
@@ -1111,6 +1637,20 @@ int attn_nosplit_min_chunks() {
     return v;
 }
 
+// Opt-in SM89 Q4_0 decode attention + 2-stage merge lever (default 0 = byte-identical fallback).
+//   0: off (default)
+//   1: fast coalesced Q4_0 chunk kernels + 2-stage split attn_merge_v2 when n_q * n_head < 64 && n_chunks >= 64
+//   2: fast coalesced Q4_0 chunk kernels only (1-stage merge)
+int qsa_attn_fast_mode() {
+    static const int mode = [] {
+        const char* v = std::getenv("STRATA_QSA_ATTN_FAST");
+        if (!v || !*v) return 0;
+        const int m = std::atoi(v);
+        return (m == 1 || m == 2) ? m : (m != 0 ? 1 : 0);
+    }();
+    return mode;
+}
+
 // the merge of `n_q` queries' partials: v2 = 0 attn_merge_kernel, 1 attn_merge_v2_kernel (bitwise the same output)
 void launch_merge(int v2, const float* part_acc, const float* part_m, const float* part_l, int n_chunks,
                   const int32_t* steps, float* attn, long long stride, unsigned n_head, unsigned n_q, cudaStream_t st,
@@ -1121,6 +1661,27 @@ void launch_merge(int v2, const float* part_acc, const float* part_m, const floa
     else
         attn_merge_kernel<<<dim3(n_head, n_q), HD, 0, st>>>(part_acc, part_m, part_l, n_chunks, attn, stride,
                                                             q_full, attn_gated, rot_out);
+}
+
+void launch_merge_mut(int v2, float* part_acc, float* part_m, float* part_l, int n_chunks,
+                      const int32_t* steps, float* attn, long long stride, unsigned n_head, unsigned n_q,
+                      cudaStream_t st, const float* q_full = nullptr, float* attn_gated = nullptr,
+                      bool rot_out = false) {
+    static const bool merge_v2_explicit_zero = [] {
+        const char* v = std::getenv("STRATA_ATTN_MERGE_V2");
+        return v != nullptr && *v != '\0' && std::atoi(v) == 0;
+    }();
+    const bool use_split = (qsa_attn_fast_mode() == 1) && (v2 != 0 || !merge_v2_explicit_zero) &&
+                           ((unsigned long long) n_q * (unsigned long long) n_head < 64ull) && (n_chunks >= 64);
+    if (use_split) {
+        attn_merge_v2_split1_kernel<kMergeFastSplits, kMergeFastU1><<<dim3(n_head, n_q, kMergeFastSplits), HD, 0, st>>>(
+            part_acc, part_m, part_l, n_chunks, steps, stride);
+        attn_merge_v2_split2_kernel<kMergeFastSplits><<<dim3(n_head, n_q), HD, 0, st>>>(
+            part_acc, part_m, part_l, n_chunks, steps, attn, stride, q_full, attn_gated, rot_out);
+        return;
+    }
+    launch_merge(v2, part_acc, part_m, part_l, n_chunks, steps, attn, stride, n_head, n_q, st,
+                 q_full, attn_gated, rot_out);
 }
 
 // qsa_decode_attn_batch's chunk pass: `n_q` queries' partials into `scratch` (one stride each).  `kernel` < 0 is the
@@ -1189,7 +1750,24 @@ void launch_chunks_batch(const float* q, const QsaAttnPools& pools, const int32_
                                                               scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
     else
 #endif
-    if (pre) {
+    if (kernel < 0 && kv_mode == 2 && qsa_attn_fast_mode() > 0) {
+        const int nosplit_min = attn_nosplit_min_chunks();
+        if (!rot_q && nosplit_min > 0 && n_chunks >= nosplit_min) {
+            attn_chunk_q4_fast_kernel<false, false><<<grid_orig, THREADS, 0, st>>>(
+                q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale,
+                part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+        } else {
+            const dim3 grid_split((unsigned) n_chunks, (unsigned) (s.n_head_kv * 2), (unsigned) n_q);
+            if (rot_q)
+                attn_chunk_q4_fast_kernel<true, true><<<grid_split, THREADS, 0, st>>>(
+                    q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale,
+                    part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+            else
+                attn_chunk_q4_fast_kernel<true, false><<<grid_split, THREADS, 0, st>>>(
+                    q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale,
+                    part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+        }
+    } else if (pre) {
         if (kv_mode == 3)
             STRATA_ATTN_CHUNK_SEL(3, true)<<<grid_orig, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv,
                                                                           (int) s.page_size, scale, part_acc, part_m, part_l,
@@ -1280,6 +1858,18 @@ void launch_merge_batch(const int32_t* steps, int64_t cap, const QsaShapes& s, c
                  q_full, attn_gated, rot_out);
 }
 
+void launch_merge_batch_mut(const int32_t* steps, int64_t cap, const QsaShapes& s, float* scratch, float* attn,
+                            int64_t n_q, int v2, cudaStream_t st,
+                            const float* q_full = nullptr, float* attn_gated = nullptr, bool rot_out = false) {
+    const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
+    const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
+    float* part_acc = scratch;
+    float* part_m = scratch + (size_t) n_chunks * s.n_head * HD;
+    float* part_l = part_m + (size_t) n_chunks * s.n_head;
+    launch_merge_mut(v2, part_acc, part_m, part_l, n_chunks, steps, attn, stride, (unsigned) s.n_head, (unsigned) n_q, st,
+                     q_full, attn_gated, rot_out);
+}
+
 }  // namespace
 
 void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
@@ -1293,7 +1883,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     }
     cudaStream_t st = (cudaStream_t) stream;
     launch_chunks_batch(q, pools, ids, steps, cap, s, scratch, n_q, st, -1, rot_q);
-    launch_merge_batch(steps, cap, s, scratch, attn, n_q, attn_merge_v2(), st, q_full, attn_gated, rot_out);
+    launch_merge_batch_mut(steps, cap, s, scratch, attn, n_q, attn_merge_v2(), st, q_full, attn_gated, rot_out);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "qsa_decode_attn_batch: %s\n", cudaGetErrorString(e));
@@ -1342,6 +1932,17 @@ bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const 
         else if (kv_mode == 2) STRATA_ATTN_SLOTS(2, true);
         else if (kv_mode == 1) STRATA_ATTN_SLOTS(1, true);
         else STRATA_ATTN_SLOTS(0, true);
+    } else if (kv_mode == 2 && qsa_attn_fast_mode() > 0) {
+        if ((long long) n_chunks * s.n_head_kv * n_q < 128) {
+            const dim3 grid_split((unsigned) n_chunks, (unsigned) (s.n_head_kv * 2), (unsigned) n_q);
+            attn_chunk_slots_q4_fast_kernel<true><<<grid_split, THREADS, 0, st>>>(
+                q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale,
+                part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+        } else {
+            attn_chunk_slots_q4_fast_kernel<false><<<grid, THREADS, 0, st>>>(
+                q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale,
+                part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+        }
     } else {
         if (kv_mode == 3) STRATA_ATTN_SLOTS(3, false);
         else if (kv_mode == 2) STRATA_ATTN_SLOTS(2, false);
@@ -1349,8 +1950,8 @@ bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const 
         else STRATA_ATTN_SLOTS(0, false);
     }
 #undef STRATA_ATTN_SLOTS
-    launch_merge(attn_merge_v2(), part_acc, part_m, part_l, n_chunks, steps, attn, stride, (unsigned) s.n_head,
-                 (unsigned) n_q, st);
+    launch_merge_mut(attn_merge_v2(), part_acc, part_m, part_l, n_chunks, steps, attn, stride, (unsigned) s.n_head,
+                     (unsigned) n_q, st);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "qsa_decode_attn_slots: %s\n", cudaGetErrorString(e));
@@ -1397,13 +1998,24 @@ void qsa_decode_attn_batch_rows(const float* q, const QsaAttnPoolsRows& rows, co
     }
 #define STRATA_ATTN_ROWS(M) attn_chunk_rows_kernel<M><<<grid, THREADS, 0, st>>>(q, rows, ids, steps, (int) s.n_head_kv, \
         (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride)
-    if (kv_mode == 3) STRATA_ATTN_ROWS(3);
+    if (kv_mode == 2 && qsa_attn_fast_mode() > 0) {
+        if ((long long) n_chunks * s.n_head_kv * n_q < 128) {
+            const dim3 grid_split((unsigned) n_chunks, (unsigned) (s.n_head_kv * 2), (unsigned) n_q);
+            attn_chunk_rows_q4_fast_kernel<true><<<grid_split, THREADS, 0, st>>>(
+                q, rows, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale,
+                part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+        } else {
+            attn_chunk_rows_q4_fast_kernel<false><<<grid, THREADS, 0, st>>>(
+                q, rows, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale,
+                part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+        }
+    } else if (kv_mode == 3) STRATA_ATTN_ROWS(3);
     else if (kv_mode == 2) STRATA_ATTN_ROWS(2);
     else if (kv_mode == 1) STRATA_ATTN_ROWS(1);
     else STRATA_ATTN_ROWS(0);
 #undef STRATA_ATTN_ROWS
-    launch_merge(attn_merge_v2(), part_acc, part_m, part_l, n_chunks, steps, attn, stride, (unsigned) s.n_head,
-                 (unsigned) n_q, st);
+    launch_merge_mut(attn_merge_v2(), part_acc, part_m, part_l, n_chunks, steps, attn, stride, (unsigned) s.n_head,
+                     (unsigned) n_q, st);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "qsa_decode_attn_batch_rows: %s\n", cudaGetErrorString(e));
@@ -1444,7 +2056,25 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
     const bool pre = false;
 #endif
 
-    if (!pre) {
+    if (!pre && kv_mode == 2 && qsa_attn_fast_mode() > 0) {
+        const int nosplit_min = attn_nosplit_min_chunks();
+        if (!rot_q && nosplit_min > 0 && n_chunks >= nosplit_min) {
+            const dim3 grid_ns((unsigned) n_chunks, (unsigned) s.n_head_kv);
+            attn_chunk_q4_fast_kernel<false, false><<<grid_ns, THREADS, 0, st>>>(
+                q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size, scale,
+                part_acc, part_m, part_l, n_chunks, 0, 0);
+        } else {
+            const dim3 grid_split((unsigned) n_chunks, (unsigned) (s.n_head_kv * 2));
+            if (rot_q)
+                attn_chunk_q4_fast_kernel<true, true><<<grid_split, THREADS, 0, st>>>(
+                    q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size, scale,
+                    part_acc, part_m, part_l, n_chunks, 0, 0);
+            else
+                attn_chunk_q4_fast_kernel<true, false><<<grid_split, THREADS, 0, st>>>(
+                    q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size, scale,
+                    part_acc, part_m, part_l, n_chunks, 0, 0);
+        }
+    } else if (!pre) {
         const int nosplit_min = attn_nosplit_min_chunks();
         if (!rot_q && nosplit_min > 0 && n_chunks >= nosplit_min) {
             const dim3 grid_ns((unsigned) n_chunks, (unsigned) s.n_head_kv);
@@ -1518,8 +2148,8 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
             STRATA_ATTN_CHUNK(0)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
                                                             scale, part_acc, part_m, part_l, n_chunks, 0, 0);
     }
-    launch_merge(attn_merge_v2(), part_acc, part_m, part_l, n_chunks, step, attn, 0, (unsigned) s.n_head, 1u, st,
-                 q_full, attn_gated, rot_out);
+    launch_merge_mut(attn_merge_v2(), part_acc, part_m, part_l, n_chunks, step, attn, 0, (unsigned) s.n_head, 1u, st,
+                     q_full, attn_gated, rot_out);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "qsa_decode_attn: %s\n", cudaGetErrorString(e));

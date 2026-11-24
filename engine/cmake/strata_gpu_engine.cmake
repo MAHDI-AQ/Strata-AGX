@@ -201,6 +201,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(qsa_rows_bench EXCLUDE_FROM_ALL src/kernels/qsa_rows_bench.cpp)
     target_include_directories(qsa_rows_bench PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(qsa_rows_bench PRIVATE strata_kernels CUDA::cudart)
+    add_executable(qsa_q4_fast_parity EXCLUDE_FROM_ALL src/kernels/qsa_q4_fast_parity.cpp)
+    target_include_directories(qsa_q4_fast_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(qsa_q4_fast_parity PRIVATE strata_kernels CUDA::cudart)
   endif()
   # the QSA selection (block scores on the warp kernel and the tensor-core one, top-k): a GPU bench with a
   # scorer-vs-scorer comparison and an FP64 accuracy gate (synthetic, no model); the ctest runs a 32K context under a
