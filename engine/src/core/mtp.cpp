@@ -182,6 +182,14 @@ bool mtp_q4_shared_on() {
     return on;
 }
 
+bool mtp_pair_t2_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_MTP_PAIR_T2");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
+
 }  // namespace
 
 MtpDrafter::~MtpDrafter() {
@@ -196,6 +204,8 @@ MtpDrafter::~MtpDrafter() {
     for (auto& e : round_exec_c_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : step_exec_c_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : chain_exec_c_) if (e) cudaGraphExecDestroy(e);
+    for (auto& pg : pair_exec_) if (pg.exec) cudaGraphExecDestroy(pg.exec);
+    for (auto& pg : pair_chain_exec_) if (pg.exec) cudaGraphExecDestroy(pg.exec);
     if (cparams_) cudaFree(cparams_);
     if (cring_) cudaFree(cring_);
     if (dinv_) cudaFree(dinv_);
@@ -458,10 +468,12 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     window_ = (window > 0 && window < max_cells) ? window : 0;
     if (floor_on_ && !mapped(64, (void**) &h_floor_, (void**) &m_floor_)) { err = "mtp: the window floor does not fit"; return false; }
     cap_ = (((window_ > 0 ? window_ : max_cells) + 63) / 64) * 64;
-    attn_scratch_floats_ = (int64_t) strata::kernels::qsa_decode_attn_scratch_floats(cap_, s);
+    const int64_t row_scratch = (int64_t) strata::kernels::qsa_decode_attn_scratch_floats(cap_, s);
+    attn_scratch_floats_ = mtp_pair_t2_on() ? 2 * row_scratch : row_scratch;
     const uint64_t T = (uint64_t) max_t, N = (uint64_t) g.n_embd, HC = (uint64_t) g.hc, K = (uint64_t) ss.k;
     const uint64_t NH = (uint64_t) g.n_head, HD = (uint64_t) g.head_dim, NKV = (uint64_t) g.n_head_kv;
-    const uint64_t R2 = 2 * T;   // step/pos rows: T catch-up rows + up to T-2 chain steps
+    // step/pos rows: T catch-up rows + up to T-2 chain steps (3*T when paired chains need max_t + 2*(max_t-1) rows)
+    const uint64_t R2 = mtp_pair_t2_on() ? 3 * T : 2 * T;
     bool ok = mapped(T * 4 + 64, (void**) &h_tok_, (void**) &m_tok_) &&
               mapped(R2 * 4 * 4 + 64, (void**) &h_step_, (void**) &m_step_) &&
               mapped(R2 * NH * 4 + 64, (void**) &h_pos_, (void**) &m_pos_) &&
@@ -1078,7 +1090,8 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
     return !full || record_rest(step_row0, cs, err);
 }
 
-bool MtpDrafter::record_front(int T, int row0, cudaStream_t cs, std::string& err) {
+bool MtpDrafter::record_front(int T, int row0, cudaStream_t cs, std::string& err, int T0_split,
+                              const QsaState* st1) {
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     const int64_t N = g.n_embd, HC = g.hc, NH = g.n_head, HD = g.head_dim, NKV = g.n_head_kv;
@@ -1167,24 +1180,36 @@ bool MtpDrafter::record_front(int T, int row0, cudaStream_t cs, std::string& err
             fwht256_inplace_cuda(kcur_, (int64_t) T * NKV, cs);
             fwht256_inplace_cuda(vcur_, (int64_t) T * NKV, cs);
         }
-        // stored in the state's own format (#293 appended rotated INT8 K/V as Q4_0, into pools INT8 never has)
-        if (!no_batch_kv && st_.kv_q4)
-            kv_append_q4_steps(st_.k_q4, st_.v_q4, st_.page_table, step, 4, T, kcur_, vcur_, s, cs, &st_.host);
-        else if (!no_batch_kv && st_.kv_int8)
-            kv_append_q8_steps(st_.k_q, st_.v_q, st_.k_scale, st_.v_scale, st_.page_table, step, 4, kcur_, vcur_,
-                               (int) (NKV * HD), T, s, cs, &st_.host);
-        else
-            for (int t = 0; t < T; ++t) {
-                if (st_.kv_q4)
-                    kv_append_q4_step(st_.k_q4, st_.v_q4, st_.page_table, step + t * 4, kcur_ + t * NKV * HD,
-                                      vcur_ + t * NKV * HD, s, cs, &st_.host);
-                else if (st_.kv_int8)
-                    kv_append_q8_step(st_.k_q, st_.v_q, st_.k_scale, st_.v_scale, st_.page_table, step + t * 4,
-                                      kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st_.host);
-                else
-                    kv_append_step(st_.k_pool, st_.v_pool, st_.page_table, step + t * 4, kcur_ + t * NKV * HD,
-                                   vcur_ + t * NKV * HD, s, cs, &st_.host);
-            }
+        auto append_range = [&](const QsaState& dst_st, int t_off, int count) {
+            const int32_t* stp = step + t_off * 4;
+            float* kc = kcur_ + t_off * NKV * HD;
+            float* vc = vcur_ + t_off * NKV * HD;
+            if (!no_batch_kv && dst_st.kv_q4)
+                kv_append_q4_steps(dst_st.k_q4, dst_st.v_q4, dst_st.page_table, stp, 4, count, kc, vc, s, cs,
+                                   &dst_st.host);
+            else if (!no_batch_kv && dst_st.kv_int8)
+                kv_append_q8_steps(dst_st.k_q, dst_st.v_q, dst_st.k_scale, dst_st.v_scale, dst_st.page_table, stp, 4,
+                                   kc, vc, (int) (NKV * HD), count, s, cs, &dst_st.host);
+            else
+                for (int t = 0; t < count; ++t) {
+                    if (dst_st.kv_q4)
+                        kv_append_q4_step(dst_st.k_q4, dst_st.v_q4, dst_st.page_table, stp + t * 4,
+                                          kc + t * NKV * HD, vc + t * NKV * HD, s, cs, &dst_st.host);
+                    else if (dst_st.kv_int8)
+                        kv_append_q8_step(dst_st.k_q, dst_st.v_q, dst_st.k_scale, dst_st.v_scale,
+                                          dst_st.page_table, stp + t * 4, kc + t * NKV * HD,
+                                          vc + t * NKV * HD, s, cs, &dst_st.host);
+                    else
+                        kv_append_step(dst_st.k_pool, dst_st.v_pool, dst_st.page_table, stp + t * 4,
+                                       kc + t * NKV * HD, vc + t * NKV * HD, s, cs, &dst_st.host);
+                }
+        };
+        if (T0_split > 0 && st1 != nullptr) {
+            append_range(st_, 0, T0_split);
+            append_range(*st1, T0_split, T - T0_split);
+        } else {
+            append_range(st_, 0, T);
+        }
         g_mp.stamp(4, cs);
     } catch (const std::exception& e) {
         err = std::string("mtp: ") + e.what();
@@ -1201,12 +1226,14 @@ void MtpDrafter::norm_rope(float* data, const float* gamma, int rows, int cols, 
     else rope_neox_apply(data, data, rows, cols, (int) s.n_rot, st_.cos_tab, st_.sin_tab, p, cs);
 }
 
-bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
+bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err, int T_pair,
+                             const QsaState* st1, const int32_t* m_floor1,
+                             const MtpDrafter* d1_coupled) {
     using namespace strata::kernels;
     if (!decode_ready(err)) return false;   // this is the 512 experts' only reader
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
-    const int T = 1;
+    const int T = T_pair;
     const int64_t N = g.n_embd, HC = g.hc, K = ss.k, NH = g.n_head, HD = g.head_dim;
     const QsaShapes s = shapes_of(g);
     const GrShapes gs{g.n_embd, g.hc, g.hc_lr};
@@ -1234,14 +1261,54 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         }
         if (st_.kv_rot) fwht256_inplace_cuda(qcur_, (int64_t) T * NH, cs);
         g_mp.stamp(5, cs);
-        const QsaAttnPools pools = qsa_attn_pools(st_);
-        if (floor_on_ && m_floor_ != nullptr)   // KVA: the window (or every cell) from the first real draft cell on
-            window_ids_floor(const_cast<int32_t*>(step), T, window_ > 0 ? (int) window_ : 0x7fffffff, ident_, cap_, m_floor_, cs);
-        else if (window_ > 0) window_ids(const_cast<int32_t*>(step), T, (int) window_, ident_, cap_, cs);
-        // STRATA_QSA_SPLIT_ATTN=1: the draft layer's attention over its window, split the same way
         static const bool split_attn = [] { const char* v = std::getenv("STRATA_QSA_SPLIT_ATTN"); return v != nullptr && std::atoi(v) != 0; }();
-        if (!(split_attn && qsa_decode_attn_split(qcur_, pools, ident_, step, cap_, s, attn_scratch_, (uint64_t) attn_scratch_floats_, attn_, T, cs)))
-        qsa_decode_attn_batch(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs);
+        if (T == 1 || st1 == nullptr) {
+            const QsaAttnPools pools = qsa_attn_pools(st_);
+            if (floor_on_ && m_floor_ != nullptr)
+                window_ids_floor(const_cast<int32_t*>(step), T, window_ > 0 ? (int) window_ : 0x7fffffff, ident_, cap_, m_floor_, cs);
+            else if (window_ > 0) window_ids(const_cast<int32_t*>(step), T, (int) window_, ident_, cap_, cs);
+            if (!(split_attn && qsa_decode_attn_split(qcur_, pools, ident_, step, cap_, s, attn_scratch_, (uint64_t) attn_scratch_floats_, attn_, T, cs)))
+                qsa_decode_attn_batch(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs);
+        } else {
+            const int64_t row_scratch = (int64_t) qsa_decode_attn_scratch_floats(cap_, s);
+            const bool same_fmt = st_.kv_q4 == st1->kv_q4 && st_.kv_int8 == st1->kv_int8 && st_.kv_hybrid == st1->kv_hybrid;
+            const bool use_rows = mtp_pair_t2_on() && T <= kAttnRowsMax &&
+                                  attn_scratch_floats_ >= (int64_t) T * row_scratch && same_fmt &&
+                                  !(split_attn && st_.kv_int8 && !st_.kv_q4 && !st_.kv_hybrid);
+            if (use_rows) {
+                if (floor_on_) {
+                    for (int t = 0; t < T; ++t) {
+                        const int32_t* fl_t = (t == 0) ? m_floor_ : m_floor1;
+                        int32_t* stp_t = const_cast<int32_t*>(step + t * 4);
+                        int32_t* id_t = ident_ + (size_t) t * (size_t) cap_;
+                        if (fl_t != nullptr)
+                            window_ids_floor(stp_t, 1, window_ > 0 ? (int) window_ : 0x7fffffff, id_t, cap_, fl_t, cs);
+                        else if (window_ > 0)
+                            window_ids(stp_t, 1, (int) window_, id_t, cap_, cs);
+                    }
+                } else if (window_ > 0) {
+                    window_ids(const_cast<int32_t*>(step), T, (int) window_, ident_, cap_, cs);
+                }
+                QsaAttnPoolsRows rows{};
+                rows.n = T;
+                for (int t = 0; t < T; ++t) rows.p[t] = qsa_attn_pools((t == 0) ? st_ : *st1);
+                qsa_decode_attn_batch_rows(qcur_, rows, ident_, step, cap_, s, attn_scratch_, attn_, T, cs);
+            } else {
+                for (int t = 0; t < T; ++t) {
+                    const QsaState& st_t = (t == 0) ? st_ : *st1;
+                    const QsaAttnPools pools = qsa_attn_pools(st_t);
+                    const int32_t* stp_t = step + t * 4;
+                    const int32_t* fl_t = (t == 0) ? m_floor_ : m_floor1;
+                    if (floor_on_ && fl_t != nullptr)
+                        window_ids_floor(const_cast<int32_t*>(stp_t), 1, window_ > 0 ? (int) window_ : 0x7fffffff, ident_, cap_, fl_t, cs);
+                    else if (window_ > 0) window_ids(const_cast<int32_t*>(stp_t), 1, (int) window_, ident_, cap_, cs);
+                    float* qt = qcur_ + (size_t) t * NH * HD;
+                    float* at = attn_ + (size_t) t * NH * HD;
+                    if (!(split_attn && qsa_decode_attn_split(qt, pools, ident_, stp_t, cap_, s, attn_scratch_, (uint64_t) attn_scratch_floats_, at, 1, cs)))
+                        qsa_decode_attn_batch(qt, pools, ident_, stp_t, cap_, s, attn_scratch_, at, 1, cs);
+                }
+            }
+        }
         if (st_.kv_rot) fwht256_inplace_cuda(attn_, (int64_t) T * NH, cs);
         g_mp.stamp(6, cs);
         native_qsa_gate_apply(attn_, qfull_, attn32_, (int) (T * NH), (int) HD, cs);
@@ -1406,15 +1473,19 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
                     (int) nv, T, cs);
         g_mp.stamp(14, cs);
         if (coupled_rec_) {
-            // coupled draft sampling: the target's chain and Philox draw for the row that will verify this draft
-            // (counter = this cell + 1, from its step record), penalties over the ring; T == 1 (full layer)
-            if (m_q_ != nullptr)   // STRATA_SPEC_PROB: a draw from q with its own stream, and q's list for the verifier
-                spec_draft_sample(head_logits_, (int) nv, sub ? dvocab_ : nullptr, sub ? dinv_ : nullptr, (int) n_vocab_,
-                                  cparams_, cring_, kCoupledHistCap, coupled_j_, step, cscratch_, out_ids_, probs_, m_q_,
-                                  spec_gate_pick(), spec_draft_temp_scale(), cs);
-            else
-                coupled_draft_sample(head_logits_, (int) nv, sub ? dvocab_ : nullptr, sub ? dinv_ : nullptr, (int) n_vocab_,
-                                     cparams_, cring_, kCoupledHistCap, coupled_j_, step, cscratch_, out_ids_, probs_, cs);
+            for (int t = 0; t < T; ++t) {
+                const MtpDrafter& dc = (t == 0 || d1_coupled == nullptr) ? *this : *d1_coupled;
+                float* hl = head_logits_ + (size_t) t * (size_t) nv;
+                if (dc.m_q_ != nullptr)
+                    spec_draft_sample(hl, (int) nv, sub ? dvocab_ : nullptr, sub ? dinv_ : nullptr, (int) n_vocab_,
+                                      dc.cparams_, dc.cring_, kCoupledHistCap, coupled_j_, step + t * 4,
+                                      dc.cscratch_, out_ids_ + t, probs_ + t, dc.m_q_,
+                                      spec_gate_pick(), spec_draft_temp_scale(), cs);
+                else
+                    coupled_draft_sample(hl, (int) nv, sub ? dvocab_ : nullptr, sub ? dinv_ : nullptr, (int) n_vocab_,
+                                         dc.cparams_, dc.cring_, kCoupledHistCap, coupled_j_, step + t * 4,
+                                         dc.cscratch_, out_ids_ + t, probs_ + t, cs);
+            }
             return true;
         }
         if (argmax_rows_wanted()) {
@@ -1477,6 +1548,137 @@ bool MtpDrafter::capture_prefill_dev(int T, std::string& err) {
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     const bool ok = record_forward(T, -1, cs_, err);   // K/V only, rows [0, T); tok_/step_/pos_ filled before launch
     return finish_capture(cs_, ok, prefill_dev_exec_[T], "prefill (device inputs)", err);
+}
+
+bool MtpDrafter::capture_pair_round(const MtpDrafter& d1, int T0, int T1, bool coupled,
+                                    cudaGraphExec_t& out_exec, std::string& err) {
+    using namespace strata::kernels;
+    const int T = T0 + T1;
+    const int64_t HCN = g_->hc * g_->n_embd;
+    const int64_t N = g_->n_embd, NH = g_->n_head;
+    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+        err = "mtp: begin pair capture";
+        return false;
+    }
+    if (coupled) {
+        coupled_draft_stage(m_cparams_, m_chist_, cparams_, cring_, kCoupledHistCap, cs_);
+        coupled_draft_stage(d1.m_cparams_, d1.m_chist_, d1.cparams_, d1.cring_, kCoupledHistCap, cs_);
+    }
+    const int ra0 = 2 * max_t_ - 2;
+    const MappedCopy in[6] = {{tok_, m_tok_, T}, {step_, m_step_, (int64_t) T * 4},
+                              {pos_, m_pos_, (int64_t) T * NH}, {row_, m_row_, 2},
+                              {step_ + ra0 * 4, m_step_ + ra0 * 4, 8},
+                              {pos_ + ra0 * NH, m_pos_ + ra0 * NH, 2 * NH}};
+    copy_from_mapped_multi(in, 6, cs_);
+    bool ok = record_front(T, 0, cs_, err, T0, &d1.st_);
+    if (ok) {
+        copy_row_to_idx(row_, 0, R_, HCN, inj_, g_->hc, mixed_, N, cs_);
+        copy_row_to_idx(row_ + 1, 1, R_, HCN, inj_, g_->hc, mixed_, N, cs_);
+        native_quantize_q8_1(mixed_, xq_, (int) N, 2, cs_);
+        coupled_rec_ = coupled;
+        coupled_j_ = 0;
+        ok = record_rest(ra0, cs_, err, 2, &d1.st_, d1.m_floor_, &d1);
+        coupled_rec_ = false;
+    }
+    if (ok) mtp_select_pair(out_ids_, m_out_, cs_, probs_, m_prob_);
+    return finish_capture(cs_, ok, out_exec, coupled ? "pair_round (coupled)" : "pair_round", err);
+}
+
+bool MtpDrafter::capture_pair_chain(MtpDrafter& d1, int T0, int T1, int n_out,
+                                    cudaGraphExec_t& out_exec, std::string& err) {
+    using namespace strata::kernels;
+    const int T = T0 + T1;
+    const int64_t HCN = g_->hc * g_->n_embd;
+    const int64_t N = g_->n_embd, NH = g_->n_head;
+    const int sr0 = max_t_;
+    g_mp.init();
+    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+        err = "mtp: begin pair chain capture";
+        return false;
+    }
+    g_mp.base = 0;
+    bool ok = true;
+    if (T <= max_t_) {
+        const MappedCopy in[8] = {
+            {tok_, m_tok_, T},
+            {step_, m_step_, (int64_t) T * 4},
+            {pos_, m_pos_, (int64_t) T * NH},
+            {row_, m_row_, 4},
+            {Rin_, window_R_, (int64_t) T0 * HCN},
+            {Rin_ + (size_t) T0 * (size_t) HCN, d1.window_R_, (int64_t) T1 * HCN},
+            {step_ + (size_t) sr0 * 4, m_step_ + (size_t) sr0 * 4, (int64_t) (2 * n_out) * 4},
+            {pos_ + (size_t) sr0 * (size_t) NH, m_pos_ + (size_t) sr0 * (size_t) NH, (int64_t) (2 * n_out) * NH},
+        };
+        copy_from_mapped_multi(in, 8, cs_);
+        ok = record_front(T, 0, cs_, err, T0, &d1.st_);
+        if (ok) {
+            copy_row_to_idx(row_, 0, R_, HCN, inj_, g_->hc, mixed_, N, cs_);
+            copy_row_to_idx(row_ + 1, 1, R_, HCN, inj_, g_->hc, mixed_, N, cs_);
+        }
+    } else {
+        const MappedCopy in0[7] = {
+            {tok_, m_tok_, T0},
+            {step_, m_step_, (int64_t) T0 * 4},
+            {pos_, m_pos_, (int64_t) T0 * NH},
+            {row_, m_row_, 4},
+            {Rin_, window_R_, (int64_t) T0 * HCN},
+            {step_ + (size_t) sr0 * 4, m_step_ + (size_t) sr0 * 4, (int64_t) (2 * n_out) * 4},
+            {pos_ + (size_t) sr0 * (size_t) NH, m_pos_ + (size_t) sr0 * (size_t) NH, (int64_t) (2 * n_out) * NH},
+        };
+        copy_from_mapped_multi(in0, 7, cs_);
+        const MappedCopy in1[5] = {
+            {d1.tok_, d1.m_tok_, T1},
+            {d1.step_, d1.m_step_, (int64_t) T1 * 4},
+            {d1.pos_, d1.m_pos_, (int64_t) T1 * NH},
+            {d1.row_, d1.m_row_, 1},
+            {d1.Rin_, d1.window_R_, (int64_t) T1 * HCN},
+        };
+        copy_from_mapped_multi(in1, 5, cs_);
+        ok = record_front(T0, 0, cs_, err);
+        if (ok) {
+            const int saved_base = g_mp.base;
+            g_mp.base = -1;
+            ok = d1.record_front(T1, 0, cs_, err);
+            g_mp.base = saved_base;
+        }
+        if (ok) {
+            copy_row_to_idx(row_, 0, R_, HCN, inj_, g_->hc, mixed_, N, cs_);
+            copy_row_to_idx(d1.row_, 0, d1.R_, HCN, d1.inj_, g_->hc, d1.mixed_, N, cs_);
+            ok = cudaMemcpyAsync(R_ + HCN, d1.R_, (size_t) HCN * sizeof(float), cudaMemcpyDeviceToDevice, cs_) == cudaSuccess &&
+                 cudaMemcpyAsync(inj_ + g_->hc, d1.inj_, (size_t) g_->hc * sizeof(float), cudaMemcpyDeviceToDevice, cs_) == cudaSuccess &&
+                 cudaMemcpyAsync(mixed_ + N, d1.mixed_, (size_t) N * sizeof(float), cudaMemcpyDeviceToDevice, cs_) == cudaSuccess;
+            if (!ok) err = "mtp: pair chain kept row copy failed";
+        }
+    }
+    if (ok) {
+        native_quantize_q8_1(mixed_, xq_, (int) N, 2, cs_);
+        coupled_rec_ = false;
+        coupled_j_ = 0;
+        ok = record_rest(sr0, cs_, err, 2, &d1.st_, d1.m_floor_, &d1);
+    }
+    if (ok) {
+        mtp_select(R_, HCN, out_ids_, row_ + 2, Rin_, tok_, m_out_, 0, cs_, probs_, m_prob_);
+        mtp_select(R_, HCN, out_ids_, row_ + 3, Rin_ + HCN, tok_ + 1, d1.m_out_, 0, cs_, probs_, d1.m_prob_);
+        g_mp.stamp(16, cs_);
+    }
+    g_mp.base = -1;
+    for (int j = 1; ok && j < n_out; ++j) {
+        const int sr = sr0 + 2 * j;
+        g_mp.base = j < kMpGraphs ? j : -1;
+        ok = record_front(2, sr, cs_, err, 1, &d1.st_);
+        if (ok) {
+            coupled_rec_ = false;
+            coupled_j_ = j;
+            ok = record_rest(sr, cs_, err, 2, &d1.st_, d1.m_floor_, &d1);
+        }
+        if (ok) {
+            mtp_select(R_, HCN, out_ids_, row_ + 2, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
+            mtp_select(R_, HCN, out_ids_, row_ + 3, Rin_ + HCN, tok_ + 1, d1.m_out_, j, cs_, probs_, d1.m_prob_);
+            g_mp.stamp(16, cs_);
+        }
+        g_mp.base = -1;
+    }
+    return finish_capture(cs_, ok, out_exec, "pair_chain", err);
 }
 
 bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
@@ -2025,6 +2227,89 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     return true;
 }
 
+bool MtpDrafter::draft_pair(MtpDrafter& d1, int T0, const int32_t* tok0, int64_t p0, int a0, const float* src_R0,
+                            int32_t* draft0, int T1, const int32_t* tok1, int64_t p1, int a1, const float* src_R1,
+                            int32_t* draft1, std::string& err) {
+    if (!decode_ready(err) || !d1.decode_ready(err)) return false;
+    const OnDevice on_device(device_);
+    if (!can_pair_with(d1) || T0 < 1 || T1 < 1 || a0 < 0 || a0 >= T0 || a1 < 0 || a1 >= T1) {
+        err = "mtp: draft_pair arguments out of range";
+        return false;
+    }
+    if (!mtp_catchup_all()) { T0 = a0 + 1; T1 = a1 + 1; }
+    if (T0 + T1 > max_t_ || st_.max_cells - (p0 + a0) < 1 || d1.st_.max_cells - (p1 + a1) < 1) {
+        err = "mtp: draft_pair exceeds capacity";
+        return false;
+    }
+    const bool cp = coupled_active_;
+    cudaGraphExec_t exec = nullptr;
+    for (const auto& pg : pair_exec_) {
+        if (pg.st1 == &d1.st_ && pg.T0 == T0 && pg.T1 == T1 && pg.coupled == cp) { exec = pg.exec; break; }
+    }
+    if (!exec) {
+        if (!capture_pair_round(d1, T0, T1, cp, exec, err)) return false;
+        pair_exec_.push_back({&d1.st_, T0, T1, cp, exec});
+    }
+    const Clock::time_point t0 = Clock::now();
+    const int64_t NH = g_->n_head, HCN = g_->hc * g_->n_embd;
+    auto put = [&](int row, int64_t cell) {
+        h_step_[row * 4 + 0] = (int32_t) cell;
+        h_step_[row * 4 + 1] = (int32_t) (cell + 1);
+        h_step_[row * 4 + 2] = (int32_t) ((cell + 1) / 4);
+        h_step_[row * 4 + 3] = (int32_t) (cell + 1);
+        for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = (int32_t) cell;
+    };
+    for (int t = 0; t < T0; ++t) { h_tok_[t] = tok0[t]; put(t, p0 + t); }
+    for (int t = 0; t < T1; ++t) { h_tok_[T0 + t] = tok1[t]; put(T0 + t, p1 + t); }
+    const int ra0 = 2 * max_t_ - 2;
+    put(ra0, p0 + a0);
+    put(ra0 + 1, p1 + a1);
+    ((volatile int32_t*) h_out_)[0] = -1;
+    ((volatile int32_t*) h_out_)[1] = -1;
+    h_row_[0] = a0;
+    h_row_[1] = T0 + a1;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (cudaMemcpyAsync(Rin_, src_R0, (size_t) T0 * (size_t) HCN * sizeof(float),
+                        cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
+        cudaMemcpyAsync(Rin_ + (size_t) T0 * (size_t) HCN, src_R1, (size_t) T1 * (size_t) HCN * sizeof(float),
+                        cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) {
+        err = "mtp: draft_pair Rin copy failed";
+        return false;
+    }
+    if (cudaGraphLaunch(exec, cs_) != cudaSuccess) {
+        err = std::string("mtp draft_pair: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    auto prefetch_ple_for = [&](MtpDrafter& dm, int32_t tok_in, int32_t tok_out) {
+        SessionState* const pss = dm.ple_ss_ ? dm.ple_ss_ : dm.ss_;
+        if (pss == nullptr || !pss->ple.ready() || pss->ple.table == nullptr) return;
+        int32_t prev[2] = {pss->ple_prev[0], pss->ple_prev[1]};
+        uint32_t rows16[strata::kernels::PLE_N_HEADS];
+        if (tok_in >= 0) {
+            strata::kernels::ngram_rows(&tok_in, prev, 1, pss->ple.consts, rows16);
+            prev[0] = prev[1]; prev[1] = tok_in;
+            pss->ple.table->prefetch_rows(rows16);
+        }
+        if (tok_out >= 0) {
+            strata::kernels::ngram_rows(&tok_out, prev, 1, pss->ple.consts, rows16);
+            pss->ple.table->prefetch_rows(rows16);
+        }
+    };
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = std::string("mtp draft_pair: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    draft0[0] = ((volatile int32_t*) h_out_)[0];
+    draft1[0] = ((volatile int32_t*) h_out_)[1];
+    for (int j = 1; j < max_t_ - 1; ++j) { draft0[j] = 0; draft1[j] = 0; }
+    prefetch_ple_for(*this, tok0[a0], draft0[0]);
+    prefetch_ple_for(d1, tok1[a1], draft1[0]);
+    ms_draft += ms_since(t0);
+    ++rounds;
+    ++d1.rounds;
+    return true;
+}
+
 bool MtpDrafter::draft_long(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                             float* probs, float min_p, int* n_drafts, DraftResult* result) {
     if (T < 1 || T > strata::kernels::kVerifyLongT || a < 0 || a >= T) {
@@ -2155,6 +2440,100 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
     chain_n_ = n_out;
     ms_draft += ms_since(t0);
     ++rounds;
+    return true;
+}
+
+bool MtpDrafter::chain_pair_launch(MtpDrafter& d1, int T0, const int32_t* tok0, int64_t p0, int a0,
+                                   int T1, const int32_t* tok1, int64_t p1, int a1, int n_out, std::string& err) {
+    const OnDevice on_device(device_);
+    if (!decode_ready(err) || !d1.decode_ready(err)) return false;
+    if (!mtp_pair_t2_on() || !can_pair_chain_with(d1) || window_R_ == nullptr || d1.window_R_ == nullptr) {
+        err = "mtp: paired chain is not available for these drafters";
+        return false;
+    }
+    if (T0 < 1 || T0 > max_t_ || a0 < 0 || a0 >= T0 ||
+        T1 < 1 || T1 > max_t_ || a1 < 0 || a1 >= T1 ||
+        n_out < 1 || n_out > max_t_ - 1 || n_out > 8) {
+        err = "mtp: paired chain arguments out of range";
+        return false;
+    }
+    int lT0 = T0, lT1 = T1;
+    if (mtp_kept_round()) { lT0 = a0 + 1; lT1 = a1 + 1; }
+    cudaGraphExec_t exec = nullptr;
+    for (const auto& pg : pair_chain_exec_) {
+        if (pg.d1 == &d1 && pg.st1 == &d1.st_ && pg.win_R1 == d1.window_R_ &&
+            pg.T0 == lT0 && pg.T1 == lT1 && pg.n_out == n_out) {
+            exec = pg.exec;
+            break;
+        }
+    }
+    if (!exec) {
+        if (!capture_pair_chain(d1, lT0, lT1, n_out, exec, err)) return false;
+        pair_chain_exec_.push_back({&d1, &d1.st_, d1.window_R_, lT0, lT1, n_out, exec});
+    }
+    const Clock::time_point t0 = Clock::now();
+    const int64_t NH = g_->n_head;
+    auto put = [&](int32_t* stp, int32_t* ps, int row, int64_t cell) {
+        stp[row * 4 + 0] = (int32_t) cell;
+        stp[row * 4 + 1] = (int32_t) (cell + 1);
+        stp[row * 4 + 2] = (int32_t) ((cell + 1) / 4);
+        stp[row * 4 + 3] = (int32_t) (cell + 1);
+        for (int64_t h = 0; h < NH; ++h) ps[row * NH + h] = (int32_t) cell;
+    };
+    if (lT0 + lT1 <= max_t_) {
+        for (int t = 0; t < lT0; ++t) { h_tok_[t] = tok0[t]; put(h_step_, h_pos_, t, p0 + t); }
+        for (int t = 0; t < lT1; ++t) { h_tok_[lT0 + t] = tok1[t]; put(h_step_, h_pos_, lT0 + t, p1 + t); }
+        h_row_[0] = a0;
+        h_row_[1] = lT0 + a1;
+        h_row_[2] = 0;
+        h_row_[3] = 1;
+    } else {
+        for (int t = 0; t < lT0; ++t) { h_tok_[t] = tok0[t]; put(h_step_, h_pos_, t, p0 + t); }
+        for (int t = 0; t < lT1; ++t) { d1.h_tok_[t] = tok1[t]; put(d1.h_step_, d1.h_pos_, t, p1 + t); }
+        h_row_[0] = a0;
+        h_row_[1] = 0;
+        h_row_[2] = 0;
+        h_row_[3] = 1;
+        d1.h_row_[0] = a1;
+    }
+    const int sr0 = max_t_;
+    for (int j = 0; j < n_out; ++j) {
+        put(h_step_, h_pos_, sr0 + 2 * j + 0, p0 + a0 + j);
+        put(h_step_, h_pos_, sr0 + 2 * j + 1, p1 + a1 + j);
+        ((volatile int32_t*) h_out_)[j] = -1;
+        ((volatile int32_t*) d1.h_out_)[j] = -1;
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (!stage_source_R(lT0, err)) return false;
+    if (d1.src_R_ != nullptr && d1.src_R_ != d1.window_R_ &&
+        cudaMemcpyAsync((void*) d1.window_R_, d1.src_R_,
+                        (size_t) lT1 * (size_t) (g_->hc * g_->n_embd) * sizeof(float),
+                        cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) {
+        err = "mtp: staging the paired window's residual rows failed";
+        return false;
+    }
+    if (cudaGraphLaunch(exec, cs_) != cudaSuccess ||
+        cudaEventRecord(ev_chain_, cs_) != cudaSuccess ||
+        cudaStreamWaitEvent(d1.cs_, ev_chain_, 0) != cudaSuccess ||
+        cudaEventRecord(d1.ev_chain_, d1.cs_) != cudaSuccess) {
+        err = std::string("mtp pair chain: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+#ifdef _WIN32
+    (void) cudaStreamQuery(cs_);
+    (void) cudaStreamQuery(d1.cs_);
+#endif
+    steps_seen_ = 0;
+    chain_live_ = true;
+    chain_n_ = n_out;
+    chain_early_ = 0;
+    d1.steps_seen_ = 0;
+    d1.chain_live_ = true;
+    d1.chain_n_ = n_out;
+    d1.chain_early_ = 0;
+    ms_draft += ms_since(t0);
+    ++rounds;
+    ++d1.rounds;
     return true;
 }
 

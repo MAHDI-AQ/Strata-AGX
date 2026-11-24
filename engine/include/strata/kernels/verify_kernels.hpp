@@ -184,6 +184,12 @@ void force_token(int32_t* tok, const int32_t* force, int j, void* stream);
 /// row 0).  Graph-capturable: the row is read on the device.
 void copy_row_to_first(const int32_t* row_dev, float* a, int64_t a_n, float* b, int64_t b_n, float* c, int64_t c_n,
                        void* stream);
+/// Copy row *row_dev of a, b, c to row `dst_row` (graph-capturable).
+void copy_row_to_idx(const int32_t* row_dev, int dst_row, float* a, int64_t a_n, float* b, int64_t b_n, float* c,
+                     int64_t c_n, void* stream);
+/// Write 2 paired draft tokens (and optional probs) to mapped host outputs out[0..1].
+void mtp_select_pair(const int32_t* ids, int32_t* out, void* stream, const float* probs = nullptr,
+                     float* out_p = nullptr);
 /// dst row i = src row ids[i] (row_bytes each, multiple of 16), for n rows.
 void gather_rows(const uint8_t* src, int64_t row_bytes, const int32_t* ids, int64_t n, uint8_t* dst, void* stream);
 /// ids[t] = table[ids[t]] for n entries (a subset index back to a token id).

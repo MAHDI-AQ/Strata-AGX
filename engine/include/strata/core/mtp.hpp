@@ -135,6 +135,19 @@ public:
     /// accepted row) for T-1 drafts at cells p+a+1 ...  `drafts` gets T-1 tokens.
     bool draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr, DraftResult* result = nullptr);
+    /// STRATA_MTP_PAIR_T2=1: pair two same-device serial slots (max_drafts == 1, !coupled) into one T=2 pass.
+    bool can_pair_with(const MtpDrafter& d1) const {
+        return this != &d1 && device_ == d1.device_ && coupled_active_ == d1.coupled_active_ &&
+               max_drafts_ == 1 && d1.max_drafts_ == 1 && max_t_ >= 4 && d1.max_t_ >= 4 &&
+               max_t_ == d1.max_t_ &&
+               !floor_on_ && !d1.floor_on_ && !chain_live_ && !d1.chain_live_ &&
+               window_ == d1.window_ && cap_ == d1.cap_ && st_.kv_rot == d1.st_.kv_rot &&
+               st_.kv_q4 == d1.st_.kv_q4 && st_.kv_int8 == d1.st_.kv_int8 &&
+               st_.kv_hybrid == d1.st_.kv_hybrid;
+    }
+    bool draft_pair(MtpDrafter& d1, int T0, const int32_t* tok0, int64_t p0, int a0, const float* src_R0,
+                    int32_t* draft0, int T1, const int32_t* tok1, int64_t p1, int a1, const float* src_R1,
+                    int32_t* draft1, std::string& err);
 
     /// --lookup-max-t: draft() for a window of up to kVerifyLongT rows (T may pass max_t()).  When the last accepted
     /// row is past max_t() rows, rows 0..a-1 are caught up as prefill() does and row a runs as a one-row round, so the
@@ -182,6 +195,21 @@ public:
     /// `n_early`: an event after each of the first `n_early` outputs (chain_outputs_ready).
     bool chain_launch(int T, const int32_t* tokens, int64_t p, int a, const int32_t* force, int n_force, int n_out,
                       int n_early, std::string& err);
+    /// STRATA_MTP_PAIR_T2=1: pair two same-device pipelined slot drafters into one T=2 asynchronous chain.
+    bool can_pair_chain_with(const MtpDrafter& d1) const {
+        return this != &d1 && device_ == d1.device_ &&
+               !coupled_active_ && !d1.coupled_active_ &&
+               max_drafts_ >= 1 && max_drafts_ == d1.max_drafts_ &&
+               max_t_ >= 4 && d1.max_t_ >= 4 && max_t_ == d1.max_t_ &&
+               !floor_on_ && !d1.floor_on_ && !chain_live_ && !d1.chain_live_ &&
+               force_on_ && d1.force_on_ &&
+               ev_chain_ != nullptr && d1.ev_chain_ != nullptr &&
+               window_ == d1.window_ && cap_ == d1.cap_ && st_.kv_rot == d1.st_.kv_rot &&
+               st_.kv_q4 == d1.st_.kv_q4 && st_.kv_int8 == d1.st_.kv_int8 &&
+               st_.kv_hybrid == d1.st_.kv_hybrid;
+    }
+    bool chain_pair_launch(MtpDrafter& d1, int T0, const int32_t* tok0, int64_t p0, int a0,
+                           int T1, const int32_t* tok1, int64_t p1, int a1, int n_out, std::string& err);
     /// More outputs of the last chain, up to `n_out` in all: its next steps queued behind the ones already launched (a
     /// step is a graph of its own and every step's cell was staged by chain_launch), each with its event.  The chain
     /// may still be running or have ended; nothing else may have run on the drafter since.  Needs the chain launched
@@ -245,10 +273,19 @@ private:
     }
     /// The layer's front for T rows at step rows [row0, +T): the embedding, the fc projections, the attention
     /// hyper-connection read (R_, inj_, mixed_) and the K/V appended.
-    bool record_front(int T, int row0, cudaStream_t cs, std::string& err);
-    /// The rest for row 0 at step row `step_row`: the attention from the q projection, the MLP, the final mixer,
-    /// the head, the draft and its probability.  Needs row 0's R_, inj_ and mixed_ (its q8_1 rows in xq_).
-    bool record_rest(int step_row, cudaStream_t cs, std::string& err);
+    bool record_front(int T, int row0, cudaStream_t cs, std::string& err, int T0_split = 0,
+                      const QsaState* st1 = nullptr);
+    /// The rest for row 0 at step row `step_row` (or T=2 paired rows [0,1] at step rows [step_row, step_row+1]).
+    bool record_rest(int step_row, cudaStream_t cs, std::string& err, int T_pair = 1,
+                     const QsaState* st1 = nullptr, const int32_t* m_floor1 = nullptr,
+                     const MtpDrafter* d1_coupled = nullptr);
+    bool capture_pair_round(const MtpDrafter& d1, int T0, int T1, bool coupled, cudaGraphExec_t& out_exec,
+                            std::string& err);
+    struct PairGraph { const void* st1; int T0; int T1; bool coupled; cudaGraphExec_t exec; };
+    std::vector<PairGraph> pair_exec_;
+    bool capture_pair_chain(MtpDrafter& d1, int T0, int T1, int n_out, cudaGraphExec_t& out_exec, std::string& err);
+    struct PairChainGraph { const void* d1; const void* st1; const void* win_R1; int T0; int T1; int n_out; cudaGraphExec_t exec; };
+    std::vector<PairChainGraph> pair_chain_exec_;
     void norm_rope(float* data, const float* gamma, int rows, int cols, const int32_t* p, cudaStream_t cs);
     bool capture_prefill(int T, std::string& err);
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)

@@ -836,21 +836,41 @@ void ident_hits(const int32_t* ids, int n, int32_t* slot, int32_t* dst, int32_t*
 }
 
 namespace {
-__global__ void copy_row_to_first_kernel(const int32_t* __restrict__ row_dev, float* a, int64_t a_n, float* b,
-                                         int64_t b_n, float* c, int64_t c_n) {
+__global__ void copy_row_to_first_kernel(const int32_t* __restrict__ row_dev, int dst_row, float* a, int64_t a_n,
+                                         float* b, int64_t b_n, float* c, int64_t c_n) {
     const int64_t row = *row_dev;
-    if (row == 0) return;
+    if (row == dst_row) return;
+    const int64_t dst = dst_row;
     const int64_t i0 = (int64_t) blockIdx.x * blockDim.x + threadIdx.x, st = (int64_t) gridDim.x * blockDim.x;
-    for (int64_t i = i0; i < a_n; i += st) a[i] = a[row * a_n + i];
-    for (int64_t i = i0; i < b_n; i += st) b[i] = b[row * b_n + i];
-    for (int64_t i = i0; i < c_n; i += st) c[i] = c[row * c_n + i];
+    for (int64_t i = i0; i < a_n; i += st) a[dst * a_n + i] = a[row * a_n + i];
+    for (int64_t i = i0; i < b_n; i += st) b[dst * b_n + i] = b[row * b_n + i];
+    for (int64_t i = i0; i < c_n; i += st) c[dst * c_n + i] = c[row * c_n + i];
+}
+
+__global__ void mtp_select_pair_kernel(const int32_t* __restrict__ ids, int32_t* out, const float* probs,
+                                       float* out_p) {
+    if (threadIdx.x == 0) {
+        if (probs != nullptr && out_p != nullptr) {
+            ((volatile float*) out_p)[0] = probs[0];
+            ((volatile float*) out_p)[1] = probs[1];
+        }
+        __threadfence_system();
+        ((volatile int32_t*) out)[0] = ids[0];
+        ((volatile int32_t*) out)[1] = ids[1];
+    }
 }
 }  // namespace
 
 void copy_row_to_first(const int32_t* row_dev, float* a, int64_t a_n, float* b, int64_t b_n, float* c, int64_t c_n,
                        void* stream) {
-    copy_row_to_first_kernel<<<16, 256, 0, (cudaStream_t) stream>>>(row_dev, a, a_n, b, b_n, c, c_n);
+    copy_row_to_first_kernel<<<16, 256, 0, (cudaStream_t) stream>>>(row_dev, 0, a, a_n, b, b_n, c, c_n);
     check("copy_row_to_first");
+}
+
+void copy_row_to_idx(const int32_t* row_dev, int dst_row, float* a, int64_t a_n, float* b, int64_t b_n, float* c,
+                     int64_t c_n, void* stream) {
+    copy_row_to_first_kernel<<<16, 256, 0, (cudaStream_t) stream>>>(row_dev, dst_row, a, a_n, b, b_n, c, c_n);
+    check("copy_row_to_idx");
 }
 
 void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const int32_t* row_dev, float* R_dst,
@@ -858,6 +878,11 @@ void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const 
     mtp_select_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(R_src, R_stride, ids, row_dev, R_dst, tok_dst, out, j,
                                                             probs, out_p);
     check("mtp_select");
+}
+
+void mtp_select_pair(const int32_t* ids, int32_t* out, void* stream, const float* probs, float* out_p) {
+    mtp_select_pair_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(ids, out, probs, out_p);
+    check("mtp_select_pair");
 }
 
 void force_token(int32_t* tok, const int32_t* force, int j, void* stream) {

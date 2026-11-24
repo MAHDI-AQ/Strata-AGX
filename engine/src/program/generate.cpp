@@ -17213,21 +17213,77 @@ int main(int argc, char** argv) {
                 }
 #endif
                 if (batch_mtp && !batch_df2 && sl.active) {
-                    // The slot's two residual rows (the final residuals of the last stage: ver.final_R_all() follows the
-                    // chain, so with a layer split they are on the last stage's GPU, where the drafters are).  The copy is
-                    // queued on the drafter's own stream after the window's host sync, so the draft graph reads it.
-                    const strata::core::OnDevice on_slot_mtp(slot_mtp[(size_t) b]->device());
-                    const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
-                    if (cudaMemcpyAsync(slot_mtp_rows[(size_t) b].get(),
-                                        ver.final_R_all() + (size_t) first[t] * stride,
-                                        2 * stride * sizeof(float), cudaMemcpyDeviceToDevice,
-                                        slot_mtp[(size_t) b]->stream()) != cudaSuccess ||
-                        !slot_mtp[(size_t) b]->draft(2, outb + first[t], pos[first[t]], keep[b] - 1,
-                                                    sl.draft.data(), err)) {
-                        std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str());
-                        return false;
+                    static const bool pair_t2 = [] {
+                        const char* v = std::getenv("STRATA_MTP_PAIR_T2");
+                        return v != nullptr && std::atoi(v) != 0;
+                    }();
+                    if (!pair_t2) {
+                        const strata::core::OnDevice on_slot_mtp(slot_mtp[(size_t) b]->device());
+                        const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
+                        if (cudaMemcpyAsync(slot_mtp_rows[(size_t) b].get(),
+                                            ver.final_R_all() + (size_t) first[t] * stride,
+                                            2 * stride * sizeof(float), cudaMemcpyDeviceToDevice,
+                                            slot_mtp[(size_t) b]->stream()) != cudaSuccess ||
+                            !slot_mtp[(size_t) b]->draft(2, outb + first[t], pos[first[t]], keep[b] - 1,
+                                                        sl.draft.data(), err)) {
+                            std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str());
+                            return false;
+                        }
+                        sl.draft_ready = true;
                     }
-                    sl.draft_ready = true;
+                }
+            }
+            if (batch_mtp && !batch_df2) {
+                static const bool pair_t2 = [] {
+                    const char* v = std::getenv("STRATA_MTP_PAIR_T2");
+                    return v != nullptr && std::atoi(v) != 0;
+                }();
+                if (pair_t2) {
+                    std::vector<int> mtp_ts;
+                    mtp_ts.reserve((size_t) A);
+                    for (int t = 0; t < A; ++t) {
+                        if (bs[(size_t) active[t]].active) mtp_ts.push_back(t);
+                    }
+                    const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
+                    size_t idx = 0;
+                    while (idx < mtp_ts.size()) {
+                        const int t0 = mtp_ts[idx];
+                        const int b0 = active[t0];
+                        BSlot& sl0 = bs[(size_t) b0];
+                        strata::core::MtpDrafter& d0 = *slot_mtp[(size_t) b0];
+                        if (idx + 1 < mtp_ts.size()) {
+                            const int t1 = mtp_ts[idx + 1];
+                            const int b1 = active[t1];
+                            BSlot& sl1 = bs[(size_t) b1];
+                            strata::core::MtpDrafter& d1 = *slot_mtp[(size_t) b1];
+                            if (d0.can_pair_with(d1) && keep[b0] <= 2 && keep[b1] <= 2) {
+                                if (!d0.draft_pair(d1, 2, outb + first[t0], pos[first[t0]], keep[b0] - 1,
+                                                   ver.final_R_all() + (size_t) first[t0] * stride,
+                                                   sl0.draft.data(), 2, outb + first[t1], pos[first[t1]],
+                                                   keep[b1] - 1,
+                                                   ver.final_R_all() + (size_t) first[t1] * stride,
+                                                   sl1.draft.data(), err)) {
+                                    std::printf("ERR batch MTP pair (%d,%d): %s\n", b0, b1, err.c_str());
+                                    return false;
+                                }
+                                sl0.draft_ready = true;
+                                sl1.draft_ready = true;
+                                idx += 2;
+                                continue;
+                            }
+                        }
+                        const strata::core::OnDevice on_slot_mtp(d0.device());
+                        if (cudaMemcpyAsync(slot_mtp_rows[(size_t) b0].get(),
+                                            ver.final_R_all() + (size_t) first[t0] * stride,
+                                            2 * stride * sizeof(float), cudaMemcpyDeviceToDevice,
+                                            d0.stream()) != cudaSuccess ||
+                            !d0.draft(2, outb + first[t0], pos[first[t0]], keep[b0] - 1, sl0.draft.data(), err)) {
+                            std::printf("ERR batch MTP slot %d: %s\n", b0, err.c_str());
+                            return false;
+                        }
+                        sl0.draft_ready = true;
+                        ++idx;
+                    }
                 }
             }
 #if defined(STRATA_HAVE_DFLASH2)
@@ -17758,7 +17814,58 @@ int main(int argc, char** argv) {
             // the next proposal: each slot's drafter catches up on ITS OWN rows of this window and drafts from the last
             // kept one, as a chain on its own stream (pmtp_poll_draft collects it before the group's next window, unless
             // the lookup drafts that window); the chain waits for the copy of its rows (above).
-            for (const Blk& blk : blks) {
+            auto blk_toks = [&](const Blk& blk, int32_t* nxt) -> const int32_t* {
+                if (!blk.rd) return outb + blk.f;
+                for (int j = 0; j + 1 < blk.n; ++j) nxt[j] = G.tok[blk.f + j + 1];
+                nxt[blk.n - 1] = blk.nx;
+                return nxt;
+            };
+            static const bool pair_t2 = [] {
+                const char* v = std::getenv("STRATA_MTP_PAIR_T2");
+                return v != nullptr && std::atoi(v) != 0;
+            }();
+            std::vector<char> paired;
+            if (pair_t2 && pm_drafts >= 1 && pm_drafts <= 8) {
+                paired.assign(blks.size(), 0);
+                std::vector<size_t> pair_idx;
+                pair_idx.reserve(blks.size());
+                for (size_t i = 0; i < blks.size(); ++i) {
+                    const Blk& blk = blks[i];
+                    const BSlot& sl = bs[(size_t) blk.b];
+                    if (sl.active && !sl.rd_on && blk.n <= slot_mtp[(size_t) blk.b]->max_t())
+                        pair_idx.push_back(i);
+                }
+                for (size_t k = 0; k + 1 < pair_idx.size(); k += 2) {
+                    const size_t i0 = pair_idx[k], i1 = pair_idx[k + 1];
+                    const Blk& blk0 = blks[i0];
+                    const Blk& blk1 = blks[i1];
+                    strata::core::MtpDrafter& d0 = *slot_mtp[(size_t) blk0.b];
+                    strata::core::MtpDrafter& d1 = *slot_mtp[(size_t) blk1.b];
+                    if (pm_drafts > d0.max_t() - 1 || !d0.can_pair_chain_with(d1)) continue;
+                    const strata::core::OnDevice on_slot_mtp(d0.device());
+                    bs[(size_t) blk0.b].draft_ready = false;
+                    bs[(size_t) blk1.b].draft_ready = false;
+                    int32_t nxt0[strata::kernels::kVerifyMaxT] = {};
+                    int32_t nxt1[strata::kernels::kVerifyMaxT] = {};
+                    const int32_t* toks0 = blk_toks(blk0, nxt0);
+                    const int32_t* toks1 = blk_toks(blk1, nxt1);
+                    if (cudaStreamWaitEvent(d0.stream(), pm_copied[(size_t) blk0.b], 0) != cudaSuccess ||
+                        cudaStreamWaitEvent(d0.stream(), pm_copied[(size_t) blk1.b], 0) != cudaSuccess ||
+                        !d0.chain_pair_launch(d1, blk0.n, toks0, G.pos[blk0.f], blk0.keep - 1,
+                                              blk1.n, toks1, G.pos[blk1.f], blk1.keep - 1, pm_drafts, err)) {
+                        std::printf("ERR batch MTP slots %d+%d: %s\n", blk0.b, blk1.b,
+                                    err.empty() ? "the paired proposal chain did not start" : err.c_str());
+                        return false;
+                    }
+                    pm_drafting[(size_t) blk0.b] = 1;
+                    pm_drafting[(size_t) blk1.b] = 1;
+                    paired[i0] = 1;
+                    paired[i1] = 1;
+                }
+            }
+            for (size_t i = 0; i < blks.size(); ++i) {
+                if (!paired.empty() && paired[i]) continue;
+                const Blk& blk = blks[i];
                 BSlot& sl = bs[(size_t) blk.b];
                 // (it ended: no more drafts for it.  STRATA_SLOT_READ: its drafter still catches up on the rows this
                 // window kept, so the conversation's next turn - read in this slot - finds every cell of the draft
@@ -17768,12 +17875,7 @@ int main(int argc, char** argv) {
                 sl.draft_ready = false;
                 // row t pairs with the token at the next position: the window's picks, or - prompt rows - the prompt's
                 int32_t nxt[strata::kernels::kVerifyMaxT] = {};
-                const int32_t* toks = outb + blk.f;
-                if (blk.rd) {
-                    for (int j = 0; j + 1 < blk.n; ++j) nxt[j] = G.tok[blk.f + j + 1];
-                    nxt[blk.n - 1] = blk.nx;
-                    toks = nxt;
-                }
+                const int32_t* toks = blk_toks(blk, nxt);
                 const int n_out = sl.active && !sl.rd_on ? pm_drafts : 1;   // (proposals only for a window that drafts)
                 if (cudaStreamWaitEvent(slot_mtp[(size_t) blk.b]->stream(), pm_copied[(size_t) blk.b], 0) != cudaSuccess ||
                     !slot_mtp[(size_t) blk.b]->chain_launch(blk.n, toks, G.pos[blk.f], blk.keep - 1, nullptr, 0,
