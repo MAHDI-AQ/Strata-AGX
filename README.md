@@ -25,6 +25,33 @@
 
 **Free, open source, and yours to run.** Use Strata on your desktop or with your favorite coding tools. No account needed.
 
+## Strata-AGX (`sm_89` Ada Lovelace Fork) — Measured Performance & Quality
+
+`MAHDI-AQ/Strata-AGX` tracks upstream [`Niko1221/Strata`](https://github.com/Niko1221/Strata) `v0.2.16` (engine `0.1.62`, zero-GGML) with opt-in NVIDIA Ada Lovelace (`sm_89`) multi-GPU, FP8 prefill, QSA, MTP, and `O(delta)` server optimizations. **Default upstream execution stays byte-identical** (`Suite A` `a1_run`: `KL = 0.00000`, `top1 = 100.00%`) when opt-in switches are unset.
+
+**Measured Coordinate:** `4× RTX 4090` (`96 GB` VRAM, Ada `sm_89`) · `Qwen3.8-Flash-Next IQ3_S` · `512K` max context · `8` concurrent agent slots
+
+### Head-to-Head: Vanilla Native (`v0.2.16 / 58ee32277`) vs Strata-AGX (`ab410e06`)
+
+| Workload / Metric | Vanilla Native | Strata-AGX | Improvement |
+| --- | --- | --- | --- |
+| **8×65K Agentic Burst** (`burst65`) | `11.74` turns/min | **`246.72`** turns/min | **`+2,001.5%`** (`21.0×`) |
+| ↳ Burst TTFT p50 / Decode / Cold Prefill | `34.90 s` / `9.71` / `12,366` | **`1.42 s`** / **`244.92`** / **`16,145`** tok/s | **`-95.9%`** TTFT · **`25.2×`** dec · **`+30.6%`** PF |
+| **8×196K Agentic Burst** (`burst196`) | `3.88` turns/min | **`236.48`** turns/min | **`+5,994.8%`** (`60.9×`) |
+| ↳ Burst TTFT p50 / p95 | `69.78 s` / `192.72 s` | **`1.59 s`** / **`1.81 s`** | **`-97.7%`** p50 · **`-99.1%`** p95 |
+| ↳ Agg Decode / Cold Prefill | `2.87` / `13,016` tok/s | **`162.21`** / **`17,077`** tok/s | **`56.5×`** dec · **`+31.2%`** PF |
+| **400K Deep Context Needle** (cold / warm) | N/A (`270K` context cap) | **`Exact`** (`33.32 s` / `0.49 s`) | `512K` session support |
+| **Fleet Rotation** (`I-7`, `2×20×65K`) | `1,428.5` / `1,426.1 ms` | **`552.8`** / **`552.5 ms`** | **`-61.3%`** rotation latency |
+| **262K Prompt Hydration** (`SD_r262144_c4`) | `6,702.8` tok/s | **`16,077.7`** tok/s | **`2.40×`** |
+| **`agx_fast_gate`** (`c1` / `c4` / `c8` / `MPD`) | — | **`204.2`** / **`640.1`** / **`791.3`** / **`394.4`** tok/s | `8/8` needles · `0` leaks |
+
+### Quality Parity (`challenge-first`) & Architecture
+
+- **Suite B (`13/13 PASS`):** `100.0%` self-determinism · `24/24` (`100.0%`) think-greedy · `98.6%` think-sampled (vs `97.2%` Vanilla) · `0` empty answers & `0` repetition loops (vs `2` & `2` Vanilla).
+- **Suite C (`8/8 PASS`):** `13/16` executed coding with `0` compile/syntax errors (vs `12/16`) · `12/12` (`100.0%`) OpenAI tool calls · `23/23` (`100.0%`) multi-turn repo adherence · `36/36` (`100.0%`) long-context accuracy.
+- **Isolation:** `8/8` needles passed across all `agx_fast_gate`, `burst65`, and `burst196` runs with `0` cross-session leaks.
+- **Opt-In `sm_89` + `O(delta)` Architecture:** Surgical per-row FP8 prefill, SM89 MMVQ interleave & prefetch, long-context top-k selection, BF16 side-stream handoff, `O(delta)` rolling `slot_held_crc`, compact `array('I')` tokenizer pipe, and `orjson` SSE streaming — see [docs/SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md](docs/SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md) and [docs/SETTINGS.md](docs/SETTINGS.md).
+
 ## Models
 
 We recommend **ISTA-DASLab first**, then **Unsloth** and other providers, where a compatible model fits.
@@ -138,7 +165,7 @@ Run **`strata connect`** to see setup instructions for your tool. [Connection gu
 
 ## Strata-AGX (Ada Lovelace `sm_89` Fork)
 
-`MAHDI-AQ/Strata-AGX` `main` tracks upstream `Niko1221/Strata` `v0.2.16` (engine `0.1.62`, zero-GGML) with opt-in NVIDIA Ada Lovelace (`sm_89`) multi-GPU, FP8 prefill, QSA, MTP, and session-memory optimizations through Wave K26 Phase 1 (default upstream execution stays byte-identical when opt-in switches are unset).
+`MAHDI-AQ/Strata-AGX` `main` tracks upstream `Niko1221/Strata` `v0.2.16` (engine `0.1.62`, zero-GGML) with opt-in NVIDIA Ada Lovelace (`sm_89`) multi-GPU, FP8 prefill, QSA, MTP, and `O(delta)` server optimizations (default upstream execution stays byte-identical when opt-in switches are unset).
 
 - Architecture, verified `1×` / `2×` / `4× sm_89` flag profiles, spill/parity gates, and wave progression: [docs/SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md](docs/SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md)
 - Complete opt-in environment switch reference: [docs/SETTINGS.md](docs/SETTINGS.md)
