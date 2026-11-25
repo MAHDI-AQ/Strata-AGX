@@ -1,4 +1,4 @@
-"""terminal/serve/test_agx_k20b.py - Unit tests for Wave K20b STRATA_PICK_SLOT_GROUP_SPREAD."""
+"""Unit tests for server slot-group spread and prompt-cache safety."""
 from __future__ import annotations
 
 import os
