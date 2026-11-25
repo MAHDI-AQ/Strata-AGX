@@ -85,10 +85,16 @@ def _tok_worker_init(tpath_str: str):
     _TOK_WORKER_INST = ST.Tokenizer(tokens, merges, types, tcfg.get("pre") or "qwen35", tcfg.get("special_ids") or None)
 
 def _tok_worker_encode(text, args, kwargs):
-    return _TOK_WORKER_INST.encode(text, *args, **kwargs)
+    ids = _TOK_WORKER_INST.encode(text, *args, **kwargs)
+    if isinstance(ids, list) and (not ids or (min(ids) >= 0 and max(ids) <= 0xFFFFFFFF)):
+        return array.array("I", ids)
+    return ids
 
 def _tok_worker_encode_marked(text, args, kwargs):
-    return _TOK_WORKER_INST.encode_marked(text, *args, **kwargs)
+    ids, marks = _TOK_WORKER_INST.encode_marked(text, *args, **kwargs)
+    if isinstance(ids, list) and (not ids or (min(ids) >= 0 and max(ids) <= 0xFFFFFFFF)):
+        return array.array("I", ids), marks
+    return ids, marks
 
 class _OffloadTokenizerProxy:
     def __init__(self, tok, pool):
@@ -102,7 +108,8 @@ class _OffloadTokenizerProxy:
     def encode(self, text, *args, **kwargs):
         if self._pool is not None and isinstance(text, str) and len(text) >= self._min_chars:
             try:
-                return self._pool.submit(_tok_worker_encode, text, args, kwargs).result()
+                res = self._pool.submit(_tok_worker_encode, text, args, kwargs).result()
+                return res.tolist() if isinstance(res, array.array) else res
             except Exception:
                 pass
         return self._tok.encode(text, *args, **kwargs)
@@ -110,7 +117,8 @@ class _OffloadTokenizerProxy:
     def encode_marked(self, text, *args, **kwargs):
         if self._pool is not None and isinstance(text, str) and len(text) >= self._min_chars:
             try:
-                return self._pool.submit(_tok_worker_encode_marked, text, args, kwargs).result()
+                ids, marks = self._pool.submit(_tok_worker_encode_marked, text, args, kwargs).result()
+                return (ids.tolist() if isinstance(ids, array.array) else ids), marks
             except Exception:
                 pass
         return self._tok.encode_marked(text, *args, **kwargs)
@@ -1038,7 +1046,10 @@ class SessionLeaseRegistry:
             token_ids = meta.get("token_ids", [])
             dur_ms = res.get("duration_s", 0) * 1000.0
             if token_ids and hasattr(engine, "slot_held") and slot < len(engine.slot_held):
-                engine.slot_held[slot] = list(token_ids)
+                if hasattr(engine, "_set_slot_held"):
+                    engine._set_slot_held(slot, list(token_ids))
+                else:
+                    engine.slot_held[slot] = list(token_ids)
                 print(f"[strata 3-tier] Restored {len(token_ids)} tokens from NVMe to slot {slot} for session {session_id} in {dur_ms:.1f}ms (<40ms target).", flush=True)
             self.acquire(session_id=session_id, slot=slot, ttl=self.default_ttl, held_count=tokens, token_ids=token_ids)
             return True
@@ -1452,6 +1463,7 @@ class StrataEngine:
         # what each slot's sessions hold (prompt + every token a window fed), so a conversation's next turn goes to
         # the slot that has its start (the engine checks it again); when the slot was last used
         self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
+        self.slot_held_crc: list[tuple[int, int] | None] = [None] * self.batch
         self.session_leases = SessionLeaseRegistry(default_ttl=180.0)
         if env:
             for k, v in env.items():
@@ -2110,7 +2122,7 @@ class StrataEngine:
             self._send(f"BSTOP {slot}")
         except EngineDied:
             pass
-        q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held   # this process's: restart() replaces them
+        q, busy, held, held_crc = self.slot_q[slot], self.slot_busy, self.slot_held, self.slot_held_crc   # this process's: restart() replaces them
         releasing, claims = self.slot_releasing, self.slot_claims
         if self.gen != born:     # #5657: a restart came in since the check above (its number moves before its objects
             return               # do): these sets may be the NEW engine's, whose request holds this slot number now
@@ -2151,11 +2163,34 @@ class StrataEngine:
                 # lines still to come - the engine is ended instead (a dead engine's slots are free by being gone)
                 self._end_out_of_step(born, "the engine did not end a stopped batch slot (BSTOP) in time")
             held[slot] = tail[:-1] if stream and tail else []
+            held_crc[slot] = None
             with self.slot_cv:
                 busy[slot] = False
                 releasing.discard(slot)
                 self.slot_cv.notify_all()
         threading.Thread(target=wait, daemon=True).start()
+
+    def _set_slot_held(self, slot: int, tokens: list[int],
+                       prev_len: int = 0, prev_crc: int | None = None) -> None:
+        self.slot_held[slot] = tokens
+        if not tokens or array.array("i").itemsize != 4:
+            self.slot_held_crc[slot] = None
+            return
+        if prev_crc is not None and 0 < prev_len <= len(tokens):
+            delta = tokens[prev_len:]
+            crc = (zlib.crc32(array.array("i", delta).tobytes(), prev_crc) & 0xFFFFFFFF) if delta else prev_crc
+            self.slot_held_crc[slot] = (len(tokens), crc)
+            return
+        self.slot_held_crc[slot] = (len(tokens), zlib.crc32(array.array("i", tokens).tobytes()) & 0xFFFFFFFF)
+
+    def _get_slot_held_crc(self, slot: int, held_snap: list[int]) -> int:
+        cached = self.slot_held_crc[slot] if slot < len(self.slot_held_crc) else None
+        if cached is not None and cached[0] == len(held_snap):
+            return cached[1]
+        h = zlib.crc32(array.array("i", held_snap).tobytes()) & 0xFFFFFFFF
+        if slot < len(self.slot_held_crc):
+            self.slot_held_crc[slot] = (len(held_snap), h)
+        return h
 
     BGEN_REFUSALS_MAX = 6    # #1994: how often one request tries another slot after the engine refused a BGEN
     SLOT_PARK_S = 2.0        # ... and how long a refused slot stays out of the picks
@@ -2374,7 +2409,7 @@ class StrataEngine:
                     break
                 self.slot_busy[slot] = True
                 self.slot_claims.add(slot)
-                self.slot_held[slot] = []
+                self._set_slot_held(slot, [])
                 rq._strata_preslot = slot
                 rq._strata_co = True
                 total += len(prompt)
@@ -2699,7 +2734,7 @@ class StrataEngine:
                                 holding, born = True, self.gen
                                 lines_q, sq = getattr(self, "lines", None), getattr(self, "slot_q", None)   # (a slot is claimed below, on this engine)
                     if self._yielded is not None:           # it gave way: the others waiting then go first
-                        self.slot_held[slot] = list(prompt[:self._yielded[1]])
+                        self._set_slot_held(slot, list(prompt[:self._yielded[1]]))
                         self._yielded = None
                         yields += 1
                         self._release_control()
@@ -2742,8 +2777,12 @@ class StrataEngine:
                         and len(prompt) > len(held_snap)
                         and prompt[:len(held_snap)] == held_snap
                     )
+                    delta_prev_len = 0
+                    delta_prev_crc = None
                     if can_delta:
-                        h = zlib.crc32(array.array("i", held_snap).tobytes()) & 0xffffffff
+                        h = self._get_slot_held_crc(slot, held_snap)
+                        delta_prev_len = len(held_snap)
+                        delta_prev_crc = h
                         dhead = head.replace("BGEN ", "BGEND ", 1) + f" pfx={len(held_snap)} pfx_hash={h:08x}"
                         self._send_bin(dhead, prompt[len(held_snap):])
                     elif not embeddings and os.environ.get("STRATA_BINARY_IPC", "0") == "1" and array.array("i").itemsize == 4:
@@ -2755,7 +2794,7 @@ class StrataEngine:
                     started = getattr(cancel, "_strata_queue_started", None)
                     if started is not None:
                         started()
-                    self.slot_held[slot] = []               # the admission overwrites what the slot held
+                    self._set_slot_held(slot, [])           # the admission overwrites what the slot held
                     adm_from = len(out)                     # (the admission's own token comes after these)
                     admission_pending, admission_before = True, self.last
                     phase = "admit"
@@ -2813,7 +2852,7 @@ class StrataEngine:
                                 raise GpuBusy("the engine's batch slots are not free right now; try again in a moment",
                                           retry_after=5) from e
                             self.slot_live[slot] = None
-                            self.slot_held[slot] = []
+                            self._set_slot_held(slot, [])
                             phase = "none"
                             self._ctl_erred = False
                             self._park_slot(slot)
@@ -2911,9 +2950,10 @@ class StrataEngine:
                         self._apply_bdone(f)
                         admission_pending = False
                         # what the slot's sessions hold now: the prompt and every token fed (all but the last one)
-                        self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
+                        new_held = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
+                        self._set_slot_held(slot, new_held, prev_len=delta_prev_len, prev_crc=delta_prev_crc)
                         if f[3:4] == ["nonfinite"]:              # #879: the engine dropped the slot's state
-                            self.slot_held[slot] = []
+                            self._set_slot_held(slot, [])
                             raise EngineNonFinite("the engine's logits became non-finite (#879)")
                         self._raise_if_closed_under(f[3] if len(f) > 3 else None, cancel)   # #6055
                         if (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
@@ -3011,13 +3051,14 @@ class StrataEngine:
                 self.slot_used[slot] = time.time()
                 if phase == "slot" and bdone_in:
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
-                    self.slot_held[slot] = [] if bdone_nonfinite else (stream[:-1] if stream else [])     # as the BDONE wait leaves it
+                    self._set_slot_held(slot, [] if bdone_nonfinite else (stream[:-1] if stream else []),
+                                        prev_len=delta_prev_len, prev_crc=delta_prev_crc)     # as the BDONE wait leaves it
                     with self.slot_cv:
                         self.slot_busy[slot] = False
                         self.slot_claims.discard(slot)
                         self.slot_cv.notify_all()
                 elif phase == "slot" and self.alive():
-                    self.slot_held[slot] = []
+                    self._set_slot_held(slot, [])
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
                     self._release_slot_when_done(slot, stream, born)    # freed at its BDONE
                 else:
@@ -8796,7 +8837,7 @@ def make_handler(svc: Service):
                         tail = {"id": c["id"], "object": c["object"], "created": c["created"], "model": c["model"],
                                 "choices": [], "usage": c["usage"]}
                         for part in (head, tail):
-                            self.wfile.write(b"data: " + json.dumps(part, ensure_ascii=False).encode() + b"\n\n")
+                            self.wfile.write(b"data: " + _json_dumps_bytes(part) + b"\n\n")
                     else:
                         choices = c.get("choices") or []
                         if choices:
