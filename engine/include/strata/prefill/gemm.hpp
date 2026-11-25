@@ -159,6 +159,10 @@ private:
     // Dense FP8 Prefill Weight Cache (w8_):
     // Weights cached as CUDA_R_8F_E4M3 (N * K * 1 byte), saving 50% VRAM vs FP16 cache.
     struct W8Entry { const void* p; int type; int64_t n, k; uint8_t* d; float* scale_w; bool per_row = false; };
+    // STRATA_PF_W8_MIN_WEIGHT_MIB=N (opt-in): weights under N MiB are left uncached so the byte budget goes to the
+    // larger prefill GEMM layers. STRATA_PF_W8_SIZE_PRIORITY=1 (opt-in): on a free-VRAM-floor / allocation failure,
+    // evict the smallest cached entry (when at most half the incoming weight) before freezing the budget.
+    // Both are off by default; the hard 1,400 MiB free-VRAM floor is never lowered.
     std::vector<W8Entry> w8_;
     int64_t w8_budget_ = -1;
     int64_t w8_used_ = 0;

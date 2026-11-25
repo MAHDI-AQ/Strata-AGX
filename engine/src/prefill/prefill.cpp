@@ -935,6 +935,14 @@ static bool handoff_fp8_async_on() {
     const char* e = std::getenv("STRATA_HANDOFF_FP8_ASYNC");
     return e != nullptr && e[0] == '1' && e[1] == '\0';
 }
+// STRATA_HANDOFF_PACK_ASYNC=1 (CUDA, opt-in): do not block per chunk on the pack event. on_stage_chunk reads the
+// stage's session state, not the pack kernel's handoff staging buffer, and its checkpoint_save ends in
+// cudaDeviceSynchronize; the copy's data dependency stays on fp8_ready. The event is polled at the next chunk
+// boundary and synchronized once at the stage's end, so a pack error is still reported before the run succeeds.
+static bool handoff_pack_async_on() {
+    const char* e = std::getenv("STRATA_HANDOFF_PACK_ASYNC");
+    return e != nullptr && e[0] == '1' && e[1] == '\0';
+}
 struct HandWorker {
     std::mutex mu;
     std::condition_variable cv;
@@ -1739,6 +1747,7 @@ struct Prefill::Impl {
     cudaEvent_t fp8_pack_done = nullptr;
     cudaEvent_t fp8_ready[2] = {};
     bool fp8_side_used = false;
+    bool fp8_pack_pending = false;   // STRATA_HANDOFF_PACK_ASYNC: a pack event whose error is checked later
     // C-4: the chunk's token ids on the device, for one batched embedding gather
     int32_t* tok_dev = nullptr;
     std::vector<int32_t> tok_host;
@@ -4296,6 +4305,20 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const int64_t forced = is_first ? std::exchange(force_chunk_, 0) : 0;
     const bool forced_single = force_single_, forced_planned = force_planned_;
     Impl& m = *impl_;
+    const bool pack_async = handoff_pack_async_on();
+    // Non-blocking completion / error check of the last recorded pack event. `final` is the once-per-stage sync;
+    // before that, cudaErrorNotReady simply leaves the check pending for the next chunk boundary.
+    auto poll_fp8_pack = [&](bool final) -> bool {
+        if (!pack_async || !m.fp8_pack_pending || m.fp8_pack_done == nullptr) return true;
+        const cudaError_t q = final ? cudaEventSynchronize(m.fp8_pack_done) : cudaEventQuery(m.fp8_pack_done);
+        if (q == cudaErrorNotReady) return true;
+        if (q != cudaSuccess) {
+            err = std::string("prefill: the layer split's hand-off pack: ") + cudaGetErrorString(q);
+            return false;
+        }
+        m.fp8_pack_pending = false;
+        return true;
+    };
     const core::OnDevice on_device(m.device);
     // the stall report asks this stream (the one the waits below block on) whether its work is done (#5718 follow-up)
     const core::WatchedStream watched("the prompt's GPU work", (void*) m.cs, m.device);
@@ -7696,6 +7719,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         if (next_ != nullptr) {
             const bool use_bf16_handoff = handoff_bf16_enabled();
             if (use_bf16_handoff && m.bf16_hand[hand_buf_] != nullptr && m.bf16_hand_dev != nullptr) {
+                if (!poll_fp8_pack(false)) return false;   // before this chunk overwrites the event
                 cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
                 const bool capturing = m.cs != nullptr &&
                     (cudaStreamIsCapturing(m.cs, &cap) != cudaSuccess || cap != cudaStreamCaptureStatusNone);
@@ -7759,7 +7783,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     err = std::string("prefill: the layer split's BF16 hand-off: ") + cudaGetErrorString(cudaGetLastError());
                     return false;
                 }
-                if (async_hand && cudaEventSynchronize(m.fp8_pack_done) != cudaSuccess) {
+                if (async_hand && pack_async) {
+                    m.fp8_pack_pending = true;
+                    if (!poll_fp8_pack(false)) return false;
+                } else if (async_hand && cudaEventSynchronize(m.fp8_pack_done) != cudaSuccess) {
                     err = std::string("prefill: the layer split's BF16 hand-off: ") + cudaGetErrorString(cudaGetLastError());
                     return false;
                 }
@@ -7793,6 +7820,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
             const bool use_fp8_handoff = handoff_fp8_enabled();
             if (use_fp8_handoff && m.fp8_hand[hand_buf_].payload != nullptr && m.fp8_hand_payload_dev != nullptr) {
+                if (!poll_fp8_pack(false)) return false;   // before this chunk overwrites the event
                 // Prompt handoff is outside the decode graph. Inside a capture, keep the synchronizing copy.
                 // The capture query runs only when the flag is exactly 1, so the default path does not touch it.
                 bool async_hand = false;
@@ -7855,7 +7883,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 }
                 // on_stage_chunk saves this stage's state and requires the compute stream to have finished.
                 // The D2H is on the side stream, so this wait does not cover the copy.
-                if (async_hand && cudaEventSynchronize(m.fp8_pack_done) != cudaSuccess) {
+                if (async_hand && pack_async) {
+                    m.fp8_pack_pending = true;
+                    if (!poll_fp8_pack(false)) return false;
+                } else if (async_hand && cudaEventSynchronize(m.fp8_pack_done) != cudaSuccess) {
                     err = std::string("prefill: the layer split's FP8 hand-off: ") +
                           cudaGetErrorString(cudaGetLastError());
                     return false;
@@ -8028,6 +8059,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         bad(ss.gdn_state, 64 * 1024);
         std::fprintf(stderr, "\n");
     }
+    // STRATA_HANDOFF_PACK_ASYNC: the final chunk's pack event is checked here, once per stage.
+    if (!poll_fp8_pack(true)) return false;
     if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
         err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError());
         return false;

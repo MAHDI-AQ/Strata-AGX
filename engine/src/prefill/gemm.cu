@@ -2623,6 +2623,16 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
         const int64_t mib = std::atoll(v);
         return mib > 0 ? (mib << 20) : 0;
     };
+    // STRATA_PF_W8_MIN_WEIGHT_MIB=N (CUDA, opt-in): do not cache a weight smaller than N MiB. The scarce byte budget
+    // then goes to the larger prefill GEMM layers that would otherwise fall back to BF16. Unset / 0 changes nothing.
+    static const int64_t w8_min_weight_bytes = [] {
+        const char* v = std::getenv("STRATA_PF_W8_MIN_WEIGHT_MIB");
+        const int64_t mib = v != nullptr ? std::atoll(v) : 0;
+        return mib > 0 ? (mib << 20) : int64_t(0);
+    }();
+    // STRATA_PF_W8_SIZE_PRIORITY=1 (CUDA, opt-in): on a free-VRAM-floor skip or an allocation failure, evict the
+    // smallest cached weight (when it is at most half the incoming weight) and retry before freezing the budget.
+    static const bool w8_size_priority = env_is_1("STRATA_PF_W8_SIZE_PRIORITY");
     if (w8_budget_ < 0) {
         const char* v = std::getenv("STRATA_PF_W8_CACHE_MIB");
         const char* on = std::getenv("STRATA_PF_W8_CACHE");
@@ -2664,52 +2674,84 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
                 break;
             }
         }
-        if (cw8 == nullptr && w8_used_ + total_bytes <= w8_budget_ && N * K <= scratch_elems_) {
+        if (cw8 == nullptr && w8_used_ + total_bytes <= w8_budget_ &&
+            N * K <= scratch_elems_ && total_bytes >= w8_min_weight_bytes) {
             size_t fb = 0, tb = 0;
             if (cudaMemGetInfo(&fb, &tb) == cudaSuccess) {
                 // Hard 1,400 MiB boot-free safety floor whenever PF_W8_CACHE is active (prevents Xid 31).
                 const int64_t effective_reserve = std::max<int64_t>(w8_reserve_, kW8AutoReserve);
-                if (fb > (size_t) total_bytes + (size_t) effective_reserve &&
-                    cudaMalloc((void**) &cw8, (size_t) bytes) == cudaSuccess &&
-                    cudaMalloc((void**) &d_scale_w, (size_t) scale_bytes) == cudaSuccess) {
-                    bool q_ok = true;
-                    if (!per_row) {
-                        if (!d_max_w_ && cudaMalloc((void**) &d_max_w_, sizeof(float)) != cudaSuccess) {
-                            d_max_w_ = nullptr;
-                            q_ok = false;
+                // This loop runs once on the default path. With STRATA_PF_W8_SIZE_PRIORITY=1 a floor / allocation
+                // failure first evicts the smallest cached weight (when it is at most half the incoming weight) and
+                // retries; the budget freezes only when no entry can make room.
+                for (;;) {
+                    bool amax_alloc_failed = false;
+                    if (fb > (size_t) total_bytes + (size_t) effective_reserve &&
+                        cudaMalloc((void**) &cw8, (size_t) bytes) == cudaSuccess &&
+                        cudaMalloc((void**) &d_scale_w, (size_t) scale_bytes) == cudaSuccess) {
+                        bool q_ok = true;
+                        if (!per_row) {
+                            if (!d_max_w_ && cudaMalloc((void**) &d_max_w_, sizeof(float)) != cudaSuccess) {
+                                d_max_w_ = nullptr;
+                                q_ok = false;
+                            }
                         }
+                        if (q_ok) {
+                            strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
+                            if (per_row) {
+                                w16_per_row_quantize_e4m3_kernel<<<(unsigned) N, 256, 0, (cudaStream_t) stream_>>>(
+                                    (const half*) scratch_, cw8, d_scale_w, N, K);
+                            } else {
+                                cudaMemsetAsync(d_max_w_, 0, sizeof(float), (cudaStream_t) stream_);
+                                w16_amax_kernel<<<64, 256, 0, (cudaStream_t) stream_>>>((const half*) scratch_, N * K, d_max_w_);
+                                w16_scale_and_quantize_vectorized_kernel<<<64, 256, 0, (cudaStream_t) stream_>>>(
+                                    (const half*) scratch_, cw8, N * K, d_max_w_, d_scale_w);
+                            }
+                            w8_.push_back({W_blocks, ggml_type, N, K, cw8, d_scale_w, per_row});
+                            cw8_per_row = per_row;
+                            w8_used_ += total_bytes;
+                            if (!w8_logged_) {
+                                w8_logged_ = true;
+                                std::fprintf(stderr, "strata prefill: surgical FP8 dense weight cache active (%lld MiB cached, per-row=%d, card keeps %lld MiB free; STRATA_PF_W8_CACHE=0 turns it off)\n",
+                                             (long long) (w8_used_ >> 20), per_row ? 1 : 0, (long long) (effective_reserve >> 20));
+                            }
+                            break;   // the entry is cached
+                        }
+                        amax_alloc_failed = !q_ok;
                     }
-                    if (q_ok) {
-                        strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
-                        if (per_row) {
-                            w16_per_row_quantize_e4m3_kernel<<<(unsigned) N, 256, 0, (cudaStream_t) stream_>>>(
-                                (const half*) scratch_, cw8, d_scale_w, N, K);
-                        } else {
-                            cudaMemsetAsync(d_max_w_, 0, sizeof(float), (cudaStream_t) stream_);
-                            w16_amax_kernel<<<64, 256, 0, (cudaStream_t) stream_>>>((const half*) scratch_, N * K, d_max_w_);
-                            w16_scale_and_quantize_vectorized_kernel<<<64, 256, 0, (cudaStream_t) stream_>>>(
-                                (const half*) scratch_, cw8, N * K, d_max_w_, d_scale_w);
-                        }
-                        w8_.push_back({W_blocks, ggml_type, N, K, cw8, d_scale_w, per_row});
-                        cw8_per_row = per_row;
-                        w8_used_ += total_bytes;
-                        if (!w8_logged_) {
-                            w8_logged_ = true;
-                            std::fprintf(stderr, "strata prefill: surgical FP8 dense weight cache active (%lld MiB cached, per-row=%d, card keeps %lld MiB free; STRATA_PF_W8_CACHE=0 turns it off)\n",
-                                         (long long) (w8_used_ >> 20), per_row ? 1 : 0, (long long) (effective_reserve >> 20));
-                        }
-                    } else {
-                        (void) cudaGetLastError();
-                        if (cw8) { (void) cudaFree(cw8); cw8 = nullptr; }
-                        if (d_scale_w) { (void) cudaFree(d_scale_w); d_scale_w = nullptr; }
-                    }
-                } else {
                     (void) cudaGetLastError();
                     if (cw8) { (void) cudaFree(cw8); cw8 = nullptr; }
                     if (d_scale_w) { (void) cudaFree(d_scale_w); d_scale_w = nullptr; }
-                    // Cap budget to currently used cache if any weights cached; do NOT zero out budget on initial skip!
-                    if (w8_used_ > 0) {
-                        w8_budget_ = w8_used_;
+                    // The original path did not freeze the budget for an amax scratch allocation failure.
+                    if (amax_alloc_failed) break;
+                    bool retried = false;
+                    if (w8_size_priority && !w8_.empty()) {
+                        size_t smallest = 0;
+                        int64_t smallest_bytes = 0;
+                        for (size_t i = 0; i < w8_.size(); ++i) {
+                            const W8Entry& e = w8_[i];
+                            const int64_t eb = e.n * e.k +
+                                (e.per_row ? e.n * (int64_t) sizeof(float) : (int64_t) sizeof(float));
+                            if (smallest_bytes == 0 || eb < smallest_bytes) {
+                                smallest = i;
+                                smallest_bytes = eb;
+                            }
+                        }
+                        if (smallest_bytes > 0 && smallest_bytes <= total_bytes / 2) {
+                            W8Entry& e = w8_[smallest];
+                            (void) cudaFree(e.d);
+                            (void) cudaFree(e.scale_w);
+                            w8_used_ -= smallest_bytes;
+                            w8_.erase(w8_.begin() + smallest);
+                            // Re-check free VRAM before the retry; the hard floor is unchanged.
+                            retried = cudaMemGetInfo(&fb, &tb) == cudaSuccess;
+                        }
+                    }
+                    if (!retried) {
+                        // Cap budget to currently used cache if any weights cached; do NOT zero out budget on initial skip!
+                        if (w8_used_ > 0) {
+                            w8_budget_ = w8_used_;
+                        }
+                        break;
                     }
                 }
             }
