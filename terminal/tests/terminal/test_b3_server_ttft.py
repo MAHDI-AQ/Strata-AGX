@@ -120,3 +120,14 @@ def test_json_dumps_bytes_sse_equivalence() -> None:
     raw = srv._json_dumps_bytes(part)
     assert isinstance(raw, bytes)
     assert json.loads(raw.decode("utf-8")) == part
+
+
+def test_new_mock_without_slot_held_crc() -> None:
+    eng = srv.StrataEngine.__new__(srv.StrataEngine)
+    eng.slot_held = [[10, 20, 30]]
+    # Deliberately omit eng.slot_held_crc to mirror StrataEngine.__new__ test mocks.
+    assert eng._get_slot_held_crc(0, eng.slot_held[0]) == _full_crc32([10, 20, 30])
+    eng._set_slot_held(0, [10, 20, 30, 40], prev_len=3, prev_crc=_full_crc32([10, 20, 30]))
+    assert eng.slot_held_crc[0] == (4, _full_crc32([10, 20, 30, 40]))
+    eng._set_slot_held(0, [])
+    assert eng.slot_held_crc[0] is None

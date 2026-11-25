@@ -2122,7 +2122,8 @@ class StrataEngine:
             self._send(f"BSTOP {slot}")
         except EngineDied:
             pass
-        q, busy, held, held_crc = self.slot_q[slot], self.slot_busy, self.slot_held, self.slot_held_crc   # this process's: restart() replaces them
+        q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held   # this process's: restart() replaces them
+        held_crc = getattr(self, "slot_held_crc", None)
         releasing, claims = self.slot_releasing, self.slot_claims
         if self.gen != born:     # #5657: a restart came in since the check above (its number moves before its objects
             return               # do): these sets may be the NEW engine's, whose request holds this slot number now
@@ -2163,33 +2164,44 @@ class StrataEngine:
                 # lines still to come - the engine is ended instead (a dead engine's slots are free by being gone)
                 self._end_out_of_step(born, "the engine did not end a stopped batch slot (BSTOP) in time")
             held[slot] = tail[:-1] if stream and tail else []
-            held_crc[slot] = None
+            if held_crc is not None and slot < len(held_crc):
+                held_crc[slot] = None
             with self.slot_cv:
                 busy[slot] = False
                 releasing.discard(slot)
                 self.slot_cv.notify_all()
         threading.Thread(target=wait, daemon=True).start()
 
+    def _ensure_slot_held_crc(self, slot: int) -> list[tuple[int, int] | None]:
+        crc_list = getattr(self, "slot_held_crc", None)
+        if crc_list is None:
+            crc_list = [None] * max(len(getattr(self, "slot_held", ())), slot + 1)
+            self.slot_held_crc = crc_list
+        elif slot >= len(crc_list):
+            crc_list.extend([None] * (slot + 1 - len(crc_list)))
+        return crc_list
+
     def _set_slot_held(self, slot: int, tokens: list[int],
                        prev_len: int = 0, prev_crc: int | None = None) -> None:
         self.slot_held[slot] = tokens
+        crc_list = self._ensure_slot_held_crc(slot)
         if not tokens or array.array("i").itemsize != 4:
-            self.slot_held_crc[slot] = None
+            crc_list[slot] = None
             return
         if prev_crc is not None and 0 < prev_len <= len(tokens):
             delta = tokens[prev_len:]
             crc = (zlib.crc32(array.array("i", delta).tobytes(), prev_crc) & 0xFFFFFFFF) if delta else prev_crc
-            self.slot_held_crc[slot] = (len(tokens), crc)
+            crc_list[slot] = (len(tokens), crc)
             return
-        self.slot_held_crc[slot] = (len(tokens), zlib.crc32(array.array("i", tokens).tobytes()) & 0xFFFFFFFF)
+        crc_list[slot] = (len(tokens), zlib.crc32(array.array("i", tokens).tobytes()) & 0xFFFFFFFF)
 
     def _get_slot_held_crc(self, slot: int, held_snap: list[int]) -> int:
-        cached = self.slot_held_crc[slot] if slot < len(self.slot_held_crc) else None
+        crc_list = self._ensure_slot_held_crc(slot)
+        cached = crc_list[slot]
         if cached is not None and cached[0] == len(held_snap):
             return cached[1]
         h = zlib.crc32(array.array("i", held_snap).tobytes()) & 0xFFFFFFFF
-        if slot < len(self.slot_held_crc):
-            self.slot_held_crc[slot] = (len(held_snap), h)
+        crc_list[slot] = (len(held_snap), h)
         return h
 
     BGEN_REFUSALS_MAX = 6    # #1994: how often one request tries another slot after the engine refused a BGEN
