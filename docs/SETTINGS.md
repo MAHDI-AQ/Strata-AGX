@@ -10,7 +10,7 @@ debugging and are kept in `terminal/data/settings-register.json`.
 A number or a word is set like any environment variable, for example `STRATA_KVA=1`. In the Terminal, `strata launch --set NAME=value`
 puts it in the model's run configuration.
 
-## Switches you can turn on (369)
+## Switches you can turn on (372)
 
 Off unless you set them. The last column says where each one is described.
 
@@ -108,6 +108,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_HANDOFF_BF16` | text | NVIDIA and AMD | - |
 | `STRATA_HANDOFF_FP8` | on / off | NVIDIA and AMD | - |
 | `STRATA_HANDOFF_FP8_ASYNC` | on / off | NVIDIA and AMD | - |
+| `STRATA_HANDOFF_PACK_ASYNC` | on / off | NVIDIA and AMD | - |
 | `STRATA_HANDOFF_PIPE` | number | NVIDIA and AMD | [BATCHING.md](BATCHING.md) |
 | `STRATA_HC_PERSIST` | number | NVIDIA and AMD | [AMD_HIP.md](AMD_HIP.md), [README.md](bench-results/README.md), [README.md](bench-results/2026-10-12-hc-persist-gfx1030/README.md) |
 | `STRATA_HC_REQ8` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
@@ -253,7 +254,9 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_PF_SWITCH_MIN_T` | number | NVIDIA and AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md), [STRIX_HALO.md](STRIX_HALO.md), [README.md](bench-results/2026-10-09-community-strix-halo-laptop-70w/README.md) |
 | `STRATA_PF_W8_CACHE` | text | NVIDIA and AMD | - |
 | `STRATA_PF_W8_CACHE_MIB` | text | NVIDIA and AMD | [SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md](SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md), [AGENTS.md](../AGENTS.md) |
+| `STRATA_PF_W8_MIN_WEIGHT_MIB` | number | NVIDIA and AMD | - |
 | `STRATA_PF_W8_PER_ROW` | text | NVIDIA and AMD | - |
+| `STRATA_PF_W8_SIZE_PRIORITY` | on / off | NVIDIA and AMD | - |
 | `STRATA_PF_WMMA` | on / off | NVIDIA and AMD | [NVIDIA_V100.md](NVIDIA_V100.md), [README.md](bench-results/2026-10-07-v100-prompt-experts/README.md) |
 | `STRATA_PF_WMMA2` | on / off | NVIDIA and AMD | [NVIDIA_V100.md](NVIDIA_V100.md) |
 | `STRATA_PICK_SLOT_GROUP_SPREAD` | on / off | NVIDIA and AMD | [SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md](SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md), [AGENTS.md](../AGENTS.md) |

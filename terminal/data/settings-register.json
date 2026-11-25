@@ -12498,6 +12498,39 @@
       "retired_in": ""
     },
     {
+      "name": "STRATA_HANDOFF_PACK_ASYNC",
+      "backends": [
+        "cuda-hip"
+      ],
+      "reads": [
+        {
+          "file": "engine/src/prefill/prefill.cpp",
+          "line": 943,
+          "backend": "cuda-hip",
+          "fn": "getenv"
+        }
+      ],
+      "parse": "flag",
+      "default_state": "off",
+      "code_default": null,
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "first_commit": "a1156dd971",
+      "first_date": "2026-11-25",
+      "since": null,
+      "last_commit": "a1156dd971",
+      "last_date": "2026-11-25",
+      "status": "opt-in",
+      "owner": "prefill",
+      "note": "opt-in deferred fp8_pack_done handoff sync: check the pack event later instead of blocking per chunk (Arm H, 2026-11-26 prefill profile, 4x RTX 4090, CUDA 12.4)",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
       "name": "STRATA_HANDOFF_PIPE",
       "backends": [
         "cuda-hip"
@@ -30052,6 +30085,39 @@
       "retired_in": ""
     },
     {
+      "name": "STRATA_PF_W8_MIN_WEIGHT_MIB",
+      "backends": [
+        "cuda-hip"
+      ],
+      "reads": [
+        {
+          "file": "engine/src/prefill/gemm.cu",
+          "line": 2629,
+          "backend": "cuda-hip",
+          "fn": "getenv"
+        }
+      ],
+      "parse": "int",
+      "default_state": null,
+      "code_default": "0",
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "first_commit": "a1156dd971",
+      "first_date": "2026-11-25",
+      "since": null,
+      "last_commit": "a1156dd971",
+      "last_date": "2026-11-25",
+      "status": "opt-in",
+      "owner": "prefill",
+      "note": "opt-in W8 cache minimum weight size in MiB: weights under N MiB are left uncached so scarce bytes go to larger prefill GEMMs (Arm H, 2026-11-26 prefill profile, 4x RTX 4090, CUDA 12.4)",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
       "name": "STRATA_PF_W8_PER_ROW",
       "backends": [
         "cuda-hip"
@@ -30081,6 +30147,39 @@
       "status": "opt-in",
       "owner": "prefill",
       "note": "opt-in per-row-N FP8 W8 weight scaling inside per-token epilogue (Wave B1)",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
+      "name": "STRATA_PF_W8_SIZE_PRIORITY",
+      "backends": [
+        "cuda-hip"
+      ],
+      "reads": [
+        {
+          "file": "engine/src/prefill/gemm.cu",
+          "line": 2635,
+          "backend": "cuda-hip",
+          "fn": "env_is_1"
+        }
+      ],
+      "parse": "flag",
+      "default_state": null,
+      "code_default": null,
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "first_commit": "a1156dd971",
+      "first_date": "2026-11-25",
+      "since": null,
+      "last_commit": "a1156dd971",
+      "last_date": "2026-11-25",
+      "status": "opt-in",
+      "owner": "prefill",
+      "note": "opt-in size-priority W8 weight cache: free VRAM floor / allocation failure evicts small cached weights first (Arm H, 2026-11-26 prefill profile, 4x RTX 4090, CUDA 12.4)",
       "retire_after": "",
       "retired_in": ""
     },

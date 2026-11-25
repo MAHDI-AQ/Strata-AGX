@@ -44,6 +44,7 @@
 | **Fleet Rotation** (`I-7`, `2×20×65K`) | `1,428.5` / `1,426.1 ms` | **`552.8`** / **`552.5 ms`** | **`-61.3%`** rotation latency |
 | **262K Prompt Hydration** (`SD_r262144_c4`) | `6,702.8` tok/s | **`16,077.7`** tok/s | **`2.40×`** |
 | **`agx_fast_gate`** (`c1` / `c4` / `c8` / `MPD`) | — | **`204.2`** / **`640.1`** / **`791.3`** / **`394.4`** tok/s | `8/8` needles · `0` leaks |
+**Arm H (2026-11-26 prefill profile, current `a1156dd97`):** `burst65` cold prefill p50 `3779.64 ms` (`-5.97%`); `burst196` cold prefill p50 `10947.96 ms` (`-4.89%`) and warm TTFT p50 `1375.16 ms` (`-13.28%`); `8/8` needles and `0` Xids across `burst65`, `burst196` and `agx_fast_gate`.
 
 ### Quality Parity (`challenge-first`) & Architecture
 
