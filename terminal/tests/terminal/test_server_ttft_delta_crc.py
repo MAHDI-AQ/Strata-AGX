@@ -1,4 +1,4 @@
-"""Tests for Wave B3 server.py TTFT/GIL optimizations."""
+"""Tests for server.py TTFT delta CRC and token-pipe optimizations."""
 from __future__ import annotations
 
 import array

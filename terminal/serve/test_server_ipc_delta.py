@@ -1,4 +1,4 @@
-"""serve/test_agx_k19.py - Unit tests for Wave K19 serve/server.py changes (no GPU, no lab paths)."""
+"""serve/test_server_ipc_delta.py - Unit tests for server.py IPC delta changes (no GPU, no lab paths)."""
 from __future__ import annotations
 
 import array
@@ -87,7 +87,7 @@ def _make_bare_engine(batch: int = 2) -> StrataEngine:
     return eng
 
 
-class TestWaveK19Serve(unittest.TestCase):
+class TestServerIpcDelta(unittest.TestCase):
     def test_tier3_nvme_promotion_respects_unleased_free(self) -> None:
         eng = _make_bare_engine(batch=2)
         eng.session_leases = _FakeLeases("nvme", {0: "leased-other"})
