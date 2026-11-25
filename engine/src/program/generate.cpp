@@ -39,6 +39,7 @@
 #include "strata/program/adaptive_range.hpp"
 #include "strata/core/run_manifest.hpp"
 #include "strata/core/device.hpp"
+#include "strata/core/boot_weight_crc.hpp"
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_nibble.hpp"
@@ -7378,6 +7379,7 @@ int main(int argc, char** argv) {
             // the process-wide range that `load` also reads may be stale from an earlier stage's
             // set_layer_range (an explicit split loads its later stages eagerly): reset it to ours
             strata::core::NativeDense::set_layer_range((int) lo, (int) hi);
+            if (strata::core::boot_weight_crc_enabled()) strata::core::boot_crc_clear_holder(dev, "wt");
             table = strata::core::WeightTable{};
             cudaFree(base);
             base = nullptr;
@@ -9517,7 +9519,16 @@ int main(int argc, char** argv) {
                              (long long) i, err.c_str());
                 return 1;
             }
-            fill_bytes += strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
+            const uint64_t b_bytes = strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
+            if (!nib_pair && strata::core::boot_weight_crc_enabled()) {
+                int xdev = 0;
+                if (cudaGetDevice(&xdev) != cudaSuccess) { (void) cudaGetLastError(); xdev = 0; }
+                char tag[48];
+                std::snprintf(tag, sizeof(tag), "L%d.E%d.S%d", (int) profile[(size_t) i].first,
+                              (int) profile[(size_t) i].second, (int) slot);
+                strata::core::boot_crc_record(xdev, "ecache", tag, xcache.device_slot(slot), b_bytes, b);
+            }
+            fill_bytes += b_bytes;
             ++prefilled;
         }
         if (nib_x.active() && !nib_x.finish(err)) {
@@ -9688,6 +9699,11 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: layer split, CUDA%d profile fill failed at pair %lld: %s\n",
                              st.dev, (long long) filled, err.c_str());
                 return 1;
+            }
+            if (!nib_pair && strata::core::boot_weight_crc_enabled()) {
+                char tag[48];
+                std::snprintf(tag, sizeof(tag), "L%d.E%d.S%d", (int) pr.first, (int) pr.second, (int) slot);
+                strata::core::boot_crc_record(st.dev, "ecache", tag, st.cache.device_slot(slot), (uint64_t) lay.blob_bytes(pr.first), b);
             }
             ++filled;
         }
@@ -16090,6 +16106,15 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: STRATA_MLOCK_CODE=1 locked %.1f MiB across %zu read-only PT_LOAD segments\n",
                          (double) st.bytes / (1024.0 * 1024.0), st.segs);
         }
+#endif
+        if (strata::core::boot_weight_crc_enabled()) {
+            std::string crc_err;
+            if (!strata::core::boot_weight_crc_verify_all(crc_err)) {
+                std::fprintf(stderr, "strata generate: %s\n", crc_err.c_str());
+                return 1;
+            }
+        }
+#if !defined(_WIN32)
         static const bool drop_startup_mmap_on = [] {
             const char* v = std::getenv("STRATA_DROP_STARTUP_MMAP");
             return v != nullptr && std::atoi(v) != 0;
@@ -24566,6 +24591,13 @@ int main(int argc, char** argv) {
         if (df2_solo && !use_df2) {   // --draft-fallback none: the reason is printed above; there is no MTP to draft instead
             std::fprintf(stderr, "strata generate: --draft-fallback none: DFlash2 did not start and no MTP is loaded, so the run ends here\n");
             return 1;
+        }
+        if (strata::core::boot_weight_crc_enabled()) {
+            std::string crc_err;
+            if (!strata::core::boot_weight_crc_verify_all(crc_err)) {
+                std::fprintf(stderr, "strata generate: %s\n", crc_err.c_str());
+                return 1;
+            }
         }
         const bool draft_on = use_mtp || use_df2;   // some drafter proposes (--draft-fallback none: DFlash2 alone, use_mtp false)
         mem_mark("the verifier and the drafter's binding");

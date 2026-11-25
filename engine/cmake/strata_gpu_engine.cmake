@@ -6,7 +6,7 @@
 # the GPU engine of the CUDA and HIP builds (strata_core, strata_kernels, strata_prefill, strata_engine, strata, the Qwen3.6 engine and their tests): shared by both backends
 macro(strata_gpu_engine)
 if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
-  add_library(strata_core STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/platform/io_priority.cpp src/core/graph.cpp src/core/weights.cpp
+  add_library(strata_core STATIC src/core/device.cu src/core/pinned.cu src/core/boot_weight_crc.cu src/platform/memory.cpp src/platform/io_priority.cpp src/core/graph.cpp src/core/weights.cpp
                                src/core/layout.cpp)
   target_include_directories(strata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   # the DFlash2 drafter (src/core/dflash2.cpp, src/kernels/cuda/dflash2.cu) exists in the CUDA and HIP builds; the Metal and SYCL builds compile without it
@@ -1344,6 +1344,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(pinned_capture PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(pinned_capture PRIVATE ${_strata_gpu_runtime_target})
     add_test(NAME pinned_capture COMMAND pinned_capture)
+  endif()
+
+  if(STRATA_ENABLE_CUDA AND STRATA_BUILD_TESTS)
+    add_executable(boot_weight_crc_cuda_test src/core/boot_weight_crc_test.cu)
+    target_include_directories(boot_weight_crc_cuda_test PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(boot_weight_crc_cuda_test PRIVATE strata_core ${_strata_gpu_runtime_target})
+    add_test(NAME boot_weight_crc_cuda_test COMMAND boot_weight_crc_cuda_test)
+    set_tests_properties(boot_weight_crc_cuda_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
   endif()
 
   # Tells tests/CMakeLists.txt to add the CUDA-dependent Catch2 target.  It cannot be declared there

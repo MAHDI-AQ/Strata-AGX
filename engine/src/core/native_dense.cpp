@@ -1,4 +1,5 @@
 #include "strata/core/native_dense.hpp"
+#include "strata/core/boot_weight_crc.hpp"
 #include "strata/core/run_manifest.hpp"
 #include <cstdlib>
 #include "strata/core/weights.hpp"
@@ -305,6 +306,7 @@ NativeDense::~NativeDense() {
 }
 
 void NativeDense::release() {
+    if (dev_ >= 0 && boot_weight_crc_enabled()) boot_crc_clear_holder(dev_, "dense");
     // what the destructor always did first: no HC scratch pointer and no packed-Q8 registry key may outlive the memory
     for (auto& dev : g_hc_scratch)
         for (auto& cl : dev)
@@ -317,6 +319,7 @@ void NativeDense::release() {
     weights_.clear();
     packed_keys_.clear();
     layer_bytes_.clear();
+    dev_ = -1;
     bytes_ = 0;
 }
 
@@ -339,6 +342,13 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
     };
     if (scratch_ || !weights_.empty()) { err = "native dense: already loaded"; return false; }
     if (shards.empty()) { err = "native dense: at least one GGUF shard is required"; return false; }
+    const bool crc_on = boot_weight_crc_enabled();
+    int crc_dev = 0;
+    if (crc_on) {
+        if (cudaGetDevice(&crc_dev) != cudaSuccess) { (void) cudaGetLastError(); crc_dev = 0; }
+        dev_ = crc_dev;
+        boot_crc_clear_holder(crc_dev, "dense");
+    }
     try {
         std::vector<Pending> pending;
         std::set<std::string> seen;
@@ -432,6 +442,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     if (status != cudaSuccess) {
                         err = "native dense upload " + tensor.name + ": " + cudaGetErrorString(status); return false;
                     }
+                    if (crc_on) boot_crc_record(crc_dev, "dense", tensor.name.c_str(), data.get(), q8.size(), q8.data());
                     max_in = (std::max)(max_in, (int) ref.ne0);
                     total += q8.size();
                     allocated += alloc_bytes(q8.size());
@@ -458,6 +469,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 if (status != cudaSuccess) {
                     err = "native dense upload " + tensor.name + ": " + cudaGetErrorString(status); return false;
                 }
+                if (crc_on) boot_crc_record(crc_dev, "dense", tensor.name.c_str(), data.get(), bytes, gguf.tensor_data(tensor));
                 max_in = (std::max)(max_in, (int) ref.ne0);
                 total += bytes;
                 allocated += alloc_bytes(bytes);
@@ -486,6 +498,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                         err = "native dense packed upload " + tensor.name + ": " + cudaGetErrorString(packed_status);
                         return false;
                     }
+                    if (crc_on) boot_crc_record(crc_dev, "dense", (tensor.name + "#pk").c_str(), packed.get(), bytes, host.data());
                 }
                 if (strata::core::manifest::enabled()) {   // STRATA_MANIFEST: the dense formats as held, and the packed copies
                     strata::core::manifest::instance().tensors("dense", strata::ggml_type_name((uint32_t) tensor.type), 1, bytes);
@@ -529,6 +542,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                                    cudaMemcpyHostToDevice) != cudaSuccess) {
                         err = "native dense (STRATA_HC_Q8) upload " + tensor.name; return false;
                     }
+                    if (crc_on) boot_crc_record(crc_dev, "dense", (tensor.name + "#hcq").c_str(), p, bytes, f32_inject ? (const void*) q8.data() : gguf.tensor_data(tensor));
                     ref.hc_q8 = p;
                     weights_.push_back(p);
                     hc_q8_bytes += bytes;
@@ -561,6 +575,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     if (cudaMemcpy(p, q8.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
                         err = "native dense (STRATA_HC_Q8) upload " + name; return false;
                     }
+                    if (crc_on) boot_crc_record(crc_dev, "dense", (name + "#hcq").c_str(), p, bytes, q8.data());
                 } else {
                     strata::kernels::fused_gr_quantize_q8_0((const uint16_t*) ref.data, (uint8_t*) p, (int64_t) nb, nullptr);
                 }

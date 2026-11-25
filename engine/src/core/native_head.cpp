@@ -1,4 +1,5 @@
 #include "strata/core/native_head.hpp"
+#include "strata/core/boot_weight_crc.hpp"
 #include "strata/core/spill_gate.hpp"
 #include "strata/core/run_manifest.hpp"
 #include "strata/artifact/gguf_reader.hpp"
@@ -20,6 +21,7 @@ NativeHead::~NativeHead() {
 }
 
 void NativeHead::unload() {
+    if (device_ >= 0 && boot_weight_crc_enabled()) boot_crc_clear_holder(device_, "head");
     free_native_head_fp8(fp8_);
     if (weights_) strata::kernels::native_q6_k_unpack(weights_);
     if (weights_) strata::kernels::native_q8_0_sm60_release(weights_);
@@ -107,8 +109,15 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         type_ = (int) tensor->type;
         if (type_ == 14 && strata::kernels::native_q6_k_packed_enabled())   // STRATA_Q6_PACKED=1
             strata::kernels::native_q6_k_pack(weights_, n_in_, n_out_, "output head");
+        bool packed_sm60 = false;
         if (type_ == 8)   // STRATA_Q8_SM60=1 (a no-op otherwise); the MTP draft head reads the same matrix
-            strata::kernels::native_q8_0_sm60_pack(weights_, n_in_, n_out_, "output head");
+            packed_sm60 = strata::kernels::native_q8_0_sm60_pack(weights_, n_in_, n_out_, "output head");
+        if (host_ == nullptr && boot_weight_crc_enabled()) {
+            const bool repacked_q6k = (type_ == 14 && strata::kernels::native_q6_k_packed_enabled());
+            if (!repacked_q6k && !packed_sm60) {
+                boot_crc_record(device_, "head", "output.weight", weights_, bytes_, gguf.tensor_data(*tensor));
+            }
+        }
         if (strata::core::manifest::enabled()) {   // STRATA_MANIFEST: what the head holds and where
             namespace mf = strata::core::manifest;
             mf::instance().tensors("head", strata::ggml_type_name((uint32_t) type_), 1, bytes);
@@ -151,6 +160,7 @@ bool NativeHead::to_host(std::string& err) {
         err = "native head: the head could not be moved to host memory";
         return false;
     }
+    if (device_ >= 0 && boot_weight_crc_enabled()) boot_crc_clear_holder(device_, "head");
     cudaFree(weights_);
     weights_ = dp;
     host_ = hp;
@@ -202,6 +212,12 @@ void set_native_embed(const NativeEmbed* e) { g_embed = e; }
 const NativeEmbed* native_embed() { return g_embed; }
 
 NativeEmbed::~NativeEmbed() {
+    if (host_ == nullptr && boot_weight_crc_enabled()) {
+        for (int d = 0; d < kMaxDevices; ++d) {
+            if (dev_weights_[d] != nullptr) boot_crc_clear_holder(d, "embed");
+        }
+        if (primary_dev_ >= 0) boot_crc_clear_holder(primary_dev_, "embed");
+    }
     free_native_embed_fp8(fp8_);
     if (host_) {
         cudaFreeHost(host_);
@@ -267,6 +283,7 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
                     cudaGetDevice(&cur_dev);
                     primary_dev_ = cur_dev;
                     if (cur_dev >= 0 && cur_dev < kMaxDevices) dev_weights_[cur_dev] = d;
+                    if (boot_weight_crc_enabled()) boot_crc_record(cur_dev, "embed", "token_embd", d, bytes_, gguf.tensor_data(*t));
                     dev_ = d;   // host_ stays null: the destructor frees dev_weights_
                     type_ = (int) t->type;
                     n_embd_ = n_embd;
@@ -302,6 +319,7 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
             cudaGetDevice(&cur_dev);
             primary_dev_ = cur_dev;
             if (cur_dev >= 0 && cur_dev < kMaxDevices) dev_weights_[cur_dev] = d;
+            if (boot_weight_crc_enabled()) boot_crc_record(cur_dev, "embed", "token_embd", d, bytes_, gguf.tensor_data(*t));
             dev_ = d;
         } else {
             std::memcpy(host_, gguf.tensor_data(*t), bytes_);
@@ -321,6 +339,9 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
                     err = "native embedding: no device alias for the mapped table, and no VRAM to copy it into";
                     return false;
                 }
+                int cur_dev = 0;
+                cudaGetDevice(&cur_dev);
+                if (boot_weight_crc_enabled()) boot_crc_record(cur_dev, "embed", "token_embd", d, bytes_, gguf.tensor_data(*t));
                 cudaFreeHost(host_);   // the destructor frees dev_ when host_ is null
                 host_ = nullptr;
                 std::fprintf(stderr, "strata: native embedding: no device alias for the mapped table, kept in VRAM\n");
@@ -402,6 +423,7 @@ bool NativeEmbed::ensure_device(int dev, std::string& err) const {
         err = "native embedding: H2D replication to CUDA" + std::to_string(dev) + " failed";
         return false;
     }
+    if (boot_weight_crc_enabled()) boot_crc_record(dev, "embed", "token_embd", d_new, bytes_, staging.data());
     dev_weights_[dev] = d_new;
     std::fprintf(stderr, "strata: native embedding: STRATA_EMBED_VRAM=1 replicated %llu MiB to CUDA%d (%llu MiB free)\n",
                  (unsigned long long) (bytes_ >> 20), dev, (unsigned long long) ((free_b - bytes_) >> 20));

@@ -1,5 +1,6 @@
 // src/core/weights.cpp - the dense-weight loader.  See the header for the engine-vs-pack distinction.
 #include "strata/core/weights.hpp"
+#include "strata/core/boot_weight_crc.hpp"
 #include <vector>
 #include <cmath>
 
@@ -252,6 +253,12 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
     // STAGE_OUT IS TWICE STAGE_IN because a conversion can now GROW: widening an fp16 scale plane to f32
     // doubles it.  Sized at CHUNK it would have written 8 MiB past the end of a pinned allocation for every
     // one of the 90 widened tensors - a heap corruption that would have been blamed on whatever ran next.
+    const bool crc_on = boot_weight_crc_enabled();
+    int crc_dev = 0;
+    if (crc_on) {
+        if (cudaGetDevice(&crc_dev) != cudaSuccess) { (void) cudaGetLastError(); crc_dev = 0; }
+        boot_crc_clear_holder(crc_dev, "wt");
+    }
     void* stage_in = nullptr;
     void* stage_out = nullptr;
     if (cudaHostAlloc(&stage_in, CHUNK, cudaHostAllocDefault) != cudaSuccess ||
@@ -466,6 +473,7 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
                     cudaFreeHost(stage_in); cudaFreeHost(stage_out);
                     return false;
                 }
+                if (crc_on) boot_crc_record(crc_dev, "wt", r.name.c_str(), dst_base + r.dst_off + out_at, out_bytes, host_src);
                 upload_ms += now_ms() - u0;
                 done += n;
             }
@@ -589,6 +597,15 @@ bool WeightTable::load_hc_q8(const std::string& pack_dir, uint64_t& bytes, std::
             cudaMemcpy(scales, sc.data(), sc.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
             err = "STRATA_HC_REQ8: upload failed";
             return false;
+        }
+        if (boot_weight_crc_enabled()) {
+            int crc_dev = 0;
+            if (cudaGetDevice(&crc_dev) != cudaSuccess) { (void) cudaGetLastError(); crc_dev = 0; }
+            char htag[32];
+            std::snprintf(htag, sizeof(htag), "hc_q8@%llu.q", (unsigned long long) at);
+            boot_crc_record(crc_dev, "wt", htag, codes, q.size(), q.data());
+            std::snprintf(htag, sizeof(htag), "hc_q8@%llu.s", (unsigned long long) at);
+            boot_crc_record(crc_dev, "wt", htag, scales, sc.size() * 4, sc.data());
         }
         w->data = codes;
         w->q8_scale = scales;

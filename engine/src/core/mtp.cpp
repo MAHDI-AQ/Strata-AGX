@@ -1,5 +1,6 @@
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
 #include "strata/core/mtp.hpp"
+#include "strata/core/boot_weight_crc.hpp"
 #include "strata/core/pin_budget.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/core/coupled_draft.hpp"
@@ -217,6 +218,10 @@ MtpDrafter::~MtpDrafter() {
     if (side_) cudaStreamDestroy(side_);
     if (sh_fork_) cudaEventDestroy(sh_fork_);
     if (sh_join_) cudaEventDestroy(sh_join_);
+    if (boot_weight_crc_enabled() && device_ >= 0) {
+        if (owns_weights_) boot_crc_clear_holder(device_, "mtp");
+        if (owns_draft_head_) boot_crc_clear_holder(device_, "mtp_dhead");
+    }
     if (owns_weights_ && dense_) {
         for (const auto& t : tensors_)   // the STRATA_MTP_Q8_SM60 registrations first (a no-op for the rest)
             if (t.kind == "q8_0") strata::kernels::native_q8_0_sm60_release(dense_ + t.off);
@@ -281,7 +286,8 @@ bool MtpDrafter::make_q4_dense(const std::vector<uint8_t>& blob, std::string& er
         q4_off_.push_back({t->name, off});
     }
     if (cudaMalloc((void**) &dense4_, (size_t) total) != cudaSuccess) { err = "mtp: the Q4_0 projections do not fit"; return false; }
-    cudaMemcpy(dense4_, host.data(), (size_t) total, cudaMemcpyHostToDevice);
+    if (cudaMemcpy(dense4_, host.data(), (size_t) total, cudaMemcpyHostToDevice) != cudaSuccess) { err = "mtp: writing the Q4_0 projections"; return false; }
+    if (boot_weight_crc_enabled()) boot_crc_record(device_, "mtp", "dense4", dense4_, total, host.data());
     vram_ += total;
     std::fprintf(stderr, "strata mtp: --mtp-q4: %zu projections as Q4_0 (%.1f MiB)\n", plan.size(), (double) total / 1048576.0);
     return true;
@@ -307,6 +313,7 @@ bool MtpDrafter::make_q4_head(std::string& err) {
     }
     // the Q4_0 rows replace the subset in place (they are smaller)
     if (cudaMemcpy(dhead_, dst.data(), dst.size(), cudaMemcpyHostToDevice) != cudaSuccess) { err = "mtp: writing the draft head"; return false; }
+    if (boot_weight_crc_enabled()) boot_crc_record(device_, "mtp_dhead", "dhead_q4", dhead_, dst.size(), dst.data());
     dhead_type_ = GGML_Q4_0;
     std::fprintf(stderr, "strata mtp: --mtp-q4: draft head over %lld tokens as Q4_0 (%.1f MiB read per step, was %.1f)\n",
                  (long long) n_dvocab_, (double) dst.size() / 1048576.0, (double) src.size() / 1048576.0);
@@ -379,7 +386,8 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
                   (info == cudaSuccess ? std::to_string(free_bytes >> 20) + " MiB" : "unknown");
             return false;
         }
-        cudaMemcpy(dense_, blob.data(), blob.size(), cudaMemcpyHostToDevice);
+        if (cudaMemcpy(dense_, blob.data(), blob.size(), cudaMemcpyHostToDevice) != cudaSuccess) { err = "mtp: writing dense.bin"; return false; }
+        if (boot_weight_crc_enabled()) boot_crc_record(device_, "mtp", "dense", dense_, blob.size(), blob.data());
         vram_ += blob.size();
         if (q4_ && !make_q4_dense(blob, err)) return false;
     }
@@ -402,7 +410,12 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         for (uint64_t off = 0; off < bytes;) {
             const uint64_t n = std::min<uint64_t>(chunk.size(), bytes - off);
             if (std::fread(chunk.data(), 1, (size_t) n, f) != (size_t) n) { err = "mtp: experts.bin is truncated"; return false; }
-            cudaMemcpy(experts_ + off, chunk.data(), n, cudaMemcpyHostToDevice);
+            if (cudaMemcpy(experts_ + off, chunk.data(), n, cudaMemcpyHostToDevice) != cudaSuccess) { err = "mtp: writing experts.bin"; return false; }
+            if (boot_weight_crc_enabled()) {
+                char tag[48];
+                std::snprintf(tag, sizeof(tag), "experts@%lluM", (unsigned long long) (off >> 20));
+                boot_crc_record(device_, "mtp", tag, experts_ + off, n, chunk.data());
+            }
             off += n;
         }
         vram_ += bytes;
@@ -530,7 +543,8 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         std::vector<int32_t> id((size_t) (T * (uint64_t) cap_));
         for (uint64_t t = 0; t < T; ++t)
             for (int64_t i = 0; i < cap_; ++i) id[(size_t) (t * (uint64_t) cap_ + (uint64_t) i)] = (int32_t) i;
-        cudaMemcpy(ident_, id.data(), id.size() * 4, cudaMemcpyHostToDevice);
+        if (cudaMemcpy(ident_, id.data(), id.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) { err = "mtp: writing ident"; return false; }
+        if (boot_weight_crc_enabled()) boot_crc_record(device_, "mtp", "ident", ident_, id.size() * 4, id.data());
     }
     // --pipeline-windows 2 (the forcing graphs): the chain shares its card with stage 1's windows and the next launch
     // on stage 0 waits for it, so its stream gets the highest priority there (STRATA_MTP_PRIORITY=0: the default)
@@ -748,7 +762,8 @@ bool MtpDrafter::setup_coupled(std::string& err) {
             err = "mtp: the coupled draft sampler's token map does not fit";
             return false;
         }
-        cudaMemcpy(dinv_, inv.data(), inv.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+        if (cudaMemcpy(dinv_, inv.data(), inv.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) { err = "mtp: writing dinv"; return false; }
+        if (boot_weight_crc_enabled()) boot_crc_record(device_, "mtp", "dinv", dinv_, inv.size() * sizeof(int32_t), inv.data());
         vram_ += inv.size() * sizeof(int32_t);
     }
     if (cudaDeviceSynchronize() != cudaSuccess) {
@@ -866,7 +881,8 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 draft_head_hint(n_dvocab_, row_bytes);
                 return false;
             }
-            cudaMemcpy(dvocab_, raw.data(), raw.size(), cudaMemcpyHostToDevice);
+            if (cudaMemcpy(dvocab_, raw.data(), raw.size(), cudaMemcpyHostToDevice) != cudaSuccess) { err = "mtp: writing dvocab"; return false; }
+            if (boot_weight_crc_enabled()) boot_crc_record(device_, "mtp", "dvocab", dvocab_, raw.size(), raw.data());
             dvocab_host_.resize((size_t) n_dvocab_);
             std::memcpy(dvocab_host_.data(), raw.data(), raw.size());
             const int head_dev = head->device();
@@ -906,6 +922,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             if (q4_head_ && !make_q4_head(err)) return false;
             if (dhead_type_ == 14 && strata::kernels::native_q6_k_packed_enabled()) {   // STRATA_Q6_PACKED=1
                 dhead_plain_ = false;
+                if (boot_weight_crc_enabled()) boot_crc_clear_holder(device_, "mtp_dhead");
                 strata::kernels::native_q6_k_pack(dhead_, (int) (row_bytes / 210) * 256, (int) n_dvocab_,
                                                   "MTP draft head");
             }
@@ -915,6 +932,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 strata::kernels::native_q8_0_sm60_pack_in_place(dhead_, (int) g_->n_embd, (int) n_dvocab_,
                                                                 "MTP draft head"))
 {
+                if (boot_weight_crc_enabled()) boot_crc_clear_holder(device_, "mtp_dhead");
                 dhead_plain_ = false;
                 std::fprintf(stderr, "strata mtp: the draft head on the Pascal Q8_0 GEMV (STRATA_MTP_Q8_SM60=1)\n");
             }
