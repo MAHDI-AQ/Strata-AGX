@@ -800,6 +800,237 @@ int main() {
         std::printf("K8-A ticket parity: %d/6 PASS\n", k8a_ok);
     }
 
+    // ---- Wave B1: STRATA_PF_W8_PER_ROW=1 accuracy & epilogue parity + comma-list W8_CACHE_MIB ----
+    int b1_per_row_ok = 0;
+    {
+        auto get_saved_var = [](const char* k) -> std::string {
+            const char* v = std::getenv(k);
+            return v ? std::string(v) : std::string("__UNSET__");
+        };
+        auto put_saved_var = [](const char* k, const std::string& v) {
+            if (v == "__UNSET__") unsetenv(k);
+            else setenv(k, v.c_str(), 1);
+        };
+        const std::string orig_w8 = get_saved_var("STRATA_PF_W8_CACHE");
+        const std::string orig_w8_mib = get_saved_var("STRATA_PF_W8_CACHE_MIB");
+        const std::string orig_per_row = get_saved_var("STRATA_PF_W8_PER_ROW");
+        const std::string orig_per_tok = get_saved_var("STRATA_PF_FP8_PER_TOKEN");
+        const std::string orig_w16 = get_saved_var("STRATA_PF_W16_CACHE_MIB");
+
+        // 1) Skewed-row Q8_0 end-to-end native() test: row 0 huge magnitude vs rows 1..N-1 tiny magnitude
+        {
+            const int64_t N = 512, K = 2560, T = 128;
+            const int64_t blocks_per_row = K / 32;
+            const size_t q8_bytes = (size_t) (N * blocks_per_row) * 34;
+            std::vector<uint8_t> hq8(q8_bytes, 0);
+            std::mt19937 rng_s(20261125u);
+            for (int64_t n = 0; n < N; ++n) {
+                const float d_val = (n == 0) ? (60000.0f / 127.0f) : (0.02f / 127.0f);
+                const uint16_t dh = __half_as_ushort(__float2half(d_val));
+                for (int64_t b = 0; b < blocks_per_row; ++b) {
+                    const size_t off = (size_t) (n * blocks_per_row + b) * 34;
+                    std::memcpy(&hq8[off], &dh, 2);
+                    for (int q = 0; q < 32; ++q) {
+                        int v = (int) (rng_s() % 241) - 120;
+                        if (v == 0) v = 17;
+                        hq8[off + 2 + q] = (uint8_t) (int8_t) v;
+                    }
+                }
+            }
+            void* dw = nullptr;
+            uint16_t* Xb = nullptr;
+            float* Yb = nullptr;
+            if (!ok(cudaMalloc(&dw, q8_bytes), "b1 w") ||
+                !ok(cudaMemcpy(dw, hq8.data(), q8_bytes, cudaMemcpyHostToDevice), "b1 w copy") ||
+                !ok(cudaMalloc((void**) &Xb, (size_t) T * K * 2), "b1 X") ||
+                !ok(cudaMalloc((void**) &Yb, (size_t) T * N * 4), "b1 Y")) {
+                return 1;
+            }
+            fill_f16<<<(unsigned) ((T * K + 255) / 256), 256, 0, st>>>((__half*) Xb, T * K, 31337u, 1.0f);
+            if (!ok(cudaStreamSynchronize(st), "b1 fill")) return 1;
+
+            auto run_native_mode = [&](const char* w8_on, const char* per_row_on, const char* w8_mib,
+                                       float beta, std::vector<float>& out_y) {
+                setenv("STRATA_PF_W8_CACHE", w8_on, 1);
+                if (w8_mib) setenv("STRATA_PF_W8_CACHE_MIB", w8_mib, 1);
+                else unsetenv("STRATA_PF_W8_CACHE_MIB");
+                setenv("STRATA_PF_W8_PER_ROW", per_row_on, 1);
+                setenv("STRATA_PF_FP8_PER_TOKEN", "1", 1);
+                setenv("STRATA_PF_W16_CACHE_MIB", "0", 1);
+
+                strata::prefill::Gemm g;
+                std::string err;
+                if (!g.init(st, scratch_elems, err)) return false;
+                if (beta != 0.0f) {
+                    std::vector<float> init_v((size_t) T * N, 0.02f);
+                    cudaMemcpyAsync(Yb, init_v.data(), init_v.size() * 4, cudaMemcpyHostToDevice, st);
+                    g.native(Xb, 8, dw, Yb, T, N, K, N, 0.0f);
+                    cudaMemcpyAsync(Yb, init_v.data(), init_v.size() * 4, cudaMemcpyHostToDevice, st);
+                    g.native(Xb, 8, dw, Yb, T, N, K, N, beta);
+                } else {
+                    cudaMemsetAsync(Yb, 0, (size_t) T * N * 4, st);
+                    g.native(Xb, 8, dw, Yb, T, N, K, N, 0.0f);
+                    g.native(Xb, 8, dw, Yb, T, N, K, N, 0.0f);
+                }
+                if (cudaStreamSynchronize(st) != cudaSuccess) return false;
+                out_y.resize((size_t) T * N);
+                return cudaMemcpy(out_y.data(), Yb, out_y.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
+            };
+
+            for (float beta : {0.0f, 1.0f}) {
+                std::vector<float> y_f16, y_pt, y_pr, y_zero_list;
+                if (!run_native_mode("0", "0", nullptr, beta, y_f16) ||
+                    !run_native_mode("1", "0", "768,768,768,768", beta, y_pt) ||
+                    !run_native_mode("1", "1", "768,768,768,768", beta, y_pr) ||
+                    !run_native_mode("1", "1", "0,0,0,0", beta, y_zero_list)) {
+                    std::printf("FAIL: B1 native_mode run beta=%.1f\n", beta);
+                    ++failed;
+                    continue;
+                }
+                // Check tiny rows [1..N-1]
+                double norm0 = 0.0, dsq_pt = 0.0, dsq_pr = 0.0, dot_pr = 0.0, norm_pr = 0.0;
+                bool bad = false;
+                for (int64_t t = 0; t < T; ++t) {
+                    for (int64_t n = 1; n < N; ++n) {
+                        const float r = y_f16[(size_t) t * N + n];
+                        const float a = y_pt[(size_t) t * N + n];
+                        const float b = y_pr[(size_t) t * N + n];
+                        if (std::isnan(b) || std::isinf(b)) { bad = true; break; }
+                        norm0 += (double) r * (double) r;
+                        norm_pr += (double) b * (double) b;
+                        dot_pr += (double) r * (double) b;
+                        dsq_pt += ((double) a - (double) r) * ((double) a - (double) r);
+                        dsq_pr += ((double) b - (double) r) * ((double) b - (double) r);
+                    }
+                    if (bad) break;
+                }
+                const double rel_pt = std::sqrt(dsq_pt) / std::sqrt(norm0);
+                const double rel_pr = std::sqrt(dsq_pr) / std::sqrt(norm0);
+                const double cos_pr = dot_pr / (std::sqrt(norm0) * std::sqrt(norm_pr));
+                const bool zero_list_exact = (y_zero_list == y_f16);
+                if (!bad && zero_list_exact && cos_pr > 0.998 && rel_pr < 0.05 && rel_pr < rel_pt * 0.15) {
+                    ++b1_per_row_ok;
+                    std::printf("PASS: B1 skewed-row beta=%.1f per-tensor rel_l2=%.4f -> per-row rel_l2=%.4f (cos=%.6f, zero-list exact=%d)\n",
+                                beta, rel_pt, rel_pr, cos_pr, zero_list_exact ? 1 : 0);
+                } else {
+                    ++failed;
+                    std::printf("FAIL: B1 skewed-row beta=%.1f bad=%d zero_list=%d rel_pt=%.4f rel_pr=%.4f cos_pr=%.6f\n",
+                                beta, bad ? 1 : 0, zero_list_exact ? 1 : 0, rel_pt, rel_pr, cos_pr);
+                }
+            }
+            cudaFree(dw); cudaFree(Xb); cudaFree(Yb);
+        }
+
+        // 2) Direct Gemm::fp8(..., per_row_w=true) testing both per_token={0,1}, beta={0,1}, T={64,128},
+        //    plus 16-byte aligned d_inv_w (vectorized float4 epilogue) and 4-byte offset d_inv_w+1 (scalar fallback)
+        {
+            const int64_t K = 2560, N = 2560;
+            for (int unaligned_w : {0, 1}) {
+                std::vector<uint8_t> hw((size_t) N * K);
+                std::vector<float> h_inv_w((size_t) N + 1, 0.0f);
+                std::mt19937 rng_d(5511u + (unsigned) unaligned_w);
+                for (auto& b : hw) b = (uint8_t) (rng_d() & 0x7eu);
+                for (int64_t n = 0; n < N; ++n) h_inv_w[(size_t) n + unaligned_w] = 0.005f + 0.0005f * (float) (n % 29);
+
+                uint8_t* Wd = nullptr;
+                float* d_inv_w_base = nullptr;
+                if (!ok(cudaMalloc((void**) &Wd, hw.size()), "b1d W") ||
+                    !ok(cudaMalloc((void**) &d_inv_w_base, h_inv_w.size() * 4), "b1d inv_w")) {
+                    return 1;
+                }
+                cudaMemcpy(Wd, hw.data(), hw.size(), cudaMemcpyHostToDevice);
+                cudaMemcpy(d_inv_w_base, h_inv_w.data(), h_inv_w.size() * 4, cudaMemcpyHostToDevice);
+                const float* d_inv_w = d_inv_w_base + unaligned_w;
+
+                for (int64_t T : {int64_t(64), int64_t(128)}) {
+                    std::vector<uint16_t> hx((size_t) T * K);
+                    std::mt19937 rng_x(991u + (unsigned) T + (unsigned) N);
+                    std::normal_distribution<float> nd(0.0f, 0.4f);
+                    for (size_t i = 0; i < hx.size(); ++i) {
+                        __half hv = __float2half(nd(rng_x));
+                        std::memcpy(&hx[i], &hv, 2);
+                    }
+                    uint16_t* Xd = nullptr;
+                    float* Yd = nullptr;
+                    cudaMalloc((void**) &Xd, hx.size() * 2);
+                    cudaMalloc((void**) &Yd, (size_t) T * N * 4);
+                    cudaMemcpy(Xd, hx.data(), hx.size() * 2, cudaMemcpyHostToDevice);
+
+                    // Compute exact FP32 reference for sampled rows [0..3]
+                    std::vector<float> ref_rows(4 * (size_t) N, 0.0f);
+                    for (int t = 0; t < 4; ++t) {
+                        for (int64_t n = 0; n < N; ++n) {
+                            double acc = 0.0;
+                            for (int64_t k = 0; k < K; ++k) {
+                                const uint16_t bits = hx[(size_t) t * K + k];
+                                const float xv = __half2float(*reinterpret_cast<const __half*>(&bits));
+                                const uint8_t c = hw[(size_t) n * K + k];
+                                const float s = (c & 0x80u) ? -1.0f : 1.0f;
+                                const int e = (c >> 3) & 0xf;
+                                const int m = c & 0x7;
+                                const float raw_w = (e == 0) ? s * std::ldexp((float) m / 8.0f, -6)
+                                                             : s * std::ldexp(1.0f + (float) m / 8.0f, e - 7);
+                                acc += (double) xv * (double) (raw_w * h_inv_w[(size_t) n + unaligned_w]);
+                            }
+                            ref_rows[(size_t) t * N + n] = (float) acc;
+                        }
+                    }
+
+                    strata::prefill::Gemm g;
+                    std::string err;
+                    if (!g.init(st, scratch_elems, err)) return 1;
+
+                    for (int pt : {0, 1}) {
+                        for (float beta : {0.0f, 1.0f}) {
+                            setenv("STRATA_PF_FP8_PER_TOKEN", pt ? "1" : "0", 1);
+                            std::vector<float> y_init((size_t) T * N, beta != 0.0f ? 0.5f : 0.0f);
+                            cudaMemcpy(Yd, y_init.data(), y_init.size() * 4, cudaMemcpyHostToDevice);
+                            if (!g.fp8(Xd, Wd, d_inv_w, Yd, T, N, K, N, beta, K, nullptr, false, nullptr, true)) {
+                                ++failed;
+                                std::printf("FAIL: B1 direct unalign=%d N=%lld T=%lld pt=%d beta=%.1f returned false\n",
+                                            unaligned_w, (long long) N, (long long) T, pt, beta);
+                                continue;
+                            }
+                            cudaStreamSynchronize(st);
+                            std::vector<float> got_rows(4 * (size_t) N);
+                            cudaMemcpy(got_rows.data(), Yd, got_rows.size() * 4, cudaMemcpyDeviceToHost);
+
+                            double dot = 0.0, n0 = 0.0, n1 = 0.0, dsq = 0.0;
+                            bool has_nan = false;
+                            for (size_t i = 0; i < got_rows.size(); ++i) {
+                                const float r = ref_rows[i] + (beta != 0.0f ? 0.5f : 0.0f);
+                                const float v = got_rows[i];
+                                if (std::isnan(v) || std::isinf(v)) { has_nan = true; break; }
+                                dot += (double) r * (double) v;
+                                n0 += (double) r * (double) r;
+                                n1 += (double) v * (double) v;
+                                dsq += ((double) r - (double) v) * ((double) r - (double) v);
+                            }
+                            const double cos_s = dot / (std::sqrt(n0) * std::sqrt(n1));
+                            const double rel_l2 = std::sqrt(dsq) / std::sqrt(n0);
+                            if (!has_nan && cos_s > 0.995 && rel_l2 < 0.05) {
+                                ++b1_per_row_ok;
+                            } else {
+                                ++failed;
+                                std::printf("FAIL: B1 direct unalign=%d N=%lld T=%lld pt=%d beta=%.1f cos=%.6f rel=%.4f\n",
+                                            unaligned_w, (long long) N, (long long) T, pt, beta, cos_s, rel_l2);
+                            }
+                        }
+                    }
+                    cudaFree(Xd); cudaFree(Yd);
+                }
+                cudaFree(Wd); cudaFree(d_inv_w_base);
+            }
+        }
+        std::printf("Wave B1 per-row W8 parity checks: %d/18 PASS\n", b1_per_row_ok);
+
+        put_saved_var("STRATA_PF_W8_CACHE", orig_w8);
+        put_saved_var("STRATA_PF_W8_CACHE_MIB", orig_w8_mib);
+        put_saved_var("STRATA_PF_W8_PER_ROW", orig_per_row);
+        put_saved_var("STRATA_PF_FP8_PER_TOKEN", orig_per_tok);
+        put_saved_var("STRATA_PF_W16_CACHE_MIB", orig_w16);
+    }
+
     printf("========================================================================\n");
     printf("gemm_fp8_parity SUMMARY: %d checked | Fallback(T<128): %d PASS | FP8(T>=128): %d PASS | PF-1a fused amax: %d PASS | A1 amax_fix: %d PASS | A1 quant: %d PASS | A1 outlier: %d PASS | %d FAIL\n",
            total_checked, fallback_ok, fp8_ok, pf1a_ok, a1_amax_ok, a1_quant_ok, a1_outlier_ok, failed);

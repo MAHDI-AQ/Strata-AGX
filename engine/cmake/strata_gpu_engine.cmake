@@ -454,7 +454,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # what composes them into a token.  No tokenizer - the prompt arrives as ids - because Gate C1 compares logits
   # against llama.cpp on the SAME ids and a tokenizer on one side of that comparison is a second variable.
   # plan v0.3 P5: batched prompt processing (tensor-core GEMMs through cuBLAS).
-  add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/handoff_fp8.cu src/prefill/prefill.cpp)
+  add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/handoff_bf16.cu src/prefill/handoff_fp8.cu src/prefill/prefill.cpp)
   if(STRATA_ENABLE_HIP)
     # #313: the RDNA3 WMMA GEMMs include hip_runtime.h: AMD builds only (a CUDA build never sees this file)
     target_sources(strata_prefill PRIVATE src/prefill/wmma_gemm.cu)
@@ -896,6 +896,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(handoff_fp8_parity tests/cuda/handoff_fp8_parity.cu)
     target_link_libraries(handoff_fp8_parity PRIVATE strata_prefill)
     add_test(NAME handoff_fp8_parity COMMAND handoff_fp8_parity)
+    add_executable(handoff_bf16_parity tests/cuda/handoff_bf16_parity.cu)
+    target_link_libraries(handoff_bf16_parity PRIVATE strata_prefill)
+    add_test(NAME handoff_bf16_parity COMMAND handoff_bf16_parity)
     # Pascal, opt-in STRATA_DENSE_F32=1: the dense projections' FP16 GEMMs as cublasSgemm on FP32 copies, bitwise vs
     # the cuBLAS FP16 call over a sweep of chunk sizes (GPU, synthetic, no model; --full sweeps every size, --bench
     # adds timings).  Not a ctest: whether the two agree is a property of the cuBLAS build, which this checks.

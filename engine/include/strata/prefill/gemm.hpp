@@ -83,7 +83,7 @@ public:
     bool fp8(const uint16_t* X, const uint8_t* W8, const float* d_inv_scale_w, float* Y,
              int64_t T, int64_t N, int64_t K, int64_t ldy = 0, float beta = 0.0f, int64_t ldx = 0,
              const float* act_amax = nullptr, bool reuse_x8 = false,
-             PrefillFp8Activation* act_ticket = nullptr);
+             PrefillFp8Activation* act_ticket = nullptr, bool per_row_w = false);
 
     /// W given as native GGUF blocks of `ggml_type`, dequantized to FP16 in the scratch, X in FP16.  `ldx` (> K) is
     /// X's padded row stride, taken only by STRATA_PF_PAD's path (0 = K).
@@ -158,15 +158,15 @@ private:
 
     // Dense FP8 Prefill Weight Cache (w8_):
     // Weights cached as CUDA_R_8F_E4M3 (N * K * 1 byte), saving 50% VRAM vs FP16 cache.
-    struct W8Entry { const void* p; int type; int64_t n, k; uint8_t* d; float* scale_w; };
+    struct W8Entry { const void* p; int type; int64_t n, k; uint8_t* d; float* scale_w; bool per_row = false; };
     std::vector<W8Entry> w8_;
     int64_t w8_budget_ = -1;
     int64_t w8_used_ = 0;
-    int64_t w8_reserve_ = 512ll << 20; // 512 MiB default (down from 2048 MiB)
+    int64_t w8_reserve_ = 1400ll << 20; // 1,400 MiB safety floor to prevent Xid 31 on tight stages
     bool w8_reserve_user_set_ = false;
     bool w8_logged_ = false;
-    static constexpr int64_t kW8AutoReserve = 512ll << 20; // 512 MiB cluster default
-    static constexpr int64_t kW8MinReserve  = 384ll << 20; // 384 MiB floor for tight stages (MTP drafter)
+    static constexpr int64_t kW8AutoReserve = 1400ll << 20; // Hard 1,400 MiB boot-free safety floor
+    static constexpr int64_t kW8MinReserve  = 1400ll << 20; // Never undercut 1,400 MiB free reserve for W8
 
     void* lt_handle_ = nullptr;
     void* lt_pref_ = nullptr;
@@ -193,13 +193,17 @@ private:
     struct AlgoCacheKey {
         int64_t n, k, ldy, t_bucket;
         bool per_token;
+        bool per_row_w;
         bool operator==(const AlgoCacheKey& o) const noexcept {
-            return n == o.n && k == o.k && ldy == o.ldy && t_bucket == o.t_bucket && per_token == o.per_token;
+            return n == o.n && k == o.k && ldy == o.ldy && t_bucket == o.t_bucket &&
+                   per_token == o.per_token && per_row_w == o.per_row_w;
         }
     };
     struct AlgoCacheKeyHash {
         size_t operator()(const AlgoCacheKey& x) const noexcept {
-            uint64_t h = (uint64_t) x.n ^ ((uint64_t) x.k << 16) ^ ((uint64_t) x.ldy << 32) ^ ((uint64_t) x.t_bucket << 48) ^ (x.per_token ? 0x9e3779b97f4a7c15ULL : 0ULL);
+            uint64_t h = (uint64_t) x.n ^ ((uint64_t) x.k << 16) ^ ((uint64_t) x.ldy << 32) ^
+                         ((uint64_t) x.t_bucket << 48) ^ (x.per_token ? 0x9e3779b97f4a7c15ULL : 0ULL) ^
+                         (x.per_row_w ? 0x517cc1b727220a95ULL : 0ULL);
             h ^= h >> 33;
             h *= 0xff51afd7ed558ccdULL;
             h ^= h >> 33;

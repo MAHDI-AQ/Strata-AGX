@@ -113,6 +113,7 @@ bool ple_batch_enabled() {
 }  // namespace
 #include "strata/core/defaults_026.hpp"
 #include "strata/prefill/kernels.hpp"
+#include "strata/kernels/cuda/handoff_bf16.cuh"
 #include "strata/kernels/cuda/handoff_fp8.cuh"
 #include "strata/prefill/kva.hpp"   // STRATA_KVA: the optional approximate-prefill plan (research, off by default)
 
@@ -728,6 +729,25 @@ inline bool j1_env_flag(const char* name) {
     const char* v = std::getenv(name);
     return v != nullptr && v[0] == '1';
 }
+inline bool env_exactly_1(const char* name) {
+    const char* v = std::getenv(name);
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+}
+inline bool handoff_bf16_enabled() {
+    return env_exactly_1("STRATA_HANDOFF_BF16");
+}
+inline bool handoff_fp8_enabled() {
+    const bool bf16 = handoff_bf16_enabled();
+    const bool fp8 = j1_env_flag("STRATA_HANDOFF_FP8");
+    if (bf16 && fp8) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            std::fprintf(stderr, "strata prefill: both STRATA_HANDOFF_BF16=1 and STRATA_HANDOFF_FP8=1 are set; preferring STRATA_HANDOFF_BF16\n");
+        }
+        return false;
+    }
+    return fp8;
+}
 // The streamed ring: 384 slots when (nearly) every streamed expert is DMA'd from pinned RAM - measured on Q2_0,
 // 8192-token chunks: 96 slots 1153 tok/s, 384 1294 (the next layer's experts arrive during its attention half) -
 // and 96 when a large share goes through host copies (IQ3_S on 64 GB, a third unpinned: 96 slots 1216, 256 1070 -
@@ -905,8 +925,9 @@ static void handoff_piece(int64_t T, int P, int i, int64_t& r0, int64_t& nr) {
 // (STRATA_HANDOFF_PIPE_WORKER=0: a thread per chunk again, for an A/B of the two halves.)
 static bool handoff_pipe_worker() {
     static const bool v = [] { const char* e = std::getenv("STRATA_HANDOFF_PIPE_WORKER"); return !e || std::atoi(e) != 0; }();
-    const bool fp8_async = Prefill::slim_workspace() && j1_env_flag("STRATA_HANDOFF_FP8");
-    return (handoff_pipe_pieces() > 0 || fp8_async) && v;
+    const bool bf16_async = handoff_bf16_enabled();
+    const bool fp8_async = Prefill::slim_workspace() && handoff_fp8_enabled();
+    return (handoff_pipe_pieces() > 0 || bf16_async || fp8_async) && v;
 }
 // STRATA_HANDOFF_FP8_ASYNC=1: the FP8 hand-off D2H runs on a side stream and the next stage waits on its
 // event. Any other value, including unset, keeps the producer's cudaStreamSynchronize.
@@ -1703,6 +1724,10 @@ struct Prefill::Impl {
     float* fp8_hand_scales_dev = nullptr;
     size_t fp8_hand_dev_payload_bytes = 0;
     size_t fp8_hand_dev_scale_bytes = 0;
+    // Path C: BF16 hand-off compression (STRATA_HANDOFF_BF16=1)
+    uint16_t* bf16_hand[2] = {};
+    uint16_t* bf16_hand_dev = nullptr;
+    size_t bf16_hand_dev_bytes = 0;
     // STRATA_HANDOFF_PIPE: per hand-off buffer, "the chunk's work is done" and one "landed" event per piece
     int hand_pieces = 0;
     cudaEvent_t hand_done[2] = {};
@@ -1897,6 +1922,7 @@ void Prefill::release() {
     }
     for (int b = 0; b < 2; ++b) {
         if (impl_->hand[b]) cudaFreeHost(impl_->hand[b]);
+        if (impl_->bf16_hand[b]) cudaFreeHost(impl_->bf16_hand[b]);
         if (impl_->fp8_hand[b].payload) cudaFreeHost(impl_->fp8_hand[b].payload);
         if (impl_->fp8_hand[b].scales) cudaFreeHost(impl_->fp8_hand[b].scales);
         impl_->fp8_hand[b] = {};
@@ -1921,6 +1947,7 @@ void Prefill::release() {
     if (impl_->ple_raw_free) (void) cudaEventDestroy(impl_->ple_raw_free);
     if (impl_->kv_released) cudaEventDestroy(impl_->kv_released);
     if (impl_->kv_ready) cudaEventDestroy(impl_->kv_ready);
+    if (impl_->bf16_hand_dev) { (void) cudaFree(impl_->bf16_hand_dev); impl_->bf16_hand_dev = nullptr; }
     if (impl_->fp8_hand_payload_dev) { (void) cudaFree(impl_->fp8_hand_payload_dev); impl_->fp8_hand_payload_dev = nullptr; }
     if (impl_->fp8_hand_scales_dev) { (void) cudaFree(impl_->fp8_hand_scales_dev); impl_->fp8_hand_scales_dev = nullptr; }
     if (impl_->grp_host) cudaFreeHost(impl_->grp_host);
@@ -2553,14 +2580,31 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     // the CPU share's staged-chunk limit, before the ring is sized below (a caller that sizes loans first armed it)
     arm_cpu_share(cpu_pool_ != nullptr && !Prefill::resident_experts_only());
-    const bool use_fp8_handoff_init = (std::getenv("STRATA_HANDOFF_FP8") != nullptr &&
-                                       std::getenv("STRATA_HANDOFF_FP8")[0] == '1');
-    const bool skip_fp32_hand = Prefill::slim_workspace() && use_fp8_handoff_init;
+    const bool use_bf16_handoff_init = handoff_bf16_enabled();
+    const bool use_fp8_handoff_init = handoff_fp8_enabled();
+    const bool skip_fp32_hand = Prefill::slim_workspace() && (use_bf16_handoff_init || use_fp8_handoff_init);
     for (int b = 0; !skip_fp32_hand && next_ != nullptr && b < 2; ++b)
         if (!m.hand[b] && cudaHostAlloc((void**) &m.hand[b], (size_t) chunk * D * 4, cudaHostAllocPortable) != cudaSuccess) {
             err = "prefill: the layer split's hand-off buffers";
             return false;
         }
+    if (use_bf16_handoff_init) {
+        const size_t bf16_bytes = (size_t) chunk * (size_t) D * sizeof(uint16_t);
+        for (int b = 0; next_ != nullptr && b < 2; ++b) {
+            if (!m.bf16_hand[b] &&
+                cudaHostAlloc((void**) &m.bf16_hand[b], bf16_bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+                err = "prefill: the layer split's BF16 hand-off host buffers";
+                return false;
+            }
+        }
+        if (next_ != nullptr || stage_lb_ > 0) {
+            if (!m.bf16_hand_dev && cudaMalloc((void**) &m.bf16_hand_dev, bf16_bytes) != cudaSuccess) {
+                err = "prefill: the layer split's BF16 hand-off device buffer";
+                return false;
+            }
+            m.bf16_hand_dev_bytes = bf16_bytes;
+        }
+    }
     if (use_fp8_handoff_init) {
         for (int b = 0; next_ != nullptr && b < 2; ++b) {
             size_t p_bytes = (size_t) chunk * strata::kernels::cuda::kHandoffFP8StrideBytes;
@@ -3717,7 +3761,7 @@ int Prefill::stage_count() const {
 int64_t Prefill::plan_chunk(int64_t n) const {
     const double pipe = pipe_value();
     const int stages = stage_count();
-    if (pipe <= 0.0 || hand_in_ != nullptr || stages < 2) return 0;
+    if (pipe <= 0.0 || has_hand_in() || stages < 2) return 0;
     return pipeline_chunk(n, impl_->T, stages, pipe > 1.0 ? pipe : 0.0);
 }
 void Prefill::force_chunk(int64_t chunk, bool single, bool planned) {
@@ -3819,7 +3863,9 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     f((size_t) strata::kernels::NG_HC_DIM);
     strata::kernels::KvHostPools stage;
     take_stage(o, ss, s, stage, ok);
-    if (owned_pages && Prefill::slim_workspace() && j1_env_flag("STRATA_HANDOFF_FP8")) {
+    if (owned_pages && handoff_bf16_enabled()) {
+        o.take<uint16_t>(T * (size_t) D, ok);
+    } else if (owned_pages && Prefill::slim_workspace() && handoff_fp8_enabled()) {
         o.take<uint8_t>(T * strata::kernels::cuda::kHandoffFP8StrideBytes, ok);
         o.take<float>(T * strata::kernels::cuda::kHandoffBlocksPerToken, ok);
     }
@@ -4211,9 +4257,9 @@ struct KvaTap {
 };
 }  // namespace
 
-// Side stream for STRATA_HANDOFF_FP8_ASYNC. False: the caller keeps today's synchronize. Events are
-// cudaEventDisableTiming; the next stage joins with cudaStreamWaitEvent, not a producer-side copy wait.
-bool Prefill::open_fp8_side(Prefill::Impl& m) {
+// Shared side stream for async compressed handoff D2H (STRATA_HANDOFF_BF16=1 or STRATA_HANDOFF_FP8_ASYNC=1).
+// Events are cudaEventDisableTiming; the next stage joins with cudaStreamWaitEvent without blocking the producer stream.
+bool Prefill::open_handoff_side(Prefill::Impl& m, const char* log_msg) {
     if (m.fp8_side != nullptr && m.fp8_pack_done != nullptr && m.fp8_ready[0] != nullptr && m.fp8_ready[1] != nullptr)
         return true;
     if (m.fp8_side == nullptr &&
@@ -4229,18 +4275,23 @@ bool Prefill::open_fp8_side(Prefill::Impl& m) {
         (void) cudaGetLastError();
         return false;
     }
-    static bool said = false;
-    if (!said) {
-        said = true;
-        std::fprintf(stderr, "strata prefill: FP8 hand-off D2H on a side stream (STRATA_HANDOFF_FP8_ASYNC=1); "
-                             "the next stage waits on the event\n");
+    static std::atomic<bool> said{false};
+    if (log_msg != nullptr && !said.exchange(true)) {
+        std::fprintf(stderr, "%s", log_msg);
     }
     return true;
 }
 
+bool Prefill::open_fp8_side(Prefill::Impl& m) {
+    return open_handoff_side(
+        m,
+        "strata prefill: FP8 hand-off D2H on a side stream (STRATA_HANDOFF_FP8_ASYNC=1); "
+        "the next stage waits on the event\n");
+}
+
 bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
     err.clear();
-    const bool is_first = (hand_in_ == nullptr && fp8_hand_in_ == nullptr);
+    const bool is_first = !has_hand_in();
     // force_chunk is for this run only: taken before any early return can leave it to the next one
     const int64_t forced = is_first ? std::exchange(force_chunk_, 0) : 0;
     const bool forced_single = force_single_, forced_planned = force_planned_;
@@ -4452,7 +4503,49 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         const auto tsetup = Clock::now();
         // ---- embeddings, broadcast to the four streams - or, in a later stage of a layer split, the rows the
         // previous stage handed on
-        if (fp8_hand_in_ != nullptr && m.fp8_hand_payload_dev != nullptr) {
+        if (bf16_hand_in_ != nullptr && m.bf16_hand_dev != nullptr) {
+            // If this intermediate stage still has an outgoing side-stream D2H reading m.bf16_hand_dev from chunk k-1,
+            // wait on its GPU event before incoming H2D overwrites m.bf16_hand_dev.
+            if (m.fp8_side_used && m.fp8_ready[hand_buf_ ^ 1] != nullptr &&
+                cudaStreamWaitEvent(m.cs, m.fp8_ready[hand_buf_ ^ 1], 0) != cudaSuccess) {
+                err = std::string("prefill: the layer split's BF16 hand-off stage-reuse wait: ") +
+                      cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            bool copy_ok = true;
+            if (hand_ev_ != nullptr && hand_pieces_ > 0) {
+                const auto* ev = static_cast<const cudaEvent_t*>(hand_ev_);
+                const bool whole = (c0 == 0 && T == n);
+                for (int i = 0; copy_ok && i < hand_pieces_; ++i) {
+                    int64_t r0 = 0, nr = 0;
+                    handoff_piece(n, hand_pieces_, i, r0, nr);
+                    copy_ok = cudaStreamWaitEvent(m.cs, ev[i], 0) == cudaSuccess;
+                    if (copy_ok && whole && nr > 0) {
+                        copy_ok = cudaMemcpyAsync(m.bf16_hand_dev + (size_t) r0 * D, bf16_hand_in_ + (size_t) r0 * D,
+                                                  (size_t) nr * D * sizeof(uint16_t), cudaMemcpyHostToDevice, m.cs) == cudaSuccess;
+                    }
+                }
+                if (copy_ok && !whole) {
+                    copy_ok = cudaMemcpyAsync(m.bf16_hand_dev, bf16_hand_in_ + (size_t) c0 * D,
+                                              (size_t) T * D * sizeof(uint16_t), cudaMemcpyHostToDevice, m.cs) == cudaSuccess;
+                }
+            } else {
+                if (bf16_hand_ev_ != nullptr &&
+                    cudaStreamWaitEvent(m.cs, reinterpret_cast<cudaEvent_t>(const_cast<void*>(bf16_hand_ev_)), 0) != cudaSuccess) {
+                    err = std::string("prefill: the layer split's BF16 hand-off wait: ") +
+                          cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+                copy_ok = cudaMemcpyAsync(m.bf16_hand_dev, bf16_hand_in_ + (size_t) c0 * D,
+                                          (size_t) T * D * sizeof(uint16_t), cudaMemcpyHostToDevice, m.cs) == cudaSuccess;
+            }
+            if (!copy_ok) {
+                err = std::string("prefill: the layer split's BF16 hand-off upload failed: ") +
+                      cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            strata::kernels::cuda::unpack_activations_bf16(m.bf16_hand_dev, m.R, (int64_t) T * D, m.cs);
+        } else if (fp8_hand_in_ != nullptr && m.fp8_hand_payload_dev != nullptr) {
             const size_t p_bytes = (size_t) T * strata::kernels::cuda::kHandoffFP8StrideBytes;
             const size_t total_blocks = (size_t) T * strata::kernels::cuda::kHandoffBlocksPerToken;
             const size_t s_bytes = total_blocks * sizeof(float);
@@ -7601,8 +7694,104 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
         pt.mark(kPfStart, cs);
         if (next_ != nullptr) {
-            const bool use_fp8_handoff = (std::getenv("STRATA_HANDOFF_FP8") != nullptr &&
-                                          std::getenv("STRATA_HANDOFF_FP8")[0] == '1');
+            const bool use_bf16_handoff = handoff_bf16_enabled();
+            if (use_bf16_handoff && m.bf16_hand[hand_buf_] != nullptr && m.bf16_hand_dev != nullptr) {
+                cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+                const bool capturing = m.cs != nullptr &&
+                    (cudaStreamIsCapturing(m.cs, &cap) != cudaSuccess || cap != cudaStreamCaptureStatusNone);
+                const bool async_hand = !capturing && open_handoff_side(
+                    m,
+                    "strata prefill: BF16 hand-off D2H on a side stream (STRATA_HANDOFF_BF16=1); "
+                    "the next stage overlaps on events\n");
+                if (m.fp8_side_used && !async_hand) {
+                    if (cudaStreamSynchronize(m.fp8_side) != cudaSuccess) {
+                        err = std::string("prefill: the layer split's BF16 hand-off: ") + cudaGetErrorString(cudaGetLastError());
+                        return false;
+                    }
+                    m.fp8_side_used = false;
+                }
+                if (async_hand && m.fp8_side_used &&
+                    cudaStreamWaitEvent(m.cs, m.fp8_ready[hand_buf_ ^ 1], 0) != cudaSuccess) {
+                    err = std::string("prefill: the layer split's BF16 hand-off: ") + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+                strata::kernels::cuda::pack_activations_bf16(m.R, m.bf16_hand_dev, (int64_t) T * D, m.cs);
+                uint16_t* const h16 = m.bf16_hand[hand_buf_];
+                const int hp = m.hand_pieces;
+                bool hand_ok = true;
+                if (async_hand) {
+                    hand_ok = cudaEventRecord(m.fp8_pack_done, m.cs) == cudaSuccess &&
+                              cudaStreamWaitEvent(m.fp8_side, m.fp8_pack_done, 0) == cudaSuccess;
+                    if (hand_ok && hp > 0) {
+                        for (int i = 0; hand_ok && i < hp; ++i) {
+                            int64_t r0 = 0, nr = 0;
+                            handoff_piece(T, hp, i, r0, nr);
+                            if (nr > 0) {
+                                hand_ok = cudaMemcpyAsync(h16 + (size_t) r0 * D, m.bf16_hand_dev + (size_t) r0 * D,
+                                                          (size_t) nr * D * sizeof(uint16_t), cudaMemcpyDeviceToHost, m.fp8_side) == cudaSuccess;
+                            }
+                            hand_ok = hand_ok && cudaEventRecord(m.hand_ev[hand_buf_][i], m.fp8_side) == cudaSuccess;
+                        }
+                    } else if (hand_ok) {
+                        hand_ok = cudaMemcpyAsync(h16, m.bf16_hand_dev, (size_t) T * D * sizeof(uint16_t),
+                                                  cudaMemcpyDeviceToHost, m.fp8_side) == cudaSuccess;
+                    }
+                    hand_ok = hand_ok && cudaEventRecord(m.fp8_ready[hand_buf_], m.fp8_side) == cudaSuccess;
+                    if (hand_ok) m.fp8_side_used = true;
+                } else if (hp > 0) {
+                    hand_ok = cudaEventRecord(m.hand_done[hand_buf_], m.cs) == cudaSuccess;
+                    for (int i = 0; hand_ok && i < hp; ++i) {
+                        int64_t r0 = 0, nr = 0;
+                        handoff_piece(T, hp, i, r0, nr);
+                        if (nr > 0) {
+                            hand_ok = cudaMemcpyAsync(h16 + (size_t) r0 * D, m.bf16_hand_dev + (size_t) r0 * D,
+                                                      (size_t) nr * D * sizeof(uint16_t), cudaMemcpyDeviceToHost, m.cs) == cudaSuccess;
+                        }
+                        hand_ok = hand_ok && cudaEventRecord(m.hand_ev[hand_buf_][i], m.cs) == cudaSuccess;
+                    }
+                    hand_ok = hand_ok && cudaEventSynchronize(m.hand_done[hand_buf_]) == cudaSuccess;
+                } else {
+                    hand_ok = cudaMemcpyAsync(h16, m.bf16_hand_dev, (size_t) T * D * sizeof(uint16_t),
+                                              cudaMemcpyDeviceToHost, m.cs) == cudaSuccess &&
+                              cudaStreamSynchronize(m.cs) == cudaSuccess;
+                }
+                if (!hand_ok) {
+                    err = std::string("prefill: the layer split's BF16 hand-off: ") + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+                if (async_hand && cudaEventSynchronize(m.fp8_pack_done) != cudaSuccess) {
+                    err = std::string("prefill: the layer split's BF16 hand-off: ") + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+                if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
+                if (next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
+                next_err_.clear();
+                next_->bf16_hand_in_ = h16;
+                next_->bf16_hand_ev_ = async_hand ? static_cast<const void*>(m.fp8_ready[hand_buf_]) : nullptr;
+                next_->hand_ev_ = hp > 0 ? static_cast<const void*>(m.hand_ev[hand_buf_]) : nullptr;
+                next_->hand_pieces_ = hp;
+                next_->hand_in_ = nullptr;
+                next_->fp8_hand_in_ = nullptr;
+                next_->fp8_hand_ev_ = nullptr;
+                next_->single_chunk_ = single_chunk;
+                next_->pipe_chunked_ = pipe_chunked;
+                if (handoff_pipe_worker()) {
+                    if (!m.hand_worker) m.hand_worker = std::make_unique<HandWorker>();
+                    next_run_ = m.hand_worker->submit(std::packaged_task<bool()>([this, tokens, c0, T, p0] {
+                        const bool r = next_->run_impl(tokens + c0, T, p0, next_err_);
+                        (void) cudaGetLastError();
+                        return r;
+                    }));
+                } else {
+                    next_run_ = std::async(std::launch::async, [this, tokens, c0, T, p0] {
+                        strata::aux_cpus::pin_current_thread();
+                        return next_->run_impl(tokens + c0, T, p0, next_err_);
+                    });
+                }
+                hand_buf_ ^= 1;
+                continue;
+            }
+            const bool use_fp8_handoff = handoff_fp8_enabled();
             if (use_fp8_handoff && m.fp8_hand[hand_buf_].payload != nullptr && m.fp8_hand_payload_dev != nullptr) {
                 // Prompt handoff is outside the decode graph. Inside a capture, keep the synchronizing copy.
                 // The capture query runs only when the flag is exactly 1, so the default path does not touch it.
@@ -7679,6 +7868,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 next_->fp8_in_tokens_ = T;
                 next_->fp8_hand_ev_ = async_hand ? static_cast<const void*>(m.fp8_ready[hand_buf_]) : nullptr;
                 next_->hand_in_ = nullptr;
+                next_->bf16_hand_in_ = nullptr;
+                next_->bf16_hand_ev_ = nullptr;
                 next_->hand_ev_ = nullptr;
                 next_->hand_pieces_ = 0;
                 next_->single_chunk_ = single_chunk;
@@ -7731,7 +7922,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             next_->hand_in_ = h;
             next_->hand_ev_ = hp > 0 ? static_cast<const void*>(m.hand_ev[hand_buf_]) : nullptr;
             next_->hand_pieces_ = hp;
+            next_->fp8_hand_in_ = nullptr;
             next_->fp8_hand_ev_ = nullptr;
+            next_->bf16_hand_in_ = nullptr;
+            next_->bf16_hand_ev_ = nullptr;
             next_->single_chunk_ = single_chunk;
             next_->pipe_chunked_ = pipe_chunked;
             if (handoff_pipe_worker()) {
@@ -8095,7 +8289,7 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
     // super-chunk's rows to the next one (lm_prepare_chain); the peer GPU's expert share and the stage helper have
     // no layer-major form
     const bool split = stage_lb_ != 0 || stage_le_ != g.n_layers || next_ != nullptr;
-    if (hand_in_ != nullptr) { why = "a layer split's chunk hand-off is in use"; return 0; }
+    if (has_hand_in()) { why = "a layer split's chunk hand-off is in use"; return 0; }
     if (m.pp || helper_ != nullptr || core::peer_portable()) { why = "a peer GPU"; return 0; }
     // the PLE block (layer 1) reads the token history: on a split it runs in a first stage that holds layers 0 and 1
     // (a later stage never reaches it)
@@ -8251,6 +8445,8 @@ int64_t Prefill::lm_prepare_chain(int64_t n, std::string& why) {
         p->hand_in_ = nullptr;
         p->fp8_hand_in_ = nullptr;
         p->fp8_hand_ev_ = nullptr;
+        p->bf16_hand_in_ = nullptr;
+        p->bf16_hand_ev_ = nullptr;
         p->hand_ev_ = nullptr;
         p->hand_pieces_ = 0;
     }
@@ -8319,7 +8515,7 @@ bool Prefill::run_multi(const std::vector<Seg>& segs, std::string& err) {
     int64_t total = 0;
     for (const Seg& sg : segs) total += sg.n;
     std::string why;
-    if (hand_in_ != nullptr || fp8_hand_in_ != nullptr || !impl_) { err = "prefill: multi-prompt read declined (chunk hand-off in use)"; return false; }
+    if (has_hand_in() || !impl_) { err = "prefill: multi-prompt read declined (chunk hand-off in use)"; return false; }
     if (!tap_layers_.empty()) { err = "prefill: multi-prompt read declined (the DFlash2 prompt taps are for one prompt)"; return false; }
     for (Prefill* q = this; q != nullptr; q = q->next_) q->lm_force_ = true;
     struct ForceOff { Prefill* h; ~ForceOff() { for (Prefill* q = h; q != nullptr; q = q->next_) q->lm_force_ = false; } } force_off{this};
@@ -8359,7 +8555,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
     // the next stage on that super-chunk on a thread while it reads its own next super-chunk (one hand-off buffer:
     // its final pass waits until the next stage has finished the previous one)
     const int64_t LB = stage_lb_, LE = stage_le_;
-    if (hand_in_ == nullptr) stopped_at_ = -1;   // (stop_at_chunk is declined: this run reads every token)
+    if (!has_hand_in()) stopped_at_ = -1;   // (stop_at_chunk is declined: this run reads every token)
     strata::kernels::QsaShapes s = core::qsa_shapes(g);   // as 0.2.2's run_impl
     const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
@@ -9511,7 +9707,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
 #endif
     // layer-major prefill: STRATA_PREFILL_LAYER_MAJOR=1 / 0 win; unset, it is off everywhere (sm120_series.hpp prefill_layer_major_default: a layer split
     // reads 32K prompts 37-55% sooner chunk-major, owner's yes 2026-11-02; the single-card small-cache rule sets the variable itself)
-    if (hand_in_ == nullptr && impl_ &&
+    if (!has_hand_in() && impl_ &&
         strata::prefill_layer_major_resolve(lm_env_text(), lm_hip, stage_count(), strata::qwen_defaults_026())) {
         const bool by_default = !lm_env_explicit();
         for (Prefill* p = this; p != nullptr; p = p->next_) p->lm_by_default_ = by_default;

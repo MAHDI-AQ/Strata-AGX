@@ -389,13 +389,19 @@ private:
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
     const strata::kernels::cuda::HandoffBufferFP8* fp8_hand_in_ = nullptr; ///< Path B: FP8 compressed handoff buffer
     int64_t fp8_in_tokens_ = 0;
+    const uint16_t* bf16_hand_in_ = nullptr; ///< Path C: BF16 handoff pinned host buffer
     /// STRATA_HANDOFF_FP8_ASYNC=1: cudaEvent_t recorded on the producer's side stream after the FP8 D2H.
     /// The next stage waits on it. Null (the default) means the producer already synchronized.
     const void* fp8_hand_ev_ = nullptr;
+    /// STRATA_HANDOFF_BF16=1: side-stream D2H completion event when whole-chunk copy is used (null on PIPE or sync).
+    const void* bf16_hand_ev_ = nullptr;
     /// STRATA_HANDOFF_PIPE: the previous stage's per-piece "landed in hand_in_" events (cudaEvent_t[hand_pieces_],
     /// on its device) when it copies the chunk in pieces without a host wait; null with the one-copy hand-off
     const void* hand_ev_ = nullptr;
     int hand_pieces_ = 0;
+    bool has_hand_in() const noexcept {
+        return hand_in_ != nullptr || fp8_hand_in_ != nullptr || bf16_hand_in_ != nullptr;
+    }
 
     std::string next_err_;
     std::future<bool> next_run_;
@@ -404,7 +410,8 @@ private:
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     void release();                          // the destructor's cleanup (also `reset`'s)
     struct Impl;
-    /// STRATA_HANDOFF_FP8_ASYNC=1 opens the side stream. Unset or not 1: the caller keeps the producer synchronize.
+    /// Opens the shared handoff side stream + events cleanly for FP8-async or BF16-async D2H.
+    static bool open_handoff_side(Impl& m, const char* log_msg);
     static bool open_fp8_side(Impl& m);
     std::unique_ptr<Impl> impl_;
     PrefillStats stats_;
