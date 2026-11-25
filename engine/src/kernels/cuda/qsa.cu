@@ -415,10 +415,20 @@ __global__ void kv_gather_kernel(const uint16_t* __restrict__ k_pool, const uint
     const long long id = i / (kv_heads * (long long) per);
     const int rem = (int) (i % (kv_heads * (long long) per));
     const int h = rem / per, q = rem - h * per;
-    const int cell = ids[id];
-    const long long page = (long long) table[cell / page_size];
-    const long long src = ((page * kv_heads + h) * page_size + (cell % page_size)) * (long long) per + q;
     const long long dst = (id * kv_heads + h) * (long long) per + q;
+    const int cell = ids[id];
+    if (cell < 0) {
+        reinterpret_cast<uint2*>(k_scratch)[dst] = make_uint2(0, 0);
+        reinterpret_cast<uint2*>(v_scratch)[dst] = make_uint2(0, 0);
+        return;
+    }
+    const long long page = (long long) table[cell / page_size];
+    if (page < 0) {
+        reinterpret_cast<uint2*>(k_scratch)[dst] = make_uint2(0, 0);
+        reinterpret_cast<uint2*>(v_scratch)[dst] = make_uint2(0, 0);
+        return;
+    }
+    const long long src = ((page * kv_heads + h) * page_size + (cell % page_size)) * (long long) per + q;
     reinterpret_cast<uint2*>(k_scratch)[dst] = reinterpret_cast<const uint2*>(k_pool)[src];
     reinterpret_cast<uint2*>(v_scratch)[dst] = reinterpret_cast<const uint2*>(v_pool)[src];
 }

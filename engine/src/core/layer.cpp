@@ -1458,7 +1458,7 @@ int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
     qsa_kv_resolve(st, g, b.ids, st.step, 1, cap, stream);
     static const bool env_fused_attn = [] {
         const char* e = std::getenv("STRATA_FUSED_ATTN");
-        return e == nullptr || (e[0] != '0' && e[0] != '\0');
+        return e != nullptr && e[0] != '0' && e[0] != '\0';
     }();
     const bool can_fuse_attn = env_fused_attn && g_fast_attn && !native_flash_attn_short && dump == nullptr &&
                                native_qsa_enabled() && (st.kv_rot || st.kv_hybrid);

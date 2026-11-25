@@ -276,8 +276,9 @@ __device__ __forceinline__ void gr_q8_tail(const GrMulti& m, int d0) {
     for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
-    const float d = q8_1_finite(q81_div(amax, 127.0f));   // #606: as native_quantize_q8_1_kernel - finite blocks bit for bit
-    const int8_t q = q8_1_quant(xi, d, amax);
+    const bool ieee = m.a[0].q8_ieee;
+    const float d = q8_1_finite(q81_div_sel(amax, 127.0f, ieee));   // #606: as native_quantize_q8_1_kernel (or quantize_q8_1_rows when ieee)
+    const int8_t q = q8_1_quant_sel(xi, d, amax, ieee);
     GrQ81* y = reinterpret_cast<GrQ81*>(m.a[warp].q8_mixed) + c0 / 32;
     y->qs[lane] = q;
     if (lane == 0) y->ds = q8_1_ds(d, sum);   // #606: clamped scale/sum - an unclamped pair NaN-poisons the dot path
@@ -717,8 +718,9 @@ __global__ void __launch_bounds__(Q32_THREADS) gr_up_q32_kernel(GrMulti m) {
         for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
-        const float d = q8_1_finite(q81_div(amax, 127.0f));
-        const int8_t q = q8_1_quant(xi, d, amax);
+        const bool ieee = m.a[0].q8_ieee;
+        const float d = q8_1_finite(q81_div_sel(amax, 127.0f, ieee));
+        const int8_t q = q8_1_quant_sel(xi, d, amax, ieee);
         GrQ81* y = reinterpret_cast<GrQ81*>(m.a[warp].q8_mixed) + d0 / 32;
         y->qs[lane] = q;
         if (lane == 0) y->ds = q8_1_ds(d, sum);
@@ -2333,8 +2335,9 @@ __global__ void __launch_bounds__(Q32_THREADS) gr_up_q8_q32_kernel(GrMulti m, co
         for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
-        const float d = q8_1_finite(q81_div(amax, 127.0f));
-        const int8_t q = q8_1_quant(xi, d, amax);
+        const bool ieee = m.a[0].q8_ieee;
+        const float d = q8_1_finite(q81_div_sel(amax, 127.0f, ieee));
+        const int8_t q = q8_1_quant_sel(xi, d, amax, ieee);
         GrQ81* y = reinterpret_cast<GrQ81*>(m.a[warp].q8_mixed) + d0 / 32;
         y->qs[lane] = q;
         if (lane == 0) y->ds = q8_1_ds(d, sum);

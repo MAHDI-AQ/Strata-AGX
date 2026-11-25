@@ -21,6 +21,7 @@
 //      Asserted as a property, not as a value, because that is what the source comment claims.
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/fused_gr.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
 #include <cuda_runtime.h>
@@ -722,6 +723,87 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
                     "group-relative and window-indexed, direct and graph: %s\n", runs, REPS, g2bad ? "FAIL" : "pass");
         bad += g2bad;
         cudaFree(d_qa); cudaFree(d_qb); cudaFree(d_qabs); cudaFree(d_ref2); cudaFree(d_cnt2);
+    }
+
+    // q8_ieee == true (half == 1 nat_xq_): bit-exact match to quantize_q8_1_rows (IEEE a/b) across T=1..8
+    // (direct and graph replay) + 100-seed sweep at T=8 (~2.05M elems to exercise ~2 rounding boundaries).
+    {
+        const size_t B = (size_t) (N / 32) * 36;
+        const size_t qbytes = (size_t) T * B;
+        uint8_t *d_qi = nullptr, *d_ri = nullptr;
+        unsigned* d_ci = nullptr;
+        check(cudaMalloc(&d_qi, qbytes), "q8_ieee q");
+        check(cudaMalloc(&d_ri, qbytes), "q8_ieee ref");
+        check(cudaMalloc(&d_ci, (N / 32) * sizeof(unsigned)), "q8_ieee cnt");
+        check(cudaMemset(d_ci, 0, (N / 32) * sizeof(unsigned)), "q8_ieee cnt zero");
+        std::vector<uint8_t> hqi(qbytes), hri(qbytes);
+        int ieee_bad = 0;
+        for (int tt = 1; tt <= T && !ieee_bad; ++tt) {
+            std::vector<FusedGrArgs> qa(args.begin(), args.begin() + tt);
+            for (int t = 0; t < tt; ++t) {
+                qa[t].q8_mixed = d_qi + (size_t) t * B;
+                qa[t].q8_cnt = d_ci;
+                qa[t].q8_ieee = true;
+            }
+            for (int rep = 0; rep < 3 && !ieee_bad; ++rep) {
+                check(cudaMemsetAsync(d_qi, 0x5a, qbytes, stream), "q8_ieee poison");
+                bool wrote = false;
+                cudaGraph_t qg = nullptr;
+                cudaGraphExec_t qx = nullptr;
+                if (rep == 0) {
+                    wrote = fused_gr_read_multi(qa.data(), tt, d_xn, stream);
+                } else {
+                    check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "q8_ieee begin");
+                    wrote = fused_gr_read_multi(qa.data(), tt, d_xn, stream);
+                    check(cudaStreamEndCapture(stream, &qg), "q8_ieee end");
+                    check(cudaGraphInstantiate(&qx, qg, nullptr, nullptr, 0), "q8_ieee inst");
+                    check(cudaGraphLaunch(qx, stream), "q8_ieee replay 1");
+                    check(cudaMemsetAsync(d_qi, 0x5a, qbytes, stream), "q8_ieee poison 2");
+                    check(cudaGraphLaunch(qx, stream), "q8_ieee replay 2");
+                }
+                if (!v3) strata::kernels::quantize_q8_1_rows(d_mixed, tt, N, d_ri, stream);
+                check(cudaStreamSynchronize(stream), "q8_ieee sync");
+                if (qx) { cudaGraphExecDestroy(qx); cudaGraphDestroy(qg); }
+                if (v3) { if (wrote) ++ieee_bad; break; }
+                check(cudaMemcpy(hqi.data(), d_qi, (size_t) tt * B, cudaMemcpyDeviceToHost), "q8_ieee read");
+                check(cudaMemcpy(hri.data(), d_ri, (size_t) tt * B, cudaMemcpyDeviceToHost), "q8_ieee ref");
+                if (!wrote || std::memcmp(hqi.data(), hri.data(), (size_t) tt * B) != 0) {
+                    std::printf("  Q8_IEEE: T=%d rep %d: %s\n", tt, rep, wrote ? "q8_1 bytes differ from quantize_q8_1_rows" : "not written");
+                    ++ieee_bad;
+                }
+            }
+        }
+        if (!v3) {
+            std::mt19937 ieeerng(0x71eeu);
+            std::normal_distribution<float> idist(0.0f, 0.3f);
+            std::vector<FusedGrArgs> qa(args.begin(), args.begin() + T);
+            for (int t = 0; t < T; ++t) {
+                qa[t].q8_mixed = d_qi + (size_t) t * B;
+                qa[t].q8_cnt = d_ci;
+                qa[t].q8_ieee = true;
+            }
+            for (int seed = 0; seed < 100 && !ieee_bad; ++seed) {
+                for (auto& x : r) x = idist(ieeerng);
+                for (auto& x : bo) x = idist(ieeerng);
+                for (auto& x : inj) x = idist(ieeerng);
+                check(cudaMemcpyAsync(d_r, r.data(), r.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "q8_ieee R");
+                check(cudaMemcpyAsync(d_bo, bo.data(), bo.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "q8_ieee bo");
+                check(cudaMemcpyAsync(d_inj, inj.data(), inj.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "q8_ieee inj");
+                check(cudaMemsetAsync(d_qi, 0x5a, qbytes, stream), "q8_ieee sweep poison");
+                const bool wrote = fused_gr_read_multi(qa.data(), T, d_xn, stream);
+                strata::kernels::quantize_q8_1_rows(d_mixed, T, N, d_ri, stream);
+                check(cudaStreamSynchronize(stream), "q8_ieee sweep sync");
+                check(cudaMemcpy(hqi.data(), d_qi, qbytes, cudaMemcpyDeviceToHost), "q8_ieee sweep read");
+                check(cudaMemcpy(hri.data(), d_ri, qbytes, cudaMemcpyDeviceToHost), "q8_ieee sweep ref");
+                if (!wrote || std::memcmp(hqi.data(), hri.data(), qbytes) != 0) {
+                    std::printf("  Q8_IEEE 100-seed sweep: seed %d failed\n", seed);
+                    ++ieee_bad;
+                }
+            }
+        }
+        std::printf("  fused GR read + q8_1 (q8_ieee=true vs quantize_q8_1_rows), T 1..8 + 100-seed T=8: %s\n", ieee_bad ? "FAIL" : "pass");
+        bad += ieee_bad;
+        cudaFree(d_qi); cudaFree(d_ri); cudaFree(d_ci);
     }
     std::printf("  fused GR multi max-T=8 LDS launch and changing graph replay %s\n",
                 bad == 0 ? "pass" : "FAIL");

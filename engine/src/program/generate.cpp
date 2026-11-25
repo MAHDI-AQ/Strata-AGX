@@ -21318,7 +21318,7 @@ int main(int argc, char** argv) {
                 }();
                 static const bool dynamic_prefill = [] {
                     const char* v = std::getenv("STRATA_DYNAMIC_PREFILL");
-                    return v == nullptr || (v[0] != '0' && v[0] != '\0');
+                    return v != nullptr && v[0] != '0' && v[0] != '\0';
                 }();
                 auto active_decode_count = [&]() -> int {
                     int c = 0;

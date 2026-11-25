@@ -88,8 +88,19 @@ __global__ void kv_gather_q8_kernel(const int8_t* __restrict__ k_q, const int8_t
     const long long id = i / (kv_heads * (long long) per);
     const int rem = (int) (i % (kv_heads * (long long) per));
     const int h = rem / per, q4 = rem - h * per;
+    const long long dst = (id * kv_heads + h) * (long long) per + q4;
     const int cell = ids[id];
+    if (cell < 0) {
+        reinterpret_cast<ushort4*>(k_scratch)[dst] = make_ushort4(0, 0, 0, 0);
+        reinterpret_cast<ushort4*>(v_scratch)[dst] = make_ushort4(0, 0, 0, 0);
+        return;
+    }
     const long long page = (long long) table[cell / page_size];
+    if (page < 0) {
+        reinterpret_cast<ushort4*>(k_scratch)[dst] = make_ushort4(0, 0, 0, 0);
+        reinterpret_cast<ushort4*>(v_scratch)[dst] = make_ushort4(0, 0, 0, 0);
+        return;
+    }
     const long long row = (page * kv_heads + h) * page_size + (cell % page_size);
     const int d = q4 * 4;
     const int groups = head_dim / KV_Q8_GROUP;
@@ -102,7 +113,6 @@ __global__ void kv_gather_q8_kernel(const int8_t* __restrict__ k_q, const int8_t
     ko.z = f16_from_f32((float) kc.z * ks); ko.w = f16_from_f32((float) kc.w * ks);
     vo.x = f16_from_f32((float) vc.x * vs); vo.y = f16_from_f32((float) vc.y * vs);
     vo.z = f16_from_f32((float) vc.z * vs); vo.w = f16_from_f32((float) vc.w * vs);
-    const long long dst = (id * kv_heads + h) * (long long) per + q4;
     reinterpret_cast<ushort4*>(k_scratch)[dst] = ko;
     reinterpret_cast<ushort4*>(v_scratch)[dst] = vo;
 }
@@ -131,8 +141,19 @@ __global__ void kv_gather_q8_wide_kernel(const int8_t* __restrict__ k_q, const i
     const long long id = i / (kv_heads * (long long) per);
     const int rem = (int) (i % (kv_heads * (long long) per));
     const int h = rem / per, q8 = rem - h * per;
+    const long long dst = (id * kv_heads + h) * (long long) per + q8;
     const int cell = ids[id];
+    if (cell < 0) {
+        reinterpret_cast<uint4*>(k_scratch)[dst] = make_uint4(0, 0, 0, 0);
+        reinterpret_cast<uint4*>(v_scratch)[dst] = make_uint4(0, 0, 0, 0);
+        return;
+    }
     const long long page = (long long) table[cell / page_size];
+    if (page < 0) {
+        reinterpret_cast<uint4*>(k_scratch)[dst] = make_uint4(0, 0, 0, 0);
+        reinterpret_cast<uint4*>(v_scratch)[dst] = make_uint4(0, 0, 0, 0);
+        return;
+    }
     const long long row = (page * kv_heads + h) * page_size + (cell % page_size);
     const int d = q8 * 8;                    // 8 divides KV_Q8_GROUP, so all 8 values share the group's scale
     const int groups = head_dim / KV_Q8_GROUP;
@@ -147,7 +168,6 @@ __global__ void kv_gather_q8_wide_kernel(const int8_t* __restrict__ k_q, const i
     ko.z = q8_pair_to_f16x2(kc + 4, ks); ko.w = q8_pair_to_f16x2(kc + 6, ks);
     vo.x = q8_pair_to_f16x2(vc + 0, vs); vo.y = q8_pair_to_f16x2(vc + 2, vs);
     vo.z = q8_pair_to_f16x2(vc + 4, vs); vo.w = q8_pair_to_f16x2(vc + 6, vs);
-    const long long dst = (id * kv_heads + h) * (long long) per + q8;
     reinterpret_cast<uint4*>(k_scratch)[dst] = ko;
     reinterpret_cast<uint4*>(v_scratch)[dst] = vo;
 }

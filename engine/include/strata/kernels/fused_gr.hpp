@@ -34,6 +34,7 @@ struct FusedGrArgs {
     const uint16_t* w_up = nullptr;    ///< bf16 [hc*n_embd][hc_lr]
     const uint16_t* w_inject = nullptr;///< bf16 [hc][hc*n_embd], or null (the final mixer)
     float eps = 1e-6f;
+    bool q8_ieee = false;              ///< match quantize_q8_1_rows (IEEE a/b) instead of native_quantize_q8_1
     float* lo = nullptr;               ///< workspace, hc_lr floats
     float* rs = nullptr;               ///< workspace, hc floats
     float* inject_out = nullptr;       ///< hc floats (when w_inject)

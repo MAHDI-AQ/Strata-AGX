@@ -1933,6 +1933,39 @@
       "retired_in": ""
     },
     {
+      "name": "STRATA_ATTN_SPLIT_HEAD",
+      "backends": [
+        "cuda-hip"
+      ],
+      "reads": [
+        {
+          "file": "engine/src/kernels/cuda/qsa_decode_attn.cu",
+          "line": 1666,
+          "backend": "cuda-hip",
+          "fn": "getenv"
+        }
+      ],
+      "parse": "int",
+      "default_state": null,
+      "code_default": "0",
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "first_commit": null,
+      "first_date": null,
+      "since": null,
+      "last_commit": null,
+      "last_date": null,
+      "status": "opt-in",
+      "owner": "",
+      "note": "Split-head SM saturation for decode attention (default off; enabled explicitly or via STRATA_ATTN_NOSPLIT_MIN_CHUNKS / STRATA_QSA_ATTN_FAST).",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
       "name": "STRATA_ATTN_V3",
       "backends": [
         "cuda-hip"
@@ -7202,13 +7235,13 @@
       "reads": [
         {
           "file": "engine/src/program/generate.cpp",
-          "line": 21218,
+          "line": 21320,
           "backend": "cuda-hip",
           "fn": "getenv"
         }
       ],
       "parse": "flag",
-      "default_state": "on",
+      "default_state": "off",
       "code_default": null,
       "engine_sets": [],
       "engine_defaults": [],
@@ -9091,7 +9124,7 @@
         }
       ],
       "parse": "flag",
-      "default_state": "on",
+      "default_state": "off",
       "code_default": null,
       "engine_sets": [],
       "engine_defaults": [],
@@ -18043,27 +18076,15 @@
         },
         {
           "file": "engine/src/core/verify.cpp",
-          "line": 2869,
+          "line": 317,
           "backend": "cuda-hip",
           "fn": "getenv"
         },
         {
           "file": "engine/src/core/verify.cpp",
-          "line": 2869,
+          "line": 322,
           "backend": "cuda-hip",
-          "fn": "getenv"
-        },
-        {
-          "file": "engine/src/core/verify.cpp",
-          "line": 2907,
-          "backend": "cuda-hip",
-          "fn": "getenv"
-        },
-        {
-          "file": "engine/src/core/verify.cpp",
-          "line": 2907,
-          "backend": "cuda-hip",
-          "fn": "getenv"
+          "fn": "env_on"
         },
         {
           "file": "engine/src/program/generate.cpp",
@@ -18073,7 +18094,7 @@
         }
       ],
       "parse": "flag",
-      "default_state": "on",
+      "default_state": "off",
       "code_default": null,
       "engine_sets": [],
       "engine_defaults": [],
@@ -37372,8 +37393,8 @@
         }
       ],
       "parse": "flag",
-      "default_state": null,
-      "code_default": null,
+      "default_state": "off",
+      "code_default": "0.0f",
       "engine_sets": [],
       "engine_defaults": [],
       "launch_files": [],

@@ -317,12 +317,19 @@ struct GdnQ81 { half2 ds; int8_t qs[32]; };
 __device__ __forceinline__ void gdn_q8_1_store(GdnQ81* __restrict__ xq, size_t idx, float xi) {
     // no contraction: xi is a product here, and fma(a, b, shfl) would round the first sum unlike the separate
     // quantizer, which reads xi from memory (S26 harness: ds.sum differed by 1 ulp without this)
+#if defined(__HIPCC__)
 #pragma clang fp contract(off)
+#endif
     float amax = fabsf(xi), sum = xi;
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    for (int o = 16; o > 0; o >>= 1)
+#if defined(__HIPCC__)
+        sum += __shfl_xor_sync(0xffffffffu, sum, o);
+#else
+        sum = __fadd_rn(sum, __shfl_xor_sync(0xffffffffu, sum, o));
+#endif
     const float d = q8_1_finite(q81_div(amax, 127.0f));   // #606: as native_quantize_q8_1_kernel - finite blocks bit for bit (#3948: and its division)
     const int8_t q = q8_1_quant(xi, d, amax);
     xq[idx / 32].qs[idx % 32] = q;
@@ -406,7 +413,7 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
         __syncthreads();
         float oc = 0.0f, sq_part = 0.0f;
         if (rg == 0) {
-            oc = red_o[0][col] + red_o[1][col] + red_o[2][col] + red_o[3][col];
+            oc = (red_o[0][col] + red_o[1][col] + red_o[2][col] + red_o[3][col]) * rsqrtf((float) S);
             sq_part = oc * oc;
         }
         // every thread takes the shuffles, as the single-token kernel does: inside the `rg == 0` branch hipcc on
@@ -416,9 +423,13 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
         __syncthreads();
         if (rg == 0) {
             const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
-            const float scale = rsqrtf(ss / (float) S + (float) S * eps);
+            const float scale = rsqrtf(ss / (float) S + eps);
             const float zz = z[(size_t) t * value_dim + head * S + col];
+#if defined(__HIPCC__)
             const float yv = oc * scale * gam * (1.0f / (1.0f + __expf(-zz)));
+#else
+            const float yv = __fmul_rn(oc * scale * gam, 1.0f / (1.0f + __expf(-zz)));
+#endif
             y[(size_t) t * value_dim + head * S + col] = yv;
             if constexpr (Q) gdn_q8_1_store(xq, (size_t) (f + t - t_out_begin) * value_dim + head * S + col, yv);
         }
@@ -489,7 +500,7 @@ __global__ void __launch_bounds__(GS_COLS * RG) gdn_step_split_kernel(float* __r
         __syncthreads();
         if (rg == 0 && t >= t_out_begin)
             y[(size_t) t * value_dim + head * S + col] =
-                (red[0][lc] + red[1][lc] + red[2][lc] + red[3][lc]);
+                (red[0][lc] + red[1][lc] + red[2][lc] + red[3][lc]) * rsqrtf((float) S);
     }
     if (n_keep != nullptr && n > 0) {
 #pragma unroll
@@ -584,10 +595,14 @@ __global__ void __launch_bounds__(S) gdn_out_norm_kernel(const float* __restrict
     if ((col & 31) == 0) wsum[col >> 5] = sq_part;
     __syncthreads();
     const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
-    const float scale = rsqrtf(ss / (float) S + (float) S * eps);
+    const float scale = rsqrtf(ss / (float) S + eps);
     const float zz = z[(size_t) t * value_dim + head * S + col];
     if constexpr (Q) {
+#if defined(__HIPCC__)
         const float yv = oc * scale * gamma[col] * (1.0f / (1.0f + __expf(-zz)));
+#else
+        const float yv = __fmul_rn(oc * scale * gamma[col], 1.0f / (1.0f + __expf(-zz)));
+#endif
         y[(size_t) t * value_dim + head * S + col] = yv;
         gdn_q8_1_store(xq, (size_t) (t - t_out_begin) * value_dim + head * S + col, yv);
     } else {

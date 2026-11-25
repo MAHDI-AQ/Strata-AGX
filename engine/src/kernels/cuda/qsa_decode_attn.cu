@@ -200,10 +200,11 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
         return;
     }
     static_assert(!QUERY_SWIZZLE || !LANE_CELL, "query swizzle is for warp scoring only");
+    static_assert(!LANE_CELL || !SPLIT_HEAD, "lane_cell scoring requires unsplit heads");
     const float* q_sub = q + ((size_t) (kvh * G + head_offset)) * HD;
     if constexpr (ROT) {
-        if (warp < G_ACT) {
-            const float* q_head = q_sub + (size_t) warp * HD;
+        for (int h_rot = warp; h_rot < G_ACT; h_rot += WARPS) {
+            const float* q_head = q_sub + (size_t) h_rot * HD;
             float reg[8];
 #pragma unroll
             for (int i = 0; i < 8; ++i) reg[i] = q_head[i * 32 + lane] * (1.0f / 16.0f);
@@ -234,7 +235,7 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
             for (int i = 0; i < 8; ++i) {
                 const int d = i * 32 + lane;
                 const int sd = QUERY_SWIZZLE ? (d ^ ((d >> 3) & 4)) : d;
-                sq[warp][sd] = reg[i];
+                sq[h_rot][sd] = reg[i];
             }
         }
     } else {
@@ -248,8 +249,10 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
         long long r = -1;
         if (t < n_here) {
             const int cell = ids[c0 + t];
-            const long long page = (long long) p.page_table[cell / page_size];
-            if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+            if (cell >= 0) {
+                const long long page = (long long) p.page_table[cell / page_size];
+                if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+            }
         }
         srow[t] = r;
     }
@@ -268,7 +271,8 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
             float tree[HPT][5];
             float res[HPT];
 #pragma unroll
-            for (int l = 0; l < 32; ++l) {
+            for (int idx = 0; idx < 32; ++idx) {
+                const int l = (int) (__brev((unsigned) idx) >> 27);
                 float k8[8];
                 load8<KV_MODE>(p, false, srow[c], l * 8, k8);
 #pragma unroll
@@ -277,7 +281,7 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
                     const float4 qb = *reinterpret_cast<const float4*>(&sq[h0 + j][l * 8 + 4]);
                     float cur = k8[0] * qa.x + k8[1] * qa.y + k8[2] * qa.z + k8[3] * qa.w +
                                 k8[4] * qb.x + k8[5] * qb.y + k8[6] * qb.z + k8[7] * qb.w;
-                    int m = l;
+                    int m = idx;
                     bool stored = false;
 #pragma unroll
                     for (int bit = 0; bit < 5; ++bit) {
@@ -291,7 +295,7 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
                             }
                         }
                     }
-                    if (l == 31) res[j] = cur;
+                    if (idx == 31) res[j] = cur;
                 }
             }
 #pragma unroll
@@ -472,8 +476,10 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_q8_v3_kernel(const float* 
         long long r = -1;
         if (t < n_here) {
             const int cell = ids[c0 + t];
-            const long long page = (long long) p.page_table[cell / page_size];
-            if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+            if (cell >= 0) {
+                const long long page = (long long) p.page_table[cell / page_size];
+                if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+            }
         }
         srow[t] = r;
     }
@@ -672,10 +678,12 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* 
         long long r = -1;
         if (t < n_here) {
             const int cell = ids[c0 + t];
-            const long long page = (long long) p.page_table[cell / page_size];
-            // a block the KV streaming could not make resident keeps page -1 (ctl[3]); its cells are masked
-            // (score -FLT_MAX, weight 0) instead of being read from before the pool.
-            if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+            if (cell >= 0) {
+                const long long page = (long long) p.page_table[cell / page_size];
+                // a block the KV streaming could not make resident keeps page -1 (ctl[3]); its cells are masked
+                // (score -FLT_MAX, weight 0) instead of being read from before the pool.
+                if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+            }
         }
         srow[t] = r;
     }
@@ -950,8 +958,8 @@ __device__ __forceinline__ void attn_chunk_q4_fast_body(
 
     const float* q_sub = q + ((size_t) (kvh * G + head_offset)) * HD;
     if constexpr (ROT) {
-        if (warp < G_ACT) {
-            const float* q_head = q_sub + (size_t) warp * HD;
+        for (int h_rot = warp; h_rot < G_ACT; h_rot += WARPS) {
+            const float* q_head = q_sub + (size_t) h_rot * HD;
             float reg[8];
 #pragma unroll
             for (int i = 0; i < 8; ++i) reg[i] = q_head[i * 32 + lane] * (1.0f / 16.0f);
@@ -982,7 +990,7 @@ __device__ __forceinline__ void attn_chunk_q4_fast_body(
             for (int i = 0; i < 8; ++i) {
                 const int d = i * 32 + lane;
                 const int sd = d ^ ((d >> 3) & 4);
-                sm.score.sq[warp][sd] = reg[i];
+                sm.score.sq[h_rot][sd] = reg[i];
             }
         }
     } else {
@@ -996,8 +1004,10 @@ __device__ __forceinline__ void attn_chunk_q4_fast_body(
         long long r = -1;
         if (t < n_here) {
             const int cell = __ldg(&ids[c0 + t]);
-            const long long page = (long long) __ldg(&p.page_table[cell / page_size]);
-            if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+            if (cell >= 0) {
+                const long long page = (long long) __ldg(&p.page_table[cell / page_size]);
+                if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+            }
         }
         srow[t] = r;
     }
@@ -1651,6 +1661,16 @@ int qsa_attn_fast_mode() {
     return mode;
 }
 
+bool attn_split_head_optin() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_ATTN_SPLIT_HEAD");
+        if (e != nullptr && *e != '\0') return std::atoi(e) != 0 ? 1 : 0;
+        return -1;
+    }();
+    if (v >= 0) return v != 0;
+    return attn_nosplit_min_chunks() > 0 || qsa_attn_fast_mode() > 0;
+}
+
 // the merge of `n_q` queries' partials: v2 = 0 attn_merge_kernel, 1 attn_merge_v2_kernel (bitwise the same output)
 void launch_merge(int v2, const float* part_acc, const float* part_m, const float* part_l, int n_chunks,
                   const int32_t* steps, float* attn, long long stride, unsigned n_head, unsigned n_q, cudaStream_t st,
@@ -1786,25 +1806,44 @@ void launch_chunks_batch(const float* q, const QsaAttnPools& pools, const int32_
                                                                           n_chunks, (int) cap, stride);
     } else {
         const int nosplit_min = attn_nosplit_min_chunks();
-        if (!rot_q && nosplit_min > 0 && n_chunks >= nosplit_min) {
-            if (kv_mode == 3)
-                attn_chunk_kernel<3, false, false, false, false, false><<<grid_orig, THREADS, 0, st>>>(
-                    q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l,
-                    n_chunks, (int) cap, stride);
-            else if (kv_mode == 2)
-                attn_chunk_kernel<2, false, false, false, false, false><<<grid_orig, THREADS, 0, st>>>(
-                    q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l,
-                    n_chunks, (int) cap, stride);
-            else if (kv_mode == 1)
-                attn_chunk_kernel<1, false, false, false, false, false><<<grid_orig, THREADS, 0, st>>>(
-                    q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l,
-                    n_chunks, (int) cap, stride);
-            else
-                attn_chunk_kernel<0, false, false, false, false, false><<<grid_orig, THREADS, 0, st>>>(
-                    q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l,
-                    n_chunks, (int) cap, stride);
+        const bool use_split_head = attn_split_head_optin() && (rot_q || nosplit_min <= 0 || n_chunks < nosplit_min);
+        if (!use_split_head) {
+            if (rot_q) {
+                if (kv_mode == 3)
+                    attn_chunk_kernel<3, false, false, false, false, true><<<grid_orig, THREADS, 0, st>>>(
+                        q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l,
+                        n_chunks, (int) cap, stride);
+                else if (kv_mode == 2)
+                    attn_chunk_kernel<2, false, false, false, false, true><<<grid_orig, THREADS, 0, st>>>(
+                        q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l,
+                        n_chunks, (int) cap, stride);
+                else if (kv_mode == 1)
+                    attn_chunk_kernel<1, false, false, false, false, true><<<grid_orig, THREADS, 0, st>>>(
+                        q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l,
+                        n_chunks, (int) cap, stride);
+                else
+                    attn_chunk_kernel<0, false, false, false, false, true><<<grid_orig, THREADS, 0, st>>>(
+                        q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l,
+                        n_chunks, (int) cap, stride);
+            } else {
+                if (kv_mode == 3)
+                    attn_chunk_kernel<3, false, false, false, false, false><<<grid_orig, THREADS, 0, st>>>(
+                        q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l,
+                        n_chunks, (int) cap, stride);
+                else if (kv_mode == 2)
+                    attn_chunk_kernel<2, false, false, false, false, false><<<grid_orig, THREADS, 0, st>>>(
+                        q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l,
+                        n_chunks, (int) cap, stride);
+                else if (kv_mode == 1)
+                    attn_chunk_kernel<1, false, false, false, false, false><<<grid_orig, THREADS, 0, st>>>(
+                        q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l,
+                        n_chunks, (int) cap, stride);
+                else
+                    attn_chunk_kernel<0, false, false, false, false, false><<<grid_orig, THREADS, 0, st>>>(
+                        q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l,
+                        n_chunks, (int) cap, stride);
+            }
         } else {
-        // Lever B1: Split-Head 128-SM Saturation (grid.y = n_head_kv * 2 = 4, 128 blocks)
         const dim3 grid_split((unsigned) n_chunks, (unsigned) (s.n_head_kv * 2), (unsigned) n_q);
         if (rot_q) {
             if (kv_mode == 3)
@@ -2076,26 +2115,45 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
         }
     } else if (!pre) {
         const int nosplit_min = attn_nosplit_min_chunks();
-        if (!rot_q && nosplit_min > 0 && n_chunks >= nosplit_min) {
+        const bool use_split_head = attn_split_head_optin() && (rot_q || nosplit_min <= 0 || n_chunks < nosplit_min);
+        if (!use_split_head) {
             const dim3 grid_ns((unsigned) n_chunks, (unsigned) s.n_head_kv);
-            if (kv_mode == 3)
-                attn_chunk_kernel<3, false, false, false, false, false><<<grid_ns, THREADS, 0, st>>>(
-                    q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l,
-                    n_chunks, 0, 0);
-            else if (kv_mode == 2)
-                attn_chunk_kernel<2, false, false, false, false, false><<<grid_ns, THREADS, 0, st>>>(
-                    q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l,
-                    n_chunks, 0, 0);
-            else if (kv_mode == 1)
-                attn_chunk_kernel<1, false, false, false, false, false><<<grid_ns, THREADS, 0, st>>>(
-                    q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l,
-                    n_chunks, 0, 0);
-            else
-                attn_chunk_kernel<0, false, false, false, false, false><<<grid_ns, THREADS, 0, st>>>(
-                    q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l,
-                    n_chunks, 0, 0);
+            if (rot_q) {
+                if (kv_mode == 3)
+                    attn_chunk_kernel<3, false, false, false, false, true><<<grid_ns, THREADS, 0, st>>>(
+                        q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l,
+                        n_chunks, 0, 0);
+                else if (kv_mode == 2)
+                    attn_chunk_kernel<2, false, false, false, false, true><<<grid_ns, THREADS, 0, st>>>(
+                        q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l,
+                        n_chunks, 0, 0);
+                else if (kv_mode == 1)
+                    attn_chunk_kernel<1, false, false, false, false, true><<<grid_ns, THREADS, 0, st>>>(
+                        q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l,
+                        n_chunks, 0, 0);
+                else
+                    attn_chunk_kernel<0, false, false, false, false, true><<<grid_ns, THREADS, 0, st>>>(
+                        q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l,
+                        n_chunks, 0, 0);
+            } else {
+                if (kv_mode == 3)
+                    attn_chunk_kernel<3, false, false, false, false, false><<<grid_ns, THREADS, 0, st>>>(
+                        q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l,
+                        n_chunks, 0, 0);
+                else if (kv_mode == 2)
+                    attn_chunk_kernel<2, false, false, false, false, false><<<grid_ns, THREADS, 0, st>>>(
+                        q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l,
+                        n_chunks, 0, 0);
+                else if (kv_mode == 1)
+                    attn_chunk_kernel<1, false, false, false, false, false><<<grid_ns, THREADS, 0, st>>>(
+                        q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l,
+                        n_chunks, 0, 0);
+                else
+                    attn_chunk_kernel<0, false, false, false, false, false><<<grid_ns, THREADS, 0, st>>>(
+                        q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l,
+                        n_chunks, 0, 0);
+            }
         } else {
-        // Lever B1: Split-Head 128-SM Saturation (grid.y = n_head_kv * 2 = 4, 128 blocks)
         const dim3 grid_split((unsigned) n_chunks, (unsigned) (s.n_head_kv * 2));
         if (rot_q) {
             if (kv_mode == 3)

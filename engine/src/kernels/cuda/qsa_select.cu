@@ -88,7 +88,7 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_kernel(const fl
 inline float qsa_tau_prune() {
     static const float val = [] {
         const char* v = std::getenv("STRATA_QSA_TAU_PRUNE");
-        if (v == nullptr || *v == '\0') return 0.05f;   // default enabled: 0.05
+        if (v == nullptr || *v == '\0') return 0.0f;   // opt-in: disabled by default
         if (std::strcmp(v, "0") == 0 || std::strcmp(v, "off") == 0 || std::strcmp(v, "false") == 0) return 0.0f;
         if (std::strcmp(v, "1") == 0 || std::strcmp(v, "on") == 0 || std::strcmp(v, "true") == 0) return 0.05f;
         return (float) std::atof(v);
@@ -99,7 +99,7 @@ inline float qsa_tau_prune() {
 __global__ void __launch_bounds__(TOPK_T) block_topk_kernel(const float* __restrict__ scores,
                                                             const int32_t* __restrict__ steps, int64_t max_blocks,
                                                             int64_t cap, int32_t* __restrict__ ids,
-                                                            float tau_prune = 0.05f) {
+                                                            float tau_prune = 0.0f) {
     __shared__ int hist[256];
     __shared__ int s_a[TOPK_T], s_b[TOPK_T];
     __shared__ int s_digit, s_above;
@@ -235,9 +235,8 @@ __global__ void __launch_bounds__(TOPK_T) block_topk_kernel(const float* __restr
     }
     __syncthreads();
     if (total_sel < width) {
-        const int32_t pad_val = (total_sel > 0) ? out[total_sel - 1] : 0;
         for (int64_t j = total_sel + t; j < width; j += TOPK_T) {
-            out[j] = pad_val;
+            out[j] = -1;
         }
     }
 }
@@ -826,7 +825,7 @@ template <int PER>
 __global__ void __launch_bounds__(TK_T) block_topk_reg_kernel(const float* __restrict__ scores,
                                                               const int32_t* __restrict__ steps, int64_t max_blocks,
                                                               int64_t cap, int32_t* __restrict__ ids,
-                                                              float tau_prune = 0.05f) {
+                                                              float tau_prune = 0.0f) {
     __shared__ int hist[TK_T / 32][256];
     __shared__ int s_warp[33];
     __shared__ int s_digit, s_above;
@@ -975,9 +974,8 @@ __global__ void __launch_bounds__(TK_T) block_topk_reg_kernel(const float* __res
     __syncthreads();
     const int actual_sel = tot;
     if (actual_sel < width) {
-        const int32_t pad_val = (actual_sel > 0) ? out[actual_sel - 1] : 0;
         for (int64_t j = actual_sel + t; j < width; j += TK_T) {
-            out[j] = pad_val;
+            out[j] = -1;
         }
     }
 }
@@ -996,7 +994,7 @@ template <bool ONLY_FAILED = false>
 __global__ void __launch_bounds__(TK_T) block_topk_wide_kernel(const float* __restrict__ scores,
                                                                const int32_t* __restrict__ steps, int64_t max_blocks,
                                                                int64_t cap, int32_t* __restrict__ ids,
-                                                               float tau_prune = 0.05f) {
+                                                               float tau_prune = 0.0f) {
     if (ONLY_FAILED && !g_tk_fail[blockIdx.x]) return;
     __shared__ int hist[TK_T / 32][256];
     __shared__ int s_gt[TK_T / 32], s_eq[TK_T / 32];
@@ -1149,9 +1147,8 @@ __global__ void __launch_bounds__(TK_T) block_topk_wide_kernel(const float* __re
     __syncthreads();
     const int actual_sel = s_total_sel;
     if (actual_sel < width) {
-        const int32_t pad_val = (actual_sel > 0) ? out[actual_sel - 1] : 0;
         for (int64_t j = actual_sel + t; j < width; j += TK_T) {
-            out[j] = pad_val;
+            out[j] = -1;
         }
     }
 }

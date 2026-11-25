@@ -111,8 +111,10 @@ __device__ void resolve_one(KvStreamMap m, const int32_t* __restrict__ ids,
         const int width = steps[q * kStepCount + kStepWidth];
         const int32_t* qi = ids + (long long) q * cap;
         for (int i = threadIdx.x; i < width; i += RT) {
-            const int b = qi[i] / page_size;
-            if (i > 0 && qi[i - 1] / page_size == b) continue;   // ids are ascending: one lookup per block
+            const int c = qi[i];
+            if (c < 0) continue;
+            const int b = c / page_size;
+            if (i > 0 && qi[i - 1] >= 0 && qi[i - 1] / page_size == b) continue;   // ids are ascending: one lookup per block
             ++lookups;
             const int sl = m.page_table[b];
             if (sl >= 0) {

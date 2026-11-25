@@ -2417,9 +2417,8 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
             w8_budget_ = 0;
             w8_reserve_ = kW8AutoReserve;
         } else {
-            // Default: on Ada Lovelace (cc >= 89) or when w8/w16 auto default is active
-            const int cc = current_cc();
-            const bool auto_on = (cc >= 89) || w8_auto_default_().load() || w16_auto_default_().load();
+            // Opt-in only: enabled only when explicitly requested or via w8_auto_default_()
+            const bool auto_on = w8_auto_default_().load();
             w8_budget_ = auto_on ? (16ll << 30) : 0;
             w8_reserve_ = kW8AutoReserve;
         }

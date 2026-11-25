@@ -43,6 +43,26 @@ __device__ __forceinline__ int8_t q8_1_quant(const float xi, const float d, cons
     return (int8_t) (q > 127.0f ? 127.0f : q < -127.0f ? -127.0f : q);
 }
 
+/// Grid-uniform runtime selector between fast-math div.full.f32 (native_quantize_q8_1) and IEEE a/b (quantize_q8_1_rows).
+__device__ __forceinline__ float q81_div_sel(const float a, const float b, const bool ieee) {
+#if defined(STRATA_Q81_FASTMATH_DIV) && defined(__CUDA_ARCH__) && !defined(__HIPCC__)
+    if (!ieee) {
+        float r;
+        asm("div.full.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+        return r;
+    }
+#else
+    (void) ieee;
+#endif
+    return a / b;
+}
+
+__device__ __forceinline__ int8_t q8_1_quant_sel(const float xi, const float d, const float amax, const bool ieee) {
+    if (amax == 0.0f) return 0;
+    const float q = roundf(q81_div_sel(xi, d, ieee));
+    return (int8_t) (q > 127.0f ? 127.0f : q < -127.0f ? -127.0f : q);
+}
+
 __device__ __forceinline__ half2 q8_1_ds(const float d, const float sum) {
     return make_half2(__float2half(q8_1_finite(d)), __float2half(q8_1_finite(sum)));
 }

@@ -313,6 +313,14 @@ bool env_on(const char* name) {
     const char* e = std::getenv(name);
     return e != nullptr && e[0] != 0 && e[0] != '0';
 }
+bool lm_head_fp8_off_override() {
+    const char* e = std::getenv("STRATA_LM_HEAD_FP8");
+    return e != nullptr && e[0] == '0';
+}
+bool fp8_head_wanted(const NativeHead* head) {
+    return head != nullptr && head->is_fp8() && !lm_head_fp8_off_override() &&
+           (native_head_fp8_enabled() || env_on("STRATA_LM_HEAD_FP8") || env_on("STRATA_NATIVE_HEAD_FP8"));
+}
 #if defined(STRATA_USE_HIP)
 const bool g_coherent = env_on("STRATA_VERIFY_COHERENT");
 const bool g_doorbell_store = env_on("STRATA_DOORBELL_STORE");
@@ -1732,7 +1740,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (qcnt_ != nullptr) {   // S26 STRATA_QFUSE: the consumer's q8_1 image written by the read itself
                     a.q8_cnt = qcnt_;
                     if (half == 0) a.q8_mixed = xq_ + (size_t) (t - tb) * (N / 32) * 36;
-                    else if (strata::kernels::cpu::expert_layout().native) a.q8_mixed = nat_xq_ + (size_t) t * (N / 32) * 36;
+                    else if (strata::kernels::cpu::expert_layout().native) {
+                        a.q8_mixed = nat_xq_ + (size_t) t * (N / 32) * 36;
+                        a.q8_ieee = true;
+                    }
                 }
             }
             if (strata::kernels::fused_gr_read_persist(fa, n, cs)) return false;   // STRATA_HC_PERSIST=1; q8_mixed is never set there
@@ -2785,7 +2796,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     // kFusedGrMaxT columns a launch: a longer window (--lookup-max-t) runs them in chunks of that many columns (one
     // chunk - the same launches as before - for every window up to kFusedGrMaxT tokens)
     stamp(g.n_layers, 0, 0);
-    if (head_sampling_ || batch_rec_ || !read_win_no_head_on()) {
+    if (!use_no_head_graph()) {
         const WeightRef *hn = wt.find("output_hc_norm.weight"), *hd = wt.find("output_hc_down.weight"),
                         *hu = wt.find("output_hc_up.weight");
         if (!hn || !hd || !hu) { err = "verify: an output_hc_* weight is missing"; return false; }
@@ -2865,8 +2876,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (head_ != nullptr && head_->loaded()) {
             try {
                 float* const hl = head_logits_ + (size_t) h0 * (size_t) n_vocab_;
-                const bool use_fp8 = head_->is_fp8() &&
-                    (std::getenv("STRATA_LM_HEAD_FP8") == nullptr || std::getenv("STRATA_LM_HEAD_FP8")[0] != '0');
+                const bool use_fp8 = fp8_head_wanted(head_);
                 if (use_fp8) {
                     std::string herr;
                     // Never bake target_logits=nullptr or zero_dram=true into captured CUDA graphs:
@@ -2903,8 +2913,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // Greedy, the default, is recorded here as before (no extra launch or sync per window). A request that
         // samples or penalizes is sampled again host-side after the replay (run()) with its own parameters and a
         // fresh draw counter: a captured sampler would bake them in and replay the same draws forever.
-        const bool fp8_active = head_ != nullptr && head_->is_fp8() &&
-            (std::getenv("STRATA_LM_HEAD_FP8") == nullptr || std::getenv("STRATA_LM_HEAD_FP8")[0] != '0');
+        const bool fp8_active = fp8_head_wanted(head_);
         if (fp8_active) {
             // argmax already populated directly in m_out_ by fused online softmax!
             // No argmax_rows launch, no logit writeback, zero VRAM logit traffic!
@@ -2917,7 +2926,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             sample_tokens(head_logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
         }
         // #879: whether each row's logits are all finite, beside the pick (read after the window's own sync)
-        if (!fp8_active && nan_guard_on()) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
+        if (head_logits_ != nullptr && nan_guard_on()) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
     }
     stamp(g.n_layers, 1, 0);
     if (tap_on_ && !batch_rec_ && tap_file_ != nullptr) copy_from_mapped(m_tap_, tap_dev_, (int64_t) T * (int64_t) tap_layers_.size() * N, cs);
