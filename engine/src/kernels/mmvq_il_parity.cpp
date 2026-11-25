@@ -459,7 +459,10 @@ int check_tables() {
             std::printf("FAIL table: the sm_80 table is not the CMP 170HX's\n");
         }
     }
-    if (native_mmvq_il_rows_for(89, 99, 2, 2560) != 0 || native_mmvq_il_rows_for(89, 12, 5, 2560) != 0 ||
+    const char* w89 = std::getenv("STRATA_MMVQ_IL_89_WIDE");
+    const bool wide89_on = w89 != nullptr && w89[0] == '1' && w89[1] == '\0';
+    if (native_mmvq_il_rows_for(89, 99, 2, 2560) != 0 ||
+        native_mmvq_il_rows_for(89, 12, 5, 2560) != (wide89_on ? 1 : 0) ||
         native_mmvq_il_rows_for(86, 12, 5, 2560) != 0 || native_mmvq_il_rows_for(120, 12, 9, 2560) != 0) {
         ++bad;
         std::printf("FAIL table: an unknown type or ncols must be 0\n");

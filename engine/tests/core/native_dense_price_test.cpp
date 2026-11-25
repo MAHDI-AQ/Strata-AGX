@@ -158,6 +158,35 @@ int main() {
     check(s01.priced == s01.loaded, "layers [0, 2): priced == allocated by load (" + std::to_string(s01.priced) + " / " + std::to_string(s01.loaded) + ")");
     check(s0.weights == s0.loaded && s1.weights == s1.loaded, "weight_bytes() counts the hc rows too");
 
+    std::printf("2. STRATA_HC_Q8=1 with add_hc_skip (multi-GPU layer split skipping BF16 HC rows)\n");
+    for (auto [lb, le] : std::vector<std::pair<int64_t, int64_t>>{{0, 1}, {1, 2}, {0, 2}}) {
+        const std::vector<std::string> shards{shard};
+        std::set<std::string> sk;
+        std::string err;
+        bool ok = NativeDense::served_names(shards, true, sk, err);
+        if (ok) NativeDense::add_hc_skip(pack.string(), sk);
+        uint64_t pool = 0;
+        ok = ok && WeightTable::pool_bytes(pack.string(), pool, err, &sk);
+        void* arena = nullptr;
+        if (ok && cudaMalloc(&arena, pool ? pool : 256) != cudaSuccess) { err = "cudaMalloc"; ok = false; }
+        WeightTable wt;
+        NativeDense dense;
+        uint64_t priced = 0;
+        ok = ok && wt.load(pack.string(), arena, pool ? pool : 256, err, &sk) &&
+             NativeDense::weight_bytes_for(shards, wt, true, lb, le, priced, err);
+        if (ok) {
+            NativeDense::set_layer_range((int) lb, (int) le);
+            ok = dense.load(shards, wt, err, true);
+        }
+        const uint64_t loaded = dense.allocated_bytes();
+        dense.release();
+        NativeDense::set_layer_range(-1, -1);
+        if (arena) cudaFree(arena);
+        check(ok && pool == HC_ROW_BYTES && priced == loaded,
+              "add_hc_skip [" + std::to_string(lb) + "," + std::to_string(le) + "): pool==HC_ROW_BYTES, priced==loaded (" +
+                  std::to_string(priced) + ")");
+    }
+
     std::printf(g_fail ? "native_dense_price_test: %d FAILED\n" : "native_dense_price_test: all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

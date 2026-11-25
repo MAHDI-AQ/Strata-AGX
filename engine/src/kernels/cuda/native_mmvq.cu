@@ -3602,7 +3602,7 @@ std::size_t native_q8_1_il_bytes(int n_in, int ncols) {
 
 void native_quantize_q8_1_il(const float* x, void* x_q8_1, void* x_il, int n_in, int ncols, void* stream) {
     validate_shape(n_in, ncols);
-    if (ncols < 2 || ncols > 4) throw std::invalid_argument("native_quantize_q8_1_il requires 2 <= ncols <= 4");
+    if (ncols < 2 || ncols > 8) throw std::invalid_argument("native_quantize_q8_1_il requires 2 <= ncols <= 8");
     validate_pointer(x);
     validate_pointer(x_q8_1);
     validate_pointer(x_il);
@@ -3766,6 +3766,37 @@ constexpr IlRows58 kIlRows58_80[] = {   // CMP 170HX, as kIlRows_80
     {14, {{0, 0, 4, 2, 4}, {0, 0, 2, 2, 2}, {0, 2, 2, 2, 2}, {0, 0, 4, 2, 4}}},   // Q6_K
     {11, {{0, 0, 4, 2, 4}, {0, 0, 4, 1, 4}, {0, 0, 1, 1, 1}, {1, 1, 1, 1, 1}}},   // Q3_K
 };
+// Ada (sm_89, RTX 4090) 5-8 column table measured by mmvq_il_parity --bench --emit-table --pf 0,3,4.
+// Opt-in via STRATA_MMVQ_IL_89_WIDE=1 (default off so mmvq_il_parity's default table check stays untouched).
+constexpr IlRows58 kIlRows58_89[] = {
+    {23, {{0, 4, 2, 1, 4}, {0, 2, 4, 1, 4}, {0, 1, 4, 1, 4}, {0, 2, 1, 1, 1}}},   // IQ4_XS
+    {12, {{0, 1, 1, 1, 1}, {0, 2, 4, 4, 4}, {0, 4, 4, 4, 4}, {0, 4, 4, 4, 4}}},   // Q4_K
+    {13, {{0, 1, 1, 1, 4}, {0, 4, 4, 4, 4}, {0, 4, 4, 4, 4}, {0, 4, 4, 1, 4}}},   // Q5_K
+    {14, {{0, 0, 0, 1, 1}, {0, 1, 1, 4, 2}, {0, 0, 1, 2, 1}, {0, 1, 2, 1, 1}}},   // Q6_K
+    {11, {{0, 2, 2, 4, 2}, {0, 0, 4, 1, 4}, {0, 1, 4, 4, 4}, {0, 1, 4, 4, 4}}},   // Q3_K
+};
+// Ada (sm_89, RTX 4090) joint (pf, rows) tables for STRATA_MMVQ_IL_PF=1 (opt-in, default 0):
+constexpr IlPf kIlPf_89[] = {
+    {23, {{0x00, 0x00, 0x00, 0x00, 0x00}, {0x00, 0x01, 0x01, 0x01, 0x01}, {0x00, 0x01, 0x01, 0x01, 0x01}}},   // IQ4_XS
+    {12, {{0x00, 0x01, 0x00, 0x02, 0x02}, {0x00, 0x01, 0x01, 0x01, 0x01}, {0x00, 0x01, 0x01, 0x01, 0x01}}},   // Q4_K
+    {13, {{0x00, 0x00, 0x01, 0x01, 0x00}, {0x00, 0x01, 0x01, 0x01, 0x00}, {0x00, 0x01, 0x01, 0x01, 0x02}}},   // Q5_K
+    {14, {{0x41, 0x31, 0x00, 0x00, 0x41}, {0x00, 0x41, 0x31, 0x31, 0x41}, {0x00, 0x41, 0x31, 0x31, 0x31}}},   // Q6_K
+    {11, {{0x00, 0x01, 0x01, 0x01, 0x01}, {0x00, 0x31, 0x32, 0x01, 0x01}, {0x00, 0x01, 0x42, 0x31, 0x01}}},   // Q3_K
+};
+constexpr IlPf58 kIlPf58_89[] = {
+    {23, {{0x00, 0x02, 0x02, 0x01, 0x32}, {0x00, 0x02, 0x02, 0x01, 0x02}, {0x00, 0x01, 0x02, 0x01, 0x02}, {0x00, 0x41, 0x01, 0x01, 0x01}}},   // IQ4_XS
+    {12, {{0x00, 0x41, 0x01, 0x01, 0x01}, {0x00, 0x41, 0x02, 0x02, 0x02}, {0x00, 0x02, 0x02, 0x02, 0x02}, {0x00, 0x41, 0x02, 0x02, 0x02}}},   // Q4_K
+    {13, {{0x00, 0x01, 0x01, 0x01, 0x02}, {0x00, 0x02, 0x02, 0x02, 0x02}, {0x00, 0x02, 0x02, 0x02, 0x02}, {0x00, 0x02, 0x02, 0x01, 0x02}}},   // Q5_K
+    {14, {{0x00, 0x00, 0x41, 0x31, 0x42}, {0x00, 0x01, 0x41, 0x42, 0x32}, {0x00, 0x00, 0x31, 0x42, 0x01}, {0x00, 0x41, 0x02, 0x01, 0x31}}},   // Q6_K
+    {11, {{0x00, 0x02, 0x02, 0x32, 0x02}, {0x00, 0x00, 0x02, 0x31, 0x32}, {0x00, 0x01, 0x32, 0x02, 0x42}, {0x00, 0x31, 0x32, 0x02, 0x02}}},   // Q3_K
+};
+bool il_89_wide_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_MMVQ_IL_89_WIDE");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
 struct Il58Arch { int cc; const IlRows58* t; size_t n; };
 constexpr Il58Arch kIl58Arch[] = {
     {80, kIlRows58_80, sizeof(kIlRows58_80) / sizeof(IlRows58)},
@@ -3868,6 +3899,12 @@ int native_mmvq_il_rows_for(int cc, int type, int ncols, int n_out) {
         static const bool wide = il_env_on("STRATA_MMVQ_IL_WIDE");
         if (!wide) return 0;
         if (type == 11 && !il_q3k_on()) return 0;
+        if (cc == 89) {
+            if (!il_89_wide_on()) return 0;
+            for (size_t i = 0; i < sizeof(kIlRows58_89) / sizeof(IlRows58); ++i)
+                if (kIlRows58_89[i].type == type) return kIlRows58_89[i].r[ncols - 5][cls];
+            return 0;
+        }
         for (const Il58Arch& a : kIl58Arch)
             if (a.cc == cc)
                 for (size_t i = 0; i < a.n; ++i)
@@ -3917,8 +3954,19 @@ int il_cc() {
 }
 int il_rows(int type, int ncols, int n_out) { return native_mmvq_il_rows_for(il_cc(), type, ncols, n_out); }
 int il_pf_table(int type, int ncols, int n_out) {
-    if (il_cc() != 80 || ncols < 2 || ncols > 8) return 0;   // only the CMP 170HX measured one
+    const int cc = il_cc();
+    if ((cc != 80 && cc != 89) || ncols < 2 || ncols > 8) return 0;
     const int cls = n_out < 2048 ? 0 : n_out < 4096 ? 1 : n_out < 8192 ? 2 : n_out < 12288 ? 3 : 4;
+    if (cc == 89) {
+        if (ncols <= 4) {
+            for (const IlPf& t : kIlPf_89)
+                if (t.type == type) return t.v[ncols - 2][cls];
+        } else if (il_89_wide_on()) {
+            for (const IlPf58& t : kIlPf58_89)
+                if (t.type == type) return t.v[ncols - 5][cls];
+        }
+        return 0;
+    }
     if (ncols <= 4) {
         for (const IlPf& t : kIlPf_80)
             if (t.type == type) return t.v[ncols - 2][cls];

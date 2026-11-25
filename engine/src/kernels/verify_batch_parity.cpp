@@ -18,6 +18,7 @@
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/ple.hpp"
 #include "strata/kernels/qsa.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 #include "strata/core/sm120_series.hpp"
 
 #include <cuda_runtime.h>
@@ -159,6 +160,61 @@ void ple(cudaStream_t s) {
     }
 }
 
+void handoff_u64_pingpong(cudaStream_t s) {
+    constexpr int na = 64, nb = 16, nc = 4, N = na + nb + nc;
+    float *h0 = nullptr, *d0 = nullptr, *h1 = nullptr, *d1 = nullptr;
+    uint64_t *hflag = nullptr, *dflag = nullptr, *hpseq = nullptr, *dpseq = nullptr, *hwseq = nullptr, *dwseq = nullptr;
+    uint32_t *herr_h = nullptr, *herr_d = nullptr, *dcnt = nullptr;
+    ck(cudaHostAlloc((void**) &h0, N * sizeof(float), cudaHostAllocMapped | cudaHostAllocPortable), "h0");
+    ck(cudaHostAlloc((void**) &h1, N * sizeof(float), cudaHostAllocMapped | cudaHostAllocPortable), "h1");
+    ck(cudaHostGetDevicePointer((void**) &d0, h0, 0), "d0");
+    ck(cudaHostGetDevicePointer((void**) &d1, h1, 0), "d1");
+    ck(cudaHostAlloc((void**) &hflag, 64, cudaHostAllocMapped | cudaHostAllocPortable), "hflag");
+    ck(cudaHostAlloc((void**) &hpseq, 64, cudaHostAllocMapped | cudaHostAllocPortable), "hpseq");
+    ck(cudaHostAlloc((void**) &hwseq, 64, cudaHostAllocMapped | cudaHostAllocPortable), "hwseq");
+    ck(cudaHostAlloc((void**) &herr_h, 64, cudaHostAllocMapped | cudaHostAllocPortable), "herr");
+    ck(cudaHostGetDevicePointer((void**) &dflag, hflag, 0), "dflag");
+    ck(cudaHostGetDevicePointer((void**) &dpseq, hpseq, 0), "dpseq");
+    ck(cudaHostGetDevicePointer((void**) &dwseq, hwseq, 0), "dwseq");
+    ck(cudaHostGetDevicePointer((void**) &herr_d, herr_h, 0), "derr");
+    *hflag = 0; *hpseq = 0; *hwseq = 0; *herr_h = 0;
+    ck(cudaMalloc((void**) &dcnt, 64), "dcnt");
+    ck(cudaMemset(dcnt, 0, 64), "dcnt0");
+    float *sa = dalloc<float>(na), *sb = dalloc<float>(nb), *sc = dalloc<float>(nc);
+    float *da = dalloc<float>(na), *db = dalloc<float>(nb), *dc = dalloc<float>(nc);
+    bool all_ok = true;
+    for (uint64_t seq = 1; seq <= 6; ++seq) {
+        std::vector<float> va(na), vb(nb), vc(nc);
+        for (int i = 0; i < na; ++i) va[i] = float(seq * 100 + i);
+        for (int i = 0; i < nb; ++i) vb[i] = float(seq * 200 + i);
+        for (int i = 0; i < nc; ++i) vc[i] = float(seq * 300 + i);
+        ck(cudaMemcpy(sa, va.data(), na * sizeof(float), cudaMemcpyHostToDevice), "up a");
+        ck(cudaMemcpy(sb, vb.data(), nb * sizeof(float), cudaMemcpyHostToDevice), "up b");
+        ck(cudaMemcpy(sc, vc.data(), nc * sizeof(float), cudaMemcpyHostToDevice), "up c");
+        *hpseq = seq;
+        *hwseq = seq;
+        k::handoff_publish_u64(d0, d1, 0, sa, na, sb, nb, sc, nc, dcnt, dflag, dpseq, s, nullptr);
+        k::wait_handoff_u64(dflag, dwseq, herr_d, 5000000000ull, s);
+        k::handoff_consume_u64(da, na, db, nb, dc, nc, d0, d1, 0, dwseq, s);
+        ck(cudaStreamSynchronize(s), "sync");
+        if (*herr_h != 0 || *hflag != seq || read(da, na) != va || read(db, nb) != vb || read(dc, nc) != vc) {
+            all_ok = false;
+            break;
+        }
+    }
+    report("handoff_u64_pingpong monotonic seq=1..6", all_ok);
+    *hwseq = 9999ull;
+    *herr_h = 0;
+    *hflag |= k::kHandoffAbortBit;
+    k::wait_handoff_u64(dflag, dwseq, herr_d, 5000000000ull, s);
+    ck(cudaStreamSynchronize(s), "abort sync");
+    report("handoff_u64_pingpong host abort bit releases without timeout", *herr_h == 0);
+    for (float* p : {sa, sb, sc, da, db, dc}) cudaFree(p);
+    cudaFree(dcnt);
+    for (void* p : {(void*) h0, (void*) h1, (void*) hflag, (void*) hpseq, (void*) hwseq, (void*) herr_h})
+        cudaFreeHost(p);
+}
+
 }  // namespace
 
 int main() {
@@ -183,6 +239,7 @@ int main() {
     else
         std::printf("SKIP native_ple_postops_batch_snap: built with CUDA 12.8 for RTX 50: the batched PLE post-ops are switched off in this build "
                     "(STRATA_PLE_BATCH=1 runs the step anyway)\n");
+    handoff_u64_pingpong(s);
     std::printf("verify_batch_parity: %s\n", g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;
 }

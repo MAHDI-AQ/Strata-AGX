@@ -767,7 +767,7 @@ inline cudaError_t launch_fused_lm_head_gemv_softmax(
     cudaStream_t stream = nullptr
 ) {
     bool spec_gumbel = false;
-    if (out_logits == nullptr) {
+    if (out_logits == nullptr && temperature > 0.0f) {
         const char* eg = std::getenv("STRATA_SPEC_GUMBEL");
         const char* ez = std::getenv("STRATA_ZERO_DRAM_SAMPLER");
         if ((eg != nullptr && eg[0] == '1') || (ez != nullptr && ez[0] == '1')) {

@@ -128,6 +128,18 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
                    long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err = nullptr);
 /// wait_flag_ge that also returns when *skip == value (device memory).
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream);
+/// High bit of a 64-bit handoff flag word: set by host release_gpu_waits to abort spinning consumers cleanly.
+inline constexpr unsigned long long kHandoffAbortBit = (1ull << 63);
+/// Wait until *flag >= *want_seq (unless (*flag & kHandoffAbortBit) != 0, or timeout_ns expires marking *err = 1).
+void wait_handoff_u64(const uint64_t* flag, const uint64_t* want_seq, uint32_t* err, unsigned long long timeout_ns,
+                      void* stream);
+/// Write [a, b, c] into ping-pong buffer ((*pub_seq & 1) ? dst1 : dst0) + row_off, then raise *flag = *pub_seq.
+void handoff_publish_u64(float* dst0, float* dst1, long long row_off, const float* a, long long na, const float* b,
+                         long long nb, const float* c, long long nc, uint32_t* counter, uint64_t* flag,
+                         const uint64_t* pub_seq, void* stream, const uint32_t* drop = nullptr);
+/// Copy [a, b, c] from ping-pong buffer ((*wait_seq & 1) ? src1 : src0) + row_off.
+void handoff_consume_u64(float* a, long long na, float* b, long long nb, float* c, long long nc, const float* src0,
+                         const float* src1, long long row_off, const uint64_t* wait_seq, void* stream);
 /// copy_i32_from_mapped unless *skip == value.
 void copy_i32_from_mapped_unless(int32_t* dst, const int32_t* src, long long n, const uint32_t* skip, uint32_t value,
                                  void* stream);

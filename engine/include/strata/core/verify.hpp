@@ -221,8 +221,16 @@ public:
     void set_handoff_flags(uint32_t* in_host, uint32_t* in_dev, uint32_t* out_host, uint32_t* out_dev) {
         hflag_in_h_ = in_host; hflag_in_d_ = in_dev; hflag_out_h_ = out_host; hflag_out_d_ = out_dev;
     }
-    /// This stage raises a hand-off flag (set_handoff_flags gave it an outgoing word).
-    bool publishes_handoff() const { return hflag_out_d_ != nullptr; }
+    /// STRATA_BATCH_HANDOFF=1: monotonic uint64_t sequence words + ping-pong mapped buffers [2] (zero WAR hazard).
+    void set_batch_handoff(const float* in0, const float* in1, float* out0, float* out1,
+                           uint64_t* in_host, uint64_t* in_dev, uint64_t* out_host, uint64_t* out_dev) {
+        hand_in_2_[0] = in0; hand_in_2_[1] = in1;
+        hand_out_2_[0] = out0; hand_out_2_[1] = out1;
+        hflag64_in_h_ = in_host; hflag64_in_d_ = in_dev;
+        hflag64_out_h_ = out_host; hflag64_out_d_ = out_dev;
+    }
+    /// This stage raises a hand-off flag (set_handoff_flags or set_batch_handoff gave it an outgoing word).
+    bool publishes_handoff() const { return hflag_out_d_ != nullptr || hflag64_out_d_ != nullptr; }
     /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
     /// and `final_R` are the last stage's.
     void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
@@ -489,7 +497,8 @@ private:
             return true;
         }
     };
-    std::map<BatchKey, cudaGraphExec_t> exec_bm_, commit_bm_;   ///< full row layout avoids slot-ID collisions
+    std::map<BatchKey, cudaGraphExec_t> exec_bm_, exec_bm_long_, commit_bm_;   ///< full row layout avoids slot-ID collisions
+    bool last_batch_sel_long_ = false;
     std::map<BatchKey, uint64_t> bm_used_;   ///< last use of each captured layout (LRU)
     uint64_t bm_tick_ = 0;
     size_t batch_graph_limit_ = 0;         ///< 0: keep every captured batch graph (0.1.39); N: LRU-evict beyond N layouts
@@ -542,7 +551,7 @@ private:
     float* tail_snap_b_ = nullptr;         ///< per (slot, QSA layer) indexer tail snapshot
     void* arena_b_ = nullptr;
     int64_t last_pos_b_[strata::kernels::kWindowMaxT] = {};
-    bool capture_batch(const int* rows, int S, int hbase, std::string& err);
+    bool capture_batch(const int* rows, int S, int hbase, bool use_long, std::string& err);
     // STRATA_PIPED_MTP (init_deferred_commit): the saved rows, laid out as the window scratch (global layer index) with
     // dc_rows_ rows per layer instead of max_t_; the slots' accepted prefixes (mapped and device, 2 + max_t_ per slot)
     int dc_rows_ = 0;
@@ -640,6 +649,18 @@ private:
     uint32_t* hflag_in_d_ = nullptr;
     uint32_t* hflag_out_h_ = nullptr;    ///< ... and the outgoing one's
     uint32_t* hflag_out_d_ = nullptr;
+    const float* hand_in_2_[2] = {};     ///< set_batch_handoff: ping-pong incoming handoff buffers
+    float* hand_out_2_[2] = {};          ///< set_batch_handoff: ping-pong outgoing handoff buffers
+    uint64_t* hflag64_in_h_ = nullptr;   ///< set_batch_handoff: monotonic uint64_t ready words
+    uint64_t* hflag64_in_d_ = nullptr;
+    uint64_t* hflag64_out_h_ = nullptr;
+    uint64_t* hflag64_out_d_ = nullptr;
+    uint64_t* h_hwait_seq_ = nullptr;    ///< mapped per-launch consumer target seq
+    uint64_t* m_hwait_seq_ = nullptr;
+    uint64_t* h_hpub_seq_ = nullptr;     ///< mapped per-launch producer publish seq
+    uint64_t* m_hpub_seq_ = nullptr;
+    uint64_t in_wait_seq_ = 0;
+    uint64_t out_pub_seq_ = 0;
     cudaEvent_t copy_done_ = nullptr;
     uint32_t* hcount_d_ = nullptr;       ///< handoff_publish's block counter (device memory)
     uint32_t* herr_h_ = nullptr;         ///< the bounded hand-off wait gave up (mapped; the reading stage's)

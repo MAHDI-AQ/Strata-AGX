@@ -10,7 +10,7 @@ debugging and are kept in `terminal/data/settings-register.json`.
 A number or a word is set like any environment variable, for example `STRATA_KVA=1`. In the Terminal, `strata launch --set NAME=value`
 puts it in the model's run configuration.
 
-## Switches you can turn on (368)
+## Switches you can turn on (369)
 
 Off unless you set them. The last column says where each one is described.
 
@@ -189,6 +189,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_MLOCK_CODE` | number | NVIDIA and AMD | [SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md](SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md), [AGENTS.md](../AGENTS.md) |
 | `STRATA_MMQ_GROUP_SORT` | text | NVIDIA and AMD | - |
 | `STRATA_MMVQ_IL_89` | text | NVIDIA and AMD | [release-notes-0.2.7.md](release-notes-0.2.7.md), [DETAILS.md](DETAILS.md), [MMVQ_IL_TABLE.md](MMVQ_IL_TABLE.md) |
+| `STRATA_MMVQ_IL_89_WIDE` | on / off | NVIDIA and AMD | - |
 | `STRATA_MMVQ_IL_PF` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md), [MMVQ_IL_TABLE.md](MMVQ_IL_TABLE.md) |
 | `STRATA_MMVQ_IL_ROWS` | on / off | NVIDIA and AMD | [MMVQ_IL_TABLE.md](MMVQ_IL_TABLE.md) |
 | `STRATA_MMVQ_WIDE_32` | number | Intel Arc | [INTEL.md](INTEL.md) |
@@ -327,7 +328,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_ROUTE_RESIDENT_MTP` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_SAMPLER_ASYNC` | number | NVIDIA and AMD | [SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md](SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md), [AGENTS.md](../AGENTS.md) |
 | `STRATA_SAMPLER_BATCH_ROWS` | on / off | NVIDIA and AMD | [SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md](SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md), [AGENTS.md](../AGENTS.md) |
-| `STRATA_SAVE_LOGITS` | text | NVIDIA and AMD | - |
+| `STRATA_SAVE_LOGITS` | on / off | NVIDIA and AMD | - |
 | `STRATA_SCORES_HALVE` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_SCORES_THREAD_TRACE` | text | AMD | [AMD_HIP.md](AMD_HIP.md), [README.md](bench-results/2026-10-11-gfx1100-qsa-scores/README.md) |
 | `STRATA_SELECT_LONG` | on / off | NVIDIA and AMD | [release-notes-0.2.7.md](release-notes-0.2.7.md), [OLDER_GPUS.md](OLDER_GPUS.md) |

@@ -5640,9 +5640,9 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (native_pack) skip.insert("token_embd.weight");
-        // STRATA_HC_Q8=1 (single GPU): the layers' hyper-connection down / up projections live only as Q8_0 (NativeDense
-        // quantizes them from the pack file), so their bf16 copy is not loaded
-        if (!o.native_dense_gguf.empty() && !multi_gpu && strata::core::NativeDense::hc_q8_requested())
+        // STRATA_HC_Q8=1 (single GPU or layer split): the layers' hyper-connection down / up projections live only as
+        // Q8_0 (NativeDense quantizes them from the pack file), so their bf16 copy is not loaded
+        if (!o.native_dense_gguf.empty() && strata::core::NativeDense::hc_q8_requested())
             strata::core::NativeDense::add_hc_skip(o.pack, skip);
     }
     // Layer split: every GPU holds only the dense weights of ITS layers (the PLE tensors stay everywhere).
@@ -12901,16 +12901,36 @@ int main(int argc, char** argv) {
                 const char* v = std::getenv("STRATA_BATCH_HANDOFF");
                 return v != nullptr && v[0] == '1' && v[1] == '\0';
             }() && !overlap && !split_same && o.pipeline_windows == 0;
-            std::vector<uint32_t*> hflag_h((size_t) n_stages - 1, nullptr), hflag_d((size_t) n_stages - 1, nullptr);
-            if (overlap || batch_hand)
-                for (size_t i = 0; i < hflag_h.size(); ++i) {
-                    if (cudaHostAlloc((void**) &hflag_h[i], 64, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
-                        cudaHostGetDevicePointer((void**) &hflag_d[i], hflag_h[i], 0) != cudaSuccess) {
-                        std::fprintf(stderr, "strata serve: the layer-split hand-off flag allocation failed\n");
-                        return 1;
-                    }
-                    std::memset(hflag_h[i], 0, 64);
+            std::vector<float*> hand_pp((size_t) (batch_hand ? n_stages - 1 : 0), nullptr);
+            for (float*& hp : hand_pp) {
+                float* hh = nullptr;
+                if (cudaHostAlloc((void**) &hh, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                    cudaHostGetDevicePointer((void**) &hp, hh, 0) != cudaSuccess) {
+                    std::fprintf(stderr, "strata serve: the layer-split ping-pong hand-off allocation failed\n");
+                    return 1;
                 }
+                std::memset(hh, 0, hb);
+            }
+            std::vector<uint32_t*> hflag_h((size_t) (overlap ? n_stages - 1 : 0), nullptr),
+                                   hflag_d((size_t) (overlap ? n_stages - 1 : 0), nullptr);
+            for (size_t i = 0; i < hflag_h.size(); ++i) {
+                if (cudaHostAlloc((void**) &hflag_h[i], 64, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                    cudaHostGetDevicePointer((void**) &hflag_d[i], hflag_h[i], 0) != cudaSuccess) {
+                    std::fprintf(stderr, "strata serve: the layer-split hand-off flag allocation failed\n");
+                    return 1;
+                }
+                std::memset(hflag_h[i], 0, 64);
+            }
+            std::vector<uint64_t*> hflag64_h((size_t) (batch_hand ? n_stages - 1 : 0), nullptr),
+                                   hflag64_d((size_t) (batch_hand ? n_stages - 1 : 0), nullptr);
+            for (size_t i = 0; i < hflag64_h.size(); ++i) {
+                if (cudaHostAlloc((void**) &hflag64_h[i], 64, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                    cudaHostGetDevicePointer((void**) &hflag64_d[i], hflag64_h[i], 0) != cudaSuccess) {
+                    std::fprintf(stderr, "strata serve: the layer-split uint64 hand-off flag allocation failed\n");
+                    return 1;
+                }
+                std::memset(hflag64_h[i], 0, 64);
+            }
             split_drive.base = &drive;
             split_drive.n = n_stages;
             for (int st = 0; st < n_stages; ++st) {
@@ -12921,11 +12941,20 @@ int main(int argc, char** argv) {
                 if (use_df2 && st > 0) stage_ver(st).set_taps(df2.tap_layers());   // (stage 0 gets its taps below, as on one card)
                 if (batch_df2 && st > 0) stage_ver(st).set_batch_taps(true);
 #endif
-                if (overlap || batch_hand)
+                if (overlap)
                     stage_ver(st).set_handoff_flags(st == 0 ? nullptr : hflag_h[(size_t) st - 1],
                                                     st == 0 ? nullptr : hflag_d[(size_t) st - 1],
                                                     st + 1 < n_stages ? hflag_h[(size_t) st] : nullptr,
                                                     st + 1 < n_stages ? hflag_d[(size_t) st] : nullptr);
+                if (batch_hand)
+                    stage_ver(st).set_batch_handoff(st == 0 ? nullptr : hand[(size_t) st - 1],
+                                                    st == 0 ? nullptr : hand_pp[(size_t) st - 1],
+                                                    st + 1 < n_stages ? hand[(size_t) st] : nullptr,
+                                                    st + 1 < n_stages ? hand_pp[(size_t) st] : nullptr,
+                                                    st == 0 ? nullptr : hflag64_h[(size_t) st - 1],
+                                                    st == 0 ? nullptr : hflag64_d[(size_t) st - 1],
+                                                    st + 1 < n_stages ? hflag64_h[(size_t) st] : nullptr,
+                                                    st + 1 < n_stages ? hflag64_d[(size_t) st] : nullptr);
                 split_drive.end[st] = st + 1 < n_stages ? split_at[(size_t) st] : g.n_layers;
                 split_drive.cache_base[st] = drive.d.cache_base;
                 split_drive.cache_slot_off[st] = drive.d.cache_slot_off;

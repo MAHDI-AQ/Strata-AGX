@@ -551,6 +551,61 @@ int test_condition5_mtp_distributed_concurrency() {
 }
 
 // ============================================================================
+// Test 6: Greedy Guard under STRATA_ZERO_DRAM_SAMPLER=1 (temp <= 0.0f)
+// ============================================================================
+int test_condition6_greedy_guard() {
+    std::cout << ">>> Running Condition 6: Greedy Guard (STRATA_ZERO_DRAM_SAMPLER=1, temp<=0.0f)..." << std::endl;
+#if defined(_WIN32)
+    _putenv_s("STRATA_ZERO_DRAM_SAMPLER", "1");
+#else
+    setenv("STRATA_ZERO_DRAM_SAMPLER", "1", 1);
+#endif
+    const int32_t T = 2, V = 256, K = 128;
+    std::vector<uint8_t> h_W((size_t) V * K, 0x3C);
+    std::vector<float> h_sw(V, 1.0f);
+    h_sw[17] = 1.02f;
+    h_sw[99] = 1.01f;
+    std::vector<uint8_t> h_X((size_t) T * K, 0x3C);
+
+    uint8_t *d_W = nullptr, *d_X = nullptr;
+    float* d_sw = nullptr;
+    int32_t* d_tok = nullptr;
+    strata::kernels::SoftmaxArgmaxTuple* d_scratch = nullptr;
+    cudaMalloc(&d_W, h_W.size());
+    cudaMalloc(&d_X, h_X.size());
+    cudaMalloc(&d_sw, h_sw.size() * sizeof(float));
+    cudaMalloc(&d_tok, T * sizeof(int32_t));
+    cudaMalloc(&d_scratch, T * ((V + 127) / 128) * sizeof(strata::kernels::SoftmaxArgmaxTuple));
+    cudaMemcpy(d_W, h_W.data(), h_W.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_X, h_X.data(), h_X.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_sw, h_sw.data(), h_sw.size() * sizeof(float), cudaMemcpyHostToDevice);
+
+    cudaStream_t stream = nullptr;
+    cudaStreamCreate(&stream);
+    std::vector<int32_t> h_tok(T, -1);
+    for (float temp : {0.0f, -0.5f}) {
+        cudaError_t e1 = strata::kernels::launch_fused_lm_head_gemv_softmax(
+            d_W, d_X, d_scratch, d_tok, nullptr, nullptr, T, V, K, temp, 1.0f, 1.0f, d_sw, nullptr, stream);
+        TEST_ASSERT(e1 == cudaSuccess, "Greedy guard overload launch failed");
+        cudaStreamSynchronize(stream);
+        cudaMemcpy(h_tok.data(), d_tok, T * sizeof(int32_t), cudaMemcpyDeviceToHost);
+        for (int t = 0; t < T; ++t) TEST_ASSERT(h_tok[t] == 17, "Greedy overload picked non-argmax token under ZERO_DRAM");
+
+        cudaError_t e2 = strata::kernels::launch_fused_lm_head_gemv_softmax(
+            d_W, d_X, d_scratch, d_tok, nullptr, nullptr, T, V, K, temp, 1.0f, 1.0f, d_sw, nullptr, true, 0xCAFEull, 99ull, stream);
+        TEST_ASSERT(e2 == cudaSuccess, "Greedy guard explicit spec_gumbel launch failed");
+        cudaStreamSynchronize(stream);
+        cudaMemcpy(h_tok.data(), d_tok, T * sizeof(int32_t), cudaMemcpyDeviceToHost);
+        for (int t = 0; t < T; ++t) TEST_ASSERT(h_tok[t] == 17, "Greedy explicit spec_gumbel=true picked non-argmax token");
+    }
+
+    cudaFree(d_W); cudaFree(d_X); cudaFree(d_sw); cudaFree(d_tok); cudaFree(d_scratch);
+    cudaStreamDestroy(stream);
+    std::cout << ">>> Condition 6 PASSED: Greedy guard verified (deterministic argmax under ZERO_DRAM_SAMPLER=1)." << std::endl;
+    return 0;
+}
+
+// ============================================================================
 // Main Execution
 // ============================================================================
 int main(int argc, char** argv) {
@@ -575,6 +630,7 @@ int main(int argc, char** argv) {
     if (test_condition3_float_stability() != 0) return 1;
     if (test_condition4_zero_dram_leakage() != 0) return 1;
     if (test_condition5_mtp_distributed_concurrency() != 0) return 1;
+    if (test_condition6_greedy_guard() != 0) return 1;
 
     std::cout << "=================================================================" << std::endl;
     std::cout << " ALL 5 ADVERSARIAL AUDIT CONDITIONS EXERCISED & VERIFIED!" << std::endl;

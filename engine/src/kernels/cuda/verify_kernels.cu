@@ -1506,6 +1506,76 @@ void wait_handoff(const uint32_t* flag, uint32_t value, uint32_t* err, unsigned 
     check("wait_handoff");
 }
 
+__global__ void wait_handoff_u64_kernel(const volatile uint64_t* flag, const volatile uint64_t* want_seq,
+                                        uint32_t* err, unsigned long long timeout_ns) {
+    const uint64_t target = *want_seq;
+    const unsigned long long t0 = timeout_ns ? strata_now_ns() : 0ull;
+    for (;;) {
+        const uint64_t f = *flag;
+        if ((f & kHandoffAbortBit) != 0ull) {
+            __threadfence_system();
+            return;
+        }
+        if (f >= target) break;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        __nanosleep(64);
+#else
+        strata_spin_pause();
+#endif
+        if (timeout_ns && strata_now_ns() - t0 > timeout_ns) {
+            *(volatile uint32_t*) err = 1u;
+            __threadfence_system();
+            return;
+        }
+    }
+    __threadfence_system();
+}
+
+__global__ void handoff_publish_u64_kernel(float* dst0, float* dst1, long long row_off,
+                                           const float* __restrict__ a, long long na,
+                                           const float* __restrict__ b, long long nb,
+                                           const float* __restrict__ c, long long nc,
+                                           uint32_t* counter, uint64_t* flag,
+                                           const volatile uint64_t* pub_seq, const volatile uint32_t* drop) {
+    const uint64_t seq = *pub_seq;
+    float* const dst = ((seq & 1ull) ? dst1 : dst0) + row_off;
+    const long long n = na + nb + nc;
+    volatile float* const out = dst;
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (long long) gridDim.x * blockDim.x)
+        out[i] = i < na ? a[i] : i < na + nb ? b[i - na] : c[i - na - nb];
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const uint32_t prev = atomicAdd(counter, 1u);
+        if (prev == gridDim.x - 1) {
+            *(volatile uint32_t*) counter = 0u;
+            __threadfence_system();
+            if (drop == nullptr || *drop == 0u) {
+                *(volatile uint64_t*) flag = seq;
+                __threadfence_system();
+            }
+        }
+    }
+}
+
+__global__ void handoff_consume_u64_kernel(float* __restrict__ a, long long na,
+                                           float* __restrict__ b, long long nb,
+                                           float* __restrict__ c, long long nc,
+                                           const float* src0, const float* src1, long long row_off,
+                                           const volatile uint64_t* wait_seq) {
+    const uint64_t seq = *wait_seq;
+    const float* const src = ((seq & 1ull) ? src1 : src0) + row_off;
+    const long long n = na + nb + nc;
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (long long) gridDim.x * blockDim.x) {
+        const float v = src[i];
+        if (i < na) a[i] = v;
+        else if (i < na + nb) b[i - na] = v;
+        else c[i - na - nb] = v;
+    }
+}
+
 void handoff_publish(float* dst, const float* a, int64_t na, const float* b, int64_t nb, const float* c, int64_t nc,
                      uint32_t* counter, uint32_t* flag, void* stream, const uint32_t* drop) {
     const int64_t n = na + nb + nc;
@@ -1517,6 +1587,42 @@ void handoff_publish(float* dst, const float* a, int64_t na, const float* b, int
     const int blocks = (int) (nb256 < 64 ? nb256 : 64);
     handoff_publish_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(dst, a, na, b, nb, c, nc, counter, flag, drop);
     check("handoff_publish");
+}
+
+void wait_handoff_u64(const uint64_t* flag, const uint64_t* want_seq, uint32_t* err, unsigned long long timeout_ns,
+                      void* stream) {
+    wait_handoff_u64_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, want_seq, err, timeout_ns);
+    check("wait_handoff_u64");
+}
+
+void handoff_publish_u64(float* dst0, float* dst1, long long row_off, const float* a, long long na, const float* b,
+                         long long nb, const float* c, long long nc, uint32_t* counter, uint64_t* flag,
+                         const uint64_t* pub_seq, void* stream, const uint32_t* drop) {
+    const long long n = na + nb + nc;
+    if (n <= 0 || dst0 == nullptr || dst1 == nullptr || counter == nullptr || flag == nullptr || pub_seq == nullptr) {
+        std::fprintf(stderr, "handoff_publish_u64: invalid arguments\n");
+        std::exit(1);
+    }
+    const long long nb256 = (n + 255) / 256;
+    const int blocks = (int) (nb256 < 64 ? nb256 : 64);
+    handoff_publish_u64_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(
+        dst0, dst1, row_off, a, na, b, nb, c, nc, counter, flag, pub_seq, drop);
+    check("handoff_publish_u64");
+}
+
+void handoff_consume_u64(float* a, long long na, float* b, long long nb, float* c, long long nc, const float* src0,
+                         const float* src1, long long row_off, const uint64_t* wait_seq, void* stream) {
+    const long long n = na + nb + nc;
+    if (n <= 0 || a == nullptr || b == nullptr || c == nullptr || src0 == nullptr || src1 == nullptr ||
+        wait_seq == nullptr) {
+        std::fprintf(stderr, "handoff_consume_u64: invalid arguments\n");
+        std::exit(1);
+    }
+    const long long nb256 = (n + 255) / 256;
+    const int blocks = (int) (nb256 < 64 ? nb256 : 64);
+    handoff_consume_u64_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(
+        a, na, b, nb, c, nc, src0, src1, row_off, wait_seq);
+    check("handoff_consume_u64");
 }
 
 namespace {

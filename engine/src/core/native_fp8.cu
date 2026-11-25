@@ -279,8 +279,8 @@ bool run_native_head_fp8(const NativeHeadFp8State& state, const float* mixed, fl
         mixed, static_cast<uint8_t*>(state.d_X_act), state.d_scale_x, state.K, T
     );
 
-    bool gumbel_enabled = spec_gumbel;
-    if (!gumbel_enabled && logits == nullptr) {
+    bool gumbel_enabled = spec_gumbel && (temperature > 0.0f);
+    if (!gumbel_enabled && logits == nullptr && temperature > 0.0f) {
         const char* eg = std::getenv("STRATA_SPEC_GUMBEL");
         const char* ez = std::getenv("STRATA_ZERO_DRAM_SAMPLER");
         if ((eg != nullptr && eg[0] == '1') || (ez != nullptr && ez[0] == '1')) {
