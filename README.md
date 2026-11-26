@@ -44,7 +44,9 @@
 | **Fleet Rotation** (`I-7`, `2×20×65K`) | `1,428.5` / `1,426.1 ms` | **`552.8`** / **`552.5 ms`** | **`-61.3%`** rotation latency |
 | **262K Prompt Hydration** (`SD_r262144_c4`) | `6,702.8` tok/s | **`16,077.7`** tok/s | **`2.40×`** |
 | **`agx_fast_gate`** (`c1` / `c4` / `c8` / `MPD`) | — | **`204.2`** / **`640.1`** / **`791.3`** / **`394.4`** tok/s | `8/8` needles · `0` leaks |
-**Arm H (2026-11-26 prefill profile, current `a1156dd97`):** `burst65` cold prefill p50 `3779.64 ms` (`-5.97%`); `burst196` cold prefill p50 `10947.96 ms` (`-4.89%`) and warm TTFT p50 `1375.16 ms` (`-13.28%`); `8/8` needles and `0` Xids across `burst65`, `burst196` and `agx_fast_gate`.
+**2026-11-26 prefill profile (current `a1156dd97`):** `burst65` cold prefill p50 `3779.64 ms` (`-5.97%`); `burst196` cold prefill p50 `10947.96 ms` (`-4.89%`) and warm TTFT p50 `1375.16 ms` (`-13.28%`); `8/8` needles and `0` Xids across `burst65`, `burst196` and `agx_fast_gate`.
+
+**2026-11-26 piped-read / prompt-attention profile (`4x RTX 4090`, `Qwen3.8-Flash-Next IQ3_S`; opt-in `STRATA_PIPED_READ_LEAD_IN_MIN_TOKENS`, `STRATA_QSA_PROMPT_ATTN_SHARED_KV`, `STRATA_PF_FUSED_PER_FORMAT_OCC`, `STRATA_PF_FP8_PAD_SMALL_T=1`):** `burst65` c=8 warm p50 `913.19 ms` (vs `1352.58 ms` baseline / `1230.99 ms` prior served, `-25.8%` to `-32.5%`), cold p50 `3645.04 ms`, warm p95 `1329.71 ms`, `280.31` TPM, `8/8` needles, `1724 MiB` min free VRAM; `burst196` c=8 cold p50 `10558.74 ms`, warm p50 `1274.78 ms`, `237.48` TPM (`+6.3%` vs `223.38`), `8/8` needles. `400K` exact match `31.32 s` cold / `0.45 s` warm. Quality: `Suite A 5/5` · `Suite B 100% / 0.9583` · `Suite C1..C4 all pass` · `Suite D 8/8` · `Challenge-20 14/20` · `7-Pillar P2 119/120, P3 100/93.8/100, P4 4/4, P6 8/8 (256/256), P7 32/32`.
 
 ### Quality Parity (`challenge-first`) & Architecture
 
@@ -168,7 +170,7 @@ Run **`strata connect`** to see setup instructions for your tool. [Connection gu
 
 `MAHDI-AQ/Strata-AGX` `main` tracks upstream `Niko1221/Strata` `v0.2.16` (engine `0.1.62`, zero-GGML) with opt-in NVIDIA Ada Lovelace (`sm_89`) multi-GPU, FP8 prefill, QSA, MTP, and `O(delta)` server optimizations (default upstream execution stays byte-identical when opt-in switches are unset).
 
-- Architecture, verified `1×` / `2×` / `4× sm_89` flag profiles, spill/parity gates, and wave progression: [docs/SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md](docs/SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md)
+- Architecture, verified `1×` / `2×` / `4× sm_89` flag profiles, spill/parity gates, and staged rollout: [docs/SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md](docs/SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md)
 - Complete opt-in environment switch reference: [docs/SETTINGS.md](docs/SETTINGS.md)
 
 <a id="guides"></a>
