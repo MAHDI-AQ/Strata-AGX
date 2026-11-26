@@ -27919,6 +27919,39 @@
       "retired_in": ""
     },
     {
+      "name": "STRATA_PF_FUSED_PER_FORMAT_OCC",
+      "backends": [
+        "cuda-hip"
+      ],
+      "reads": [
+        {
+          "file": "engine/src/prefill/moe_fused_iq.cu",
+          "line": 2338,
+          "backend": "cuda-hip",
+          "fn": "getenv"
+        }
+      ],
+      "parse": "flag",
+      "default_state": "off",
+      "code_default": null,
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "first_commit": "dcf58a6d2",
+      "first_date": "2026-11-26",
+      "since": null,
+      "last_commit": "dcf58a6d2",
+      "last_date": "2026-11-26",
+      "status": "opt-in",
+      "owner": "",
+      "note": "",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
       "name": "STRATA_PF_FUSED_Q2N",
       "backends": [
         "cuda-hip"
