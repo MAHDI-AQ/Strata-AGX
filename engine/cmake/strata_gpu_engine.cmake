@@ -493,6 +493,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     set_tests_properties(kv_host_dma_parity PROPERTIES SKIP_RETURN_CODE 77)
   endif()
 
+  # P2 (STRATA_PF_HCDOWN_CUDA=1): the CUDA fused HC down + inject parity case in pf_cover_test.cu, checked against
+  # two Gemm::bf16 projections.  Synthetic, no model; skips with 77 without a cc >= 8 device.
+  if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
+    add_executable(pf_hcdown_cuda_test src/prefill/pf_cover_test.cu)
+    target_include_directories(pf_hcdown_cuda_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill)
+    target_link_libraries(pf_hcdown_cuda_test PRIVATE strata_prefill ${_strata_gpu_runtime_target})
+    add_test(NAME pf_hcdown_cuda_test COMMAND pf_hcdown_cuda_test)
+    set_tests_properties(pf_hcdown_cuda_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  endif()
+
   # DFlash2 drafter tools (not built by default: cmake --build <dir> --target dflash2_parity dflash2_gemm_bench dflash2_attn_bench): the drafter against
   # the torch port on a synthetic case (needs the pack and a case file, tools/dflash2/mk_parity_case.py), and the timing of its Q8 GEMM and attention
   add_executable(dflash2_parity EXCLUDE_FROM_ALL src/core/dflash2_parity.cpp)

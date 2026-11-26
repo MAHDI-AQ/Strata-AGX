@@ -28719,6 +28719,39 @@
       "retired_in": ""
     },
     {
+      "name": "STRATA_PF_HCDOWN_CUDA",
+      "backends": [
+        "cuda"
+      ],
+      "reads": [
+        {
+          "file": "engine/src/prefill/prefill.cpp",
+          "line": 1030,
+          "backend": "cuda",
+          "fn": "getenv"
+        }
+      ],
+      "parse": "flag",
+      "default_state": "off",
+      "code_default": null,
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "first_commit": null,
+      "first_date": null,
+      "since": null,
+      "last_commit": null,
+      "last_date": null,
+      "status": "opt-in",
+      "owner": "prefill",
+      "note": "P2 Lever 3: fused CUDA HC down + inject GEMM (strata_pf_hcdown_cuda_bf16)",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
       "name": "STRATA_PF_HC_REGION",
       "backends": [
         "cuda-hip"

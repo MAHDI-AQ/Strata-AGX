@@ -11,6 +11,12 @@
 // Exit 77 without a gfx11 GPU.   pf_cover_test           the checks (a few minutes of GPU time at most)
 #include "wmma_gemm.h"
 
+#if !defined(__HIPCC__) && !defined(__APPLE__)
+#include "strata/prefill/gemm.hpp"
+#include <algorithm>
+#include <string>
+#endif
+
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -125,6 +131,107 @@ void report(const char* what, int64_t T, int64_t N, int64_t K, const Result& r) 
 
 }  // namespace
 
+
+#if !defined(__HIPCC__) && !defined(__APPLE__)
+namespace {
+uint16_t hcd_bf16_bits(float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    return (uint16_t) ((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);   // round-to-nearest-even BF16
+}
+// The fused CUDA kernel against the two cuBLAS bf16 projections it replaces.  -1 skipped, 0 pass, 1 fail.
+int hcdown_cuda_case(int64_t T, std::mt19937& rng) {
+    constexpr int64_t nd = 320, ni = 4, K = 10240, ldx = K + 64;
+    uint16_t *dX = nullptr, *dWd = nullptr, *dWi = nullptr;
+    float *dlo = nullptr, *dinj = nullptr, *rlo = nullptr, *rinj = nullptr;
+    auto cleanup = [&]() {
+        cudaFree(dX); cudaFree(dWd); cudaFree(dWi);
+        cudaFree(dlo); cudaFree(dinj); cudaFree(rlo); cudaFree(rinj);
+    };
+    auto make = [&](int64_t R, int64_t C, int64_t LD, float scale, uint16_t** d) {
+        std::vector<uint16_t> h((size_t) R * LD, 0);
+        std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+        for (int64_t r = 0; r < R; ++r)
+            for (int64_t c = 0; c < C; ++c)
+                h[(size_t) r * LD + c] = hcd_bf16_bits(u(rng) * scale);
+        if (!ck(cudaMalloc((void**) d, h.size() * 2), "hcdown_cuda malloc")) return false;
+        ck(cudaMemcpy(*d, h.data(), h.size() * 2, cudaMemcpyHostToDevice), "hcdown_cuda upload");
+        return true;
+    };
+    if (!make(T, K, ldx, 1.0f, &dX) || !make(nd, K, K, 0.05f, &dWd) || !make(ni, K, K, 0.05f, &dWi)) {
+        cleanup();
+        return 1;
+    }
+    const size_t lo_b = (size_t) T * nd * 4, inj_b = (size_t) T * ni * 4;
+    if (!ck(cudaMalloc((void**) &dlo, lo_b), "hcdown_cuda malloc lo") ||
+        !ck(cudaMalloc((void**) &dinj, inj_b), "hcdown_cuda malloc inj") ||
+        !ck(cudaMalloc((void**) &rlo, lo_b), "hcdown_cuda malloc ref lo") ||
+        !ck(cudaMalloc((void**) &rinj, inj_b), "hcdown_cuda malloc ref inj")) {
+        cleanup();
+        return 1;
+    }
+    ck(cudaMemset(dlo, 0xff, lo_b), "hcdown_cuda poison lo");
+    ck(cudaMemset(dinj, 0xff, inj_b), "hcdown_cuda poison inj");
+    strata::prefill::Gemm gm;
+    std::string err;
+    if (!gm.init(nullptr, 0, err)) {
+        std::printf("FAIL: hcdown_cuda Gemm init: %s\n", err.c_str());
+        cleanup();
+        return 1;
+    }
+    gm.bf16(dX, dWd, rlo, T, nd, K, nd, 0.0f, ldx, false);
+    gm.bf16(dX, dWi, rinj, T, ni, K, ni, 0.0f, ldx, false);
+
+    size_t free0 = 0, total0 = 0, free1 = 0, total1 = 0;
+    cudaMemGetInfo(&free0, &total0);
+    const bool ran = strata_pf_hcdown_cuda_bf16(dX, ldx, dWd, dWi, nd, ni, dlo, dinj, T, K, nullptr);
+    if (!ck(cudaDeviceSynchronize(), "hcdown_cuda sync")) {
+        cleanup();
+        return 1;
+    }
+    cudaMemGetInfo(&free1, &total1);
+    if (!ran) {
+        std::printf("hcdown cuda T %lld: not run (no cc >= 8 device)\n", (long long) T);
+        cleanup();
+        return -1;
+    }
+    std::vector<float> lo((size_t) T * nd), inj((size_t) T * ni);
+    std::vector<float> ref_lo((size_t) T * nd), ref_inj((size_t) T * ni);
+    if (!ck(cudaMemcpy(lo.data(), dlo, lo_b, cudaMemcpyDeviceToHost), "hcdown_cuda read lo") ||
+        !ck(cudaMemcpy(inj.data(), dinj, inj_b, cudaMemcpyDeviceToHost), "hcdown_cuda read inj") ||
+        !ck(cudaMemcpy(ref_lo.data(), rlo, lo_b, cudaMemcpyDeviceToHost), "hcdown_cuda read ref lo") ||
+        !ck(cudaMemcpy(ref_inj.data(), rinj, inj_b, cudaMemcpyDeviceToHost), "hcdown_cuda read ref inj")) {
+        cleanup();
+        return 1;
+    }
+
+    int bad = 0;
+    double worst = 0.0;
+    auto cmp = [&](const std::vector<float>& got, const std::vector<float>& ref, const char* what) {
+        int local_bad = 0;
+        for (size_t i = 0; i < got.size(); ++i) {
+            const float d = std::fabs(got[i] - ref[i]);
+            const float tol = 1e-4f * std::max(1.0f, std::fabs(ref[i]));   // K 10240 BF16 ULP noise
+            if (!std::isfinite(got[i]) || !(d <= tol)) ++local_bad;
+            worst = std::max(worst, (double) d / std::max(1e-30f, std::fabs(ref[i])));
+        }
+        bad += local_bad;
+        std::printf("hcdown cuda %-3s T %4lld  worst rel %.2e  bad %d of %zu  %s\n", what, (long long) T, worst,
+                    local_bad, got.size(), local_bad ? "FAIL" : "OK");
+    };
+    cmp(lo, ref_lo, "lo");
+    cmp(inj, ref_inj, "inj");
+    const size_t vram_delta = free0 > free1 ? free0 - free1 : 0;
+    if (vram_delta) {
+        std::printf("FAIL: hcdown cuda T %lld took %zu bytes of extra VRAM\n", (long long) T, vram_delta);
+        ++bad;
+    }
+    cleanup();
+    return bad ? 1 : 0;
+}
+}  // namespace
+#endif
+
 int main() {
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) {
@@ -143,6 +250,7 @@ int main() {
     };
     bool any_ran = false;
 
+#if defined(STRATA_USE_HIP)   // these cases call wmma_gemm.cu, which is a HIP-only translation unit
     // ---- the generic WMMA GEMMs (T x K) . (N x K)^T, FP16 and BF16
     struct S { int64_t T, N, K; };
     const S generic[] = {{1, 16, 32}, {17, 40, 64}, {31, 31 + 1, 48}, {32, 32, 16}, {33, 96, 128}, {100, 130, 256},
@@ -224,6 +332,16 @@ int main() {
         cudaFree(Wd.dev);
         cudaFree(Wi.dev);
     }
+#endif   // STRATA_USE_HIP
+
+#if !defined(__HIPCC__) && !defined(__APPLE__)
+    for (int64_t T : {64, 128, 129, 257}) {
+        const int r = hcdown_cuda_case(T, rng);
+        if (r < 0) continue;   // no cc >= 8 device: the whole test can still skip with 77
+        any_ran = true;
+        if (r) ++fails;
+    }
+#endif
     if (!any_ran) {
         std::printf("SKIP: no gfx11 WMMA device\n");
         return 77;

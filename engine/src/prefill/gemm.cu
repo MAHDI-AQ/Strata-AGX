@@ -7,7 +7,7 @@
 #include "strata/prefill/moe_mmq.hpp"
 #endif
 
-#ifdef STRATA_USE_HIP
+#if defined(STRATA_USE_HIP) || (!defined(__HIPCC__) && !defined(__APPLE__))
 #include "wmma_gemm.h"
 #endif
 
@@ -980,6 +980,140 @@ int64_t dense_f32_min_t(int64_t N, int64_t K) {
 }
 #endif
 }  // namespace
+
+// P2 (STRATA_PF_HCDOWN_CUDA=1): fused HC down + inject GEMM on m16n8k16 BF16 MMA (sm_80+).  One padded xn16 read,
+// 64 fp32 accumulators per thread, no device heap: dynamic SMEM A[2][64][72] + B[2][128][72] bf16 = 55,296 B.
+namespace {
+constexpr int HCD_BM = 64, HCD_BN = 128, HCD_BK = 64, HCD_NT = 128, HCD_SMEM_PAD = 8;
+__global__ __launch_bounds__(HCD_NT, 1) void kernel_pf_hcdown_cuda_bf16(
+    const uint16_t* __restrict__ X, int ldx, const uint16_t* __restrict__ Wd, const uint16_t* __restrict__ Wi,
+    int nd, int ni, float* __restrict__ lo, float* __restrict__ inj, int T, int K) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    extern __shared__ uint32_t sm[];
+    constexpr int ROW_W = (HCD_BK + HCD_SMEM_PAD) / 2;   // 36 words = 72 bf16: 16-byte aligned rows, no bank conflicts
+    constexpr int A_W = 2 * HCD_BM * ROW_W;              // 4,608 words
+    uint32_t* const A = sm;                              // A[buf][r][k/2] = (buf*BM + r)*ROW_W + k/2
+    uint32_t* const B = sm + A_W;                        // B[buf][n][k/2] = (buf*BN + n)*ROW_W + k/2
+    constexpr int A_COPIES = HCD_BM * (HCD_BK / 8);
+    constexpr int B_COPIES = HCD_BN * (HCD_BK / 8);
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int g = lane >> 2, t = lane & 3;               // PTX m16n8k16 fragment coordinates
+    const int m0 = (int) blockIdx.x * HCD_BM, n0 = (int) blockIdx.y * HCD_BN;
+    const int kbt = (K + HCD_BK - 1) / HCD_BK;
+
+    // One 16-byte cp.async per 8 bf16.  Out-of-range rows / columns / k zero-fill (src-size 0), so the epilogue
+    // needs no extra guards beyond the output bounds and no scratch allocation is made.
+    auto load = [&](int kb, int ib) {
+        const int k0 = kb * HCD_BK;
+        for (int i = tid; i < A_COPIES; i += HCD_NT) {
+            const int r = i / (HCD_BK / 8), c = (i % (HCD_BK / 8)) * 8;
+            const int m = m0 + r, k = k0 + c;
+            const bool ok = m < T && k < K;
+            const uint16_t* src = X + (size_t) (m < T ? m : T - 1) * ldx + (k < K ? k : K - 1);
+            uint32_t* dst = A + (ib * HCD_BM + r) * ROW_W + c / 2;
+            const unsigned sz = ok ? 16u : 0u;
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;\n"
+                         :: "r"((unsigned) __cvta_generic_to_shared(dst)), "l"(src), "r"(sz) : "memory");
+        }
+        for (int i = tid; i < B_COPIES; i += HCD_NT) {
+            const int nr = i / (HCD_BK / 8), n = n0 + nr, c = (i % (HCD_BK / 8)) * 8;
+            const int k = k0 + c;
+            const bool ok = n < nd + ni && k < K;
+            const int row = n < nd ? n : (n - nd < ni ? n - nd : ni - 1);
+            const uint16_t* w = n < nd ? Wd : Wi;
+            const uint16_t* src = w + (size_t) row * K + (k < K ? k : K - 1);
+            uint32_t* dst = B + (ib * HCD_BN + nr) * ROW_W + c / 2;
+            const unsigned sz = ok ? 16u : 0u;
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;\n"
+                         :: "r"((unsigned) __cvta_generic_to_shared(dst)), "l"(src), "r"(sz) : "memory");
+        }
+    };
+
+    float acc[16][4];
+#pragma unroll
+    for (int i = 0; i < 16; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] = 0.0f;
+
+    load(0, 0);
+    asm volatile("cp.async.commit_group;\n");
+#pragma unroll 1
+    for (int kb = 0; kb < kbt; ++kb) {
+        const int ib = kb & 1;
+        if (kb + 1 < kbt) {
+            load(kb + 1, ib ^ 1);
+            asm volatile("cp.async.commit_group;\n\tcp.async.wait_group 1;\n");
+        } else {
+            asm volatile("cp.async.wait_group 0;\n");
+        }
+        __syncthreads();
+
+        const int ar0 = (ib * HCD_BM + warp * 16 + g) * ROW_W;
+        const int ar1 = ar0 + 8 * ROW_W;
+#pragma unroll
+        for (int nt = 0; nt < 16; ++nt) {
+            const int br = (ib * HCD_BN + nt * 8 + g) * ROW_W;
+#pragma unroll
+            for (int ks = 0; ks < 4; ++ks) {
+                const int kw = ks * 8 + t;   // k = ks*16 + 2*t, in uint32 words
+                // PTX m16n8k16.row.col fragments: A rows g / g+8, k 2*t / 2*t+8; B col g, k 2*t / 2*t+8;
+                // D rows g / g+8, columns 2*t and 2*t+1 (NOT t and t+4).
+                const uint32_t a0 = A[ar0 + kw], a1 = A[ar1 + kw];
+                const uint32_t a2 = A[ar0 + kw + 4], a3 = A[ar1 + kw + 4];
+                const uint32_t b0 = B[br + kw], b1 = B[br + kw + 4];
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                             : "+f"(acc[nt][0]), "+f"(acc[nt][1]), "+f"(acc[nt][2]), "+f"(acc[nt][3])
+                             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int nt = 0; nt < 16; ++nt) {
+        const int nbase = n0 + nt * 8 + 2 * t;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int m = m0 + warp * 16 + g + (j >> 1) * 8;
+            const int n = nbase + (j & 1);
+            if (m < T && n < nd + ni) {
+                if (n < nd) lo[(size_t) m * nd + n] = acc[nt][j];
+                else inj[(size_t) m * ni + (n - nd)] = acc[nt][j];
+            }
+        }
+    }
+#else
+    (void) X; (void) ldx; (void) Wd; (void) Wi; (void) nd; (void) ni;
+    (void) lo; (void) inj; (void) T; (void) K;   // only launched on cc >= 8.0
+#endif
+}
+}  // namespace
+}  // namespace strata::prefill
+
+#if !defined(__APPLE__)
+bool strata_pf_hcdown_cuda_bf16(const uint16_t* X, int64_t ldx, const uint16_t* Wd, const uint16_t* Wi, int64_t nd,
+                                int64_t ni, float* lo, float* inj, int64_t T, int64_t K, void* stream) {
+    using namespace strata::prefill;   // HCD_* constants and kernel live in its unnamed namespace
+    constexpr int64_t kD = 10240, kLR = 320, kHC = 4, kPad = 64;   // prefill.cpp's D / LR / HC / XN_PAD
+    if (!X || !Wd || !Wi || !lo || !inj) return false;
+    if (nd != kLR || ni != kHC || K != kD || ldx != K + kPad || ldx == K) return false;
+    if (T < 64 || T > (1LL << 30) || K % HCD_BK != 0) return false;
+    int dev = 0, cc_major = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    if (cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) return false;
+    if (cc_major < 8) return false;   // m16n8k16 BF16 mma.sync begins on sm_80 (Ampere / Ada / Hopper)
+    constexpr size_t smem_bytes = 2 * HCD_BM * (HCD_BK + HCD_SMEM_PAD) * 2 +
+                                  2 * HCD_BN * (HCD_BK + HCD_SMEM_PAD) * 2;   // 55,296 B
+    if (cudaFuncSetAttribute(kernel_pf_hcdown_cuda_bf16, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int) smem_bytes) != cudaSuccess) return false;
+    const dim3 grid((unsigned) ((T + HCD_BM - 1) / HCD_BM), (unsigned) ((nd + ni + HCD_BN - 1) / HCD_BN));
+    kernel_pf_hcdown_cuda_bf16<<<grid, HCD_NT, smem_bytes, static_cast<cudaStream_t>(stream)>>>(
+        X, (int) ldx, Wd, Wi, (int) nd, (int) ni, lo, inj, (int) T, (int) K);
+    return cudaGetLastError() == cudaSuccess;
+}
+#endif
+namespace strata::prefill {
 #endif
 #if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
 void gemm_set_dense_f32(int mode) { g_dense_f32 = mode; }

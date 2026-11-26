@@ -1022,6 +1022,19 @@ inline bool pf_hcdown() {
     static const bool v = [] { const char* e = std::getenv("STRATA_PF_HCDOWN"); return e && e[0] == '1'; }();
     return v;
 }
+// P2 (opt-in STRATA_PF_HCDOWN_CUDA=1): the CUDA m16n8k16 fused HC down + inject GEMM (gemm.cu) reads xn16 once at
+// the padded token stride.  CUDA-only; off (or any non-CUDA backend) is byte-identical to the two-cuBLAS path.
+#if !defined(__HIPCC__) && !defined(__APPLE__)
+inline bool pf_hcdown_cuda() {
+    static const bool v = [] {
+        const char* e = std::getenv("STRATA_PF_HCDOWN_CUDA");
+        return e && e[0] == '1' && e[1] == '\0';
+    }();
+    return v;
+}
+#else
+inline bool pf_hcdown_cuda() { return false; }
+#endif
 constexpr int64_t XN_PAD = 64;
 // S (opt-in STRATA_HCD_EXACT=1, on chunks of STRATA_PF_SWITCH_MIN_T+ tokens): the HC down projection by a WMMA kernel with
 // hipBLASLt's own k order (bitwise: strata_pf_hcdown_exact_bf16), xn16 written with token stride 10240 + 64 (the inject
@@ -1030,7 +1043,7 @@ inline bool hcd_exact() {
     static const bool v = [] { const char* e = std::getenv("STRATA_HCD_EXACT"); return e && e[0] == '1'; }();
     return v;
 }
-inline bool hc_pad() { return pf_hcdown() || hcd_exact(); }
+inline bool hc_pad() { return pf_hcdown() || hcd_exact() || pf_hcdown_cuda(); }
 // STRATA_QSA_FUSE_NR (default on, =0 runs rms_rows + rope [+ split_q] as separate kernels): the QSA layer's K, query and
 // indexer-query norm + rotary in one pass each (strata::prefill::rms_rope_rows; the same bits as the chain it replaces).
 // STRATA_QSA_FUSE_GATE (default on, =0 keeps the separate gate_attn pass): the attention output gate sigmoid(gate) * O in the
@@ -5296,10 +5309,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 pt.mark(kPfHcDown, cs);   // STRATA_PREFILL_TIMING: the hyper-connection read's parts on their own lines (norm stays on "hc read")
                 bool hcd = false;
                 bool hdown = false;
-                if (wd->q8_scale == nullptr && ldx != D && !pf_hcdown()) {   // not with STRATA_HC_REQ8's int8 rows   // STRATA_HCD_EXACT: the exact-order down kernel when hipBLASLt would take 1176 / 1177
+                // P2 (STRATA_PF_HCDOWN_CUDA=1): one fused CUDA m16n8k16 GEMM for the down and inject projections,
+                // reading xn16 once.  All guards are here and in strata_pf_hcdown_cuda_bf16(): when nothing is
+                // launched hcd stays false and the unchanged pair of bf16_proj calls below runs.
+                if (pf_hcdown_cuda() && wd->q8_scale == nullptr && wi->q8_scale == nullptr && ldx == D + XN_PAD &&
+                    ldx != D && !m.xn16_lo && !xf16 && T >= 64 &&
+                    wd->kind == core::WeightKind::Bf16InF32 && wd->data && wd->ne0 == D && wd->ne1 == LR &&
+                    wi->kind == core::WeightKind::Bf16InF32 && wi->data && wi->ne0 == D && wi->ne1 == HC &&
+                    strata_pf_hcdown_cuda_bf16(m.xn16, ldx, (const uint16_t*) wd->data, (const uint16_t*) wi->data,
+                                               LR, HC, m.lo, m.inj, T, D, m.cs)) {
+                    hcd = true;
+                }
+                if (!hcd && wd->q8_scale == nullptr && ldx != D && !pf_hcdown()) {   // not with STRATA_HC_REQ8's int8 rows   // STRATA_HCD_EXACT: the exact-order down kernel when hipBLASLt would take 1176 / 1177
                     hdown = wd->kind == core::WeightKind::Bf16InF32 && wd->data && wd->ne0 == D && wd->ne1 == LR &&
                             m.gemm.bf16_hcd_exact(m.xn16, ldx, (const uint16_t*) wd->data, m.lo, T, LR, D);
-                } else if (wd->q8_scale == nullptr && ldx != D) {
+                } else if (!hcd && !pf_hcdown_cuda() && wd->q8_scale == nullptr && ldx != D) {
                     if (wd->kind != core::WeightKind::Bf16InF32 || !wd->data || wd->ne0 != D || wd->ne1 != LR ||
                         wi->kind != core::WeightKind::Bf16InF32 || !wi->data || wi->ne0 != D || wi->ne1 != HC ||
                         !strata_pf_hcdown_bf16(m.xn16, ldx, (const uint16_t*) wd->data, (const uint16_t*) wi->data, LR,
