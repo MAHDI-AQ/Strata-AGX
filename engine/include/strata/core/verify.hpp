@@ -570,6 +570,9 @@ private:
     /// again when it is next used.
     bool instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, const BatchKey& key, const char* what,
                               std::string& err, int keep_t = -1, unsigned long long flags = 0);
+    /// Upload a batch graph after instantiation: retry after freeing the least recently used batch layouts on
+    /// out-of-memory, and destroy `ex` on any upload/sync failure so an un-uploaded graph is never launched.
+    bool upload_evicting(cudaGraphExec_t& ex, const BatchKey& key, const char* what, std::string& err);
     static std::atomic<uint64_t>& graphs_made_counter() {   // graphs_made(): one count for the process
         static std::atomic<uint64_t> n{0};
         return n;

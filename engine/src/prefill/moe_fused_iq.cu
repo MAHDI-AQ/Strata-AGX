@@ -2293,15 +2293,23 @@ template <int T, bool GU, int WW, int NT = THREADS, bool F16 = false> bool setup
     cudaFuncAttributes fa{};
     if (cudaFuncGetAttributes(&fa, native_kernel<T, GU, WW, NT, F16>) != cudaSuccess || fa.ptxVersion < 75) return false;
     const size_t sm = smem_bytes(T, WW, host_astages(), NT, F16, GU);
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
     {   // the block's shared memory on the card as the code sees it (STRATA_EMULATE_CC=75 on a bigger card: 64 KB, so the Turing set-up does not accept what a real Turing card refuses)
-        int dev = 0, optin = 0;
-        cudaGetDevice(&dev);
+        int optin = 0;
         if (cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) == cudaSuccess && sm > (size_t) strata::smem_optin_of(optin)) return false;
     }
     if (cudaFuncSetAttribute(native_kernel<T, GU, WW, NT, F16>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sm) != cudaSuccess)
         return false;
     int o = 0;
     if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, native_kernel<T, GU, WW, NT, F16>, NT, sm) != cudaSuccess || o < 1)
+        return false;
+    // Legal hardware limits only: 128 regs x 256 threads x 2 blocks = 65,536 fits the sm_89 register file exactly.
+    int max_regs_block = 0, max_regs_sm = 0;
+    if (cudaDeviceGetAttribute(&max_regs_block, cudaDevAttrMaxRegistersPerBlock, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&max_regs_sm, cudaDevAttrMaxRegistersPerMultiprocessor, dev) != cudaSuccess)
+        return false;
+    if ((int64_t) fa.numRegs * NT > max_regs_block || (int64_t) o * fa.numRegs * NT > max_regs_sm)
         return false;
     if (own != nullptr) *own = o;
     occ = std::min(occ, o);

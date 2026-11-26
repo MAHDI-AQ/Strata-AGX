@@ -4459,8 +4459,14 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
 }
 
 bool Verifier::capture_batch(const int* rows, int S, int hbase, bool use_long, std::string& err) {
-    cudaGraphExec_t& ex = (use_long ? exec_bm_long_ : exec_bm_)[bkey(rows, S, hbase)];
-    if (ex != nullptr) return true;
+    const auto key = bkey(rows, S, hbase);
+    auto& target = use_long ? exec_bm_long_ : exec_bm_;
+    const auto cached = target.find(key);
+    if (cached != target.end() && cached->second != nullptr) return true;
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+    prio_forks_.clear();
+    prio_tails_.clear();
+#endif
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "verify: begin batch capture failed";
         return false;
@@ -4481,11 +4487,19 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, bool use_long, s
         err = !ok ? rerr : std::string("verify: end batch capture: ") + cudaGetErrorString(ce);
         return false;
     }
-    const bool made = instantiate_evicting(ex, graph, bkey(rows, S, hbase), "verify: batch instantiate: ", err);
+    unsigned long long iflags = 0;
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+    if (graph_prio_on()) {   // STRATA_GRAPH_PRIO: as in the single-window capture path
+        apply_node_priorities(graph, S);
+        iflags = cudaGraphInstantiateFlagUseNodePriority;
+    }
+#endif
+    cudaGraphExec_t tmp = nullptr;
+    const bool made = instantiate_evicting(tmp, graph, key, "verify: batch instantiate: ", err, -1, iflags);
     cudaGraphDestroy(graph);
     if (!made) return false;
-    if (cudaGraphUpload(ex, cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess)
-        (void) cudaGetLastError();   // only a warm-up: the first launch uploads it (see capture)
+    if (!upload_evicting(tmp, key, "verify: batch upload: ", err)) return false;
+    target[key] = tmp;
     std::string list;
     for (int t = 0; t < S; ++t) list += (t ? "," : "") + std::to_string(rows[t]);
     std::fprintf(stderr, "strata verify: captured the batch window over slots %s\n", list.c_str());
@@ -4494,8 +4508,9 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, bool use_long, s
 
 bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::string& err) {
     if (batch_self_commits(rows, S)) return true;   // the window keeps its rows: no commit graph
-    cudaGraphExec_t& cex = commit_bm_[bkey(rows, S, hbase)];
-    if (cex != nullptr) return true;
+    const auto key = bkey(rows, S, hbase);
+    const auto cached = commit_bm_.find(key);
+    if (cached != commit_bm_.end() && cached->second != nullptr) return true;
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     const QsaShapes s = shapes_of(g);
@@ -4605,9 +4620,13 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
         err = std::string("verify: batch commit capture: ") + cudaGetErrorString(ce);
         return false;
     }
-    const bool made = instantiate_evicting(cex, graph, bkey(rows, S, hbase), "verify: batch commit instantiate: ", err);
+    cudaGraphExec_t tmp = nullptr;
+    const bool made = instantiate_evicting(tmp, graph, key, "verify: batch commit instantiate: ", err);
     cudaGraphDestroy(graph);
-    return made;
+    if (!made) return false;
+    if (!upload_evicting(tmp, key, "verify: batch commit upload: ", err)) return false;
+    commit_bm_[key] = tmp;
+    return true;
 }
 
 // ---- STRATA_PIPED_MTP: commits after the verdict (see the header)
@@ -4650,9 +4669,12 @@ bool Verifier::init_deferred_commit(int rows, std::string& err) {
 bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& err) {
     using namespace strata::kernels;
     const auto key = bkey(rows, S, hbase);
-    cudaGraphExec_t& sex = save_bm_[key];
-    cudaGraphExec_t& cex = dcommit_bm_[key];
-    if (sex != nullptr && cex != nullptr) return true;
+    const auto save_cached = save_bm_.find(key);
+    const auto commit_cached = dcommit_bm_.find(key);
+    const bool need_save = save_cached == save_bm_.end() || save_cached->second == nullptr;
+    const bool need_commit = commit_cached == dcommit_bm_.end() || commit_cached->second == nullptr;
+    if (!need_save && !need_commit) return true;
+    cudaGraphExec_t save_tmp = nullptr, commit_tmp = nullptr;
     const ModelGeometry& g = *g_;
     const QsaShapes s = shapes_of(g);
     const int64_t C = g.ssm_conv_channels, HV = g.ssm_v_heads, ZV = g.ssm_value_dim, ID = g.idx_key_dim, MT = max_t_;
@@ -4666,7 +4688,7 @@ bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& 
         qsa_index = gdn_index = 0;
         for (int64_t l = 0; l < lb_; ++l) (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
     };
-    auto finish = [&](cudaGraphExec_t& ex, bool ok, const char* what) {
+    auto finish = [&](cudaGraphExec_t& ex, bool ok, const char* what, const char* upload_what) {
         cudaGraph_t graph = nullptr;
         const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
         if (!ok || ce != cudaSuccess) {
@@ -4674,12 +4696,16 @@ bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& 
             if (ok) err = std::string(what) + cudaGetErrorString(ce);
             return false;
         }
-        const bool made = instantiate_evicting(ex, graph, key, what, err);
+        cudaGraphExec_t tmp = nullptr;
+        const bool made = instantiate_evicting(tmp, graph, key, what, err);
         cudaGraphDestroy(graph);
-        return made;
+        if (!made) return false;
+        if (!upload_evicting(tmp, key, upload_what, err)) return false;
+        ex = tmp;
+        return true;
     };
     // the save: the window's rows [0, S) of the scratch the commit replays -> the group's saved rows [hbase, +S)
-    if (sex == nullptr) {
+    if (need_save) {
         if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
             err = "verify: begin save capture failed";
             return false;
@@ -4706,13 +4732,14 @@ bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& 
         // batch_launch_rows queues this save graph behind the window.  The deferred commit runs after the verdict,
         // so it does not ring: batch_poll only has to see the window and this save.
         if (ok && ar_on() && batch_doorbell_on() && m_seq_ != nullptr) doorbell_ring(m_seq_, cs_);
-        if (!finish(sex, ok, "verify: save capture: ")) {
+        if (!finish(save_tmp, ok, "verify: save capture: ", "verify: save upload: ")) {
             if (ok && err.empty()) err = "verify: save capture failed";
             return false;
         }
+        save_bm_[key] = save_tmp;
     }
     // the commit: as capture_commit_batch, replaying the saved rows; the accepted prefixes come from commitd_
-    if (cex == nullptr) {
+    if (need_commit) {
         if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
             err = "verify: begin deferred commit capture failed";
             return false;
@@ -4886,10 +4913,11 @@ bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& 
             err = std::string("verify deferred commit: ") + e.what();
             ok = false;
         }
-        if (!finish(cex, ok, "verify: deferred commit capture: ")) {
+        if (!finish(commit_tmp, ok, "verify: deferred commit capture: ", "verify: deferred commit upload: ")) {
             if (ok && err.empty()) err = "verify: deferred commit capture failed";
             return false;
         }
+        dcommit_bm_[key] = commit_tmp;
     }
     return true;
 }
@@ -5183,6 +5211,36 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
     return true;
 }
 
+bool Verifier::upload_evicting(cudaGraphExec_t& ex, const BatchKey& key, const char* what, std::string& err) {
+    if (ex == nullptr) { err = std::string(what) + "no graph was instantiated"; return false; }
+    cudaError_t ue = cudaGraphUpload(ex, cs_);
+    cudaError_t us = cudaStreamSynchronize(cs_);
+    if (ue == cudaErrorMemoryAllocation || us == cudaErrorMemoryAllocation) {
+        (void) cudaGetLastError();
+        bool evicted = false;
+        if (!evict_batch_graph(key, evicted, err)) {
+            cudaGraphExecDestroy(ex);
+            ex = nullptr;
+            return false;
+        }
+        if (evicted) {
+            std::fprintf(stderr, "strata verify: %s out of memory; freed an older batch layout and retried\n", what);
+            ue = cudaGraphUpload(ex, cs_);
+            us = cudaStreamSynchronize(cs_);
+        }
+    }
+    if (ue != cudaSuccess || us != cudaSuccess) {
+        std::fprintf(stderr, "strata verify: %s upload %s, sync %s (the graph will be recaptured)\n", what,
+                     cudaGetErrorString(ue), cudaGetErrorString(us));
+        err = std::string(what) + cudaGetErrorString(ue != cudaSuccess ? ue : us);
+        (void) cudaGetLastError();
+        cudaGraphExecDestroy(ex);
+        ex = nullptr;
+        return false;
+    }
+    return true;
+}
+
 bool Verifier::prepare(int T, bool& no_vram, std::string& err) {
     no_vram = false;
 #if defined(STRATA_GPU_METAL)
@@ -5232,7 +5290,20 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     const auto key = bkey(rows, S, hbase);
     auto& target_bm = use_long ? exec_bm_long_ : exec_bm_;
     bool evicted = false;
-    if (batch_graph_limit_ > 0 && target_bm.find(key) == target_bm.end() &&
+    const bool new_layout = target_bm.find(key) == target_bm.end();
+    if (new_layout) {
+        // Headroom before capturing: an un-uploaded graph must never reach cudaGraphLaunch.
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+            while (free_b < (512ULL << 20)) {
+                if (!evict_batch_graph(key, evicted, err)) return false;
+                if (!evicted) break;
+                if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) break;
+            }
+        } else
+            (void) cudaGetLastError();
+    }
+    if (batch_graph_limit_ > 0 && new_layout &&
         (exec_bm_.size() + exec_bm_long_.size()) >= batch_graph_limit_ &&
         !evict_batch_graph(key, evicted, err))
         return false;
