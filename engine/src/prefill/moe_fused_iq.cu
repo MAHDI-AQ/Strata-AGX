@@ -2220,6 +2220,7 @@ struct DevInfo {
     bool s86 = false;   // the sm_86 rule class, compute capability 8.0 / 8.6 / 8.9 (RTX A6000 / A40 / RTX 3090 class; A100 and RTX 40 since 11-12): the same default as s120 with 80+ SMs (STRATA_PF_FUSED_SM86=0 off)
     int sms = 0, occ = 1;
     int occ_nt = 0;     // blocks per multiprocessor of the NT = 256 kernels (0: not set up)
+    int occ_nt_type[64][2] = {};   // opt-in: queried blocks/SM of each (ggml type id, gate/up) NT=256 instance
     bool ws = false;    // STRATA_PF_FUSED_WS: the warp-specialized kernels are set up
 #if !defined(__HIPCC__)
     bool q50 = false;   // sm_80+ with STRATA_PF_FUSED_Q50=1: the Q5_0 down kernels are set up (opt-in, phase 4 step 1)
@@ -2288,7 +2289,7 @@ int tq_env() {
     return v;
 }
 [[maybe_unused]] bool kq_on();   // STRATA_PF_FUSED_KQ (below): the HIP builds' reading of the switch (the CUDA builds decide in dev_info with fused_tile::kq_takes)
-template <int T, bool GU, int WW, int NT = THREADS, bool F16 = false> bool setup_ww(int& occ) {
+template <int T, bool GU, int WW, int NT = THREADS, bool F16 = false> bool setup_ww(int& occ, int* own = nullptr) {
     cudaFuncAttributes fa{};
     if (cudaFuncGetAttributes(&fa, native_kernel<T, GU, WW, NT, F16>) != cudaSuccess || fa.ptxVersion < 75) return false;
     const size_t sm = smem_bytes(T, WW, host_astages(), NT, F16, GU);
@@ -2302,6 +2303,7 @@ template <int T, bool GU, int WW, int NT = THREADS, bool F16 = false> bool setup
     int o = 0;
     if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, native_kernel<T, GU, WW, NT, F16>, NT, sm) != cudaSuccess || o < 1)
         return false;
+    if (own != nullptr) *own = o;
     occ = std::min(occ, o);
     return true;
 }
@@ -2331,6 +2333,13 @@ bool ws_requested() {
     static const bool on = [] { const char* v = std::getenv("STRATA_PF_FUSED_WS"); return v != nullptr && v[0] == '1'; }();
     return on;
 }
+bool per_format_occ_requested() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PF_FUSED_PER_FORMAT_OCC");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
 template <int T, bool GU> bool setup_ws() {
     cudaFuncAttributes fa{};
     if (cudaFuncGetAttributes(&fa, native_ws_kernel<T, GU>) != cudaSuccess || fa.ptxVersion < 80) return false;
@@ -2339,8 +2348,13 @@ template <int T, bool GU> bool setup_ws() {
     int o = 0;
     return cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, native_ws_kernel<T, GU>, WS_THREADS, ws_smem_bytes(T)) == cudaSuccess && o >= 1;
 }
-template <int T, bool GU> bool setup_nt(int& occ) {
-    return f16c_requested() ? setup_ww<T, GU, 2, 256, true>(occ) : setup_ww<T, GU, 2, 256>(occ);
+template <int T, bool GU> bool setup_nt(int& occ, DevInfo* d = nullptr) {
+    int own = 1 << 20;
+    const bool ok = f16c_requested() ? setup_ww<T, GU, 2, 256, true>(occ, &own)
+                                     : setup_ww<T, GU, 2, 256>(occ, &own);
+    if (ok && d != nullptr && per_format_occ_requested() && T >= 0 && T < 64)
+        d->occ_nt_type[T][GU ? 1 : 0] = own;
+    return ok;
 }
 #endif
 
@@ -2540,10 +2554,10 @@ const DevInfo& dev_info() {
     }
     if (d.ok && nt256_requested()) {
         int o2 = 1 << 20;
-        const bool ok2 = setup_nt<T_IQ2_XXS, true>(o2) && setup_nt<T_IQ2_XS, true>(o2) && setup_nt<T_IQ2_S, true>(o2) &&
-                         setup_nt<T_IQ3_XXS, true>(o2) && setup_nt<T_IQ3_S, true>(o2) && setup_nt<T_IQ4_XS, true>(o2) &&
-                         setup_nt<T_Q2_0, false>(o2) && setup_nt<T_IQ4_NL, false>(o2) &&
-                         (!d.q2n || setup_nt<T_Q2_0, true>(o2));   // (the Q2_0 gate/up of STRATA_PF_FUSED_Q2N=1 too)
+        const bool ok2 = setup_nt<T_IQ2_XXS, true>(o2, &d) && setup_nt<T_IQ2_XS, true>(o2, &d) && setup_nt<T_IQ2_S, true>(o2, &d) &&
+                         setup_nt<T_IQ3_XXS, true>(o2, &d) && setup_nt<T_IQ3_S, true>(o2, &d) && setup_nt<T_IQ4_XS, true>(o2, &d) &&
+                         setup_nt<T_Q2_0, false>(o2, &d) && setup_nt<T_IQ4_NL, false>(o2, &d) &&
+                         (!d.q2n || setup_nt<T_Q2_0, true>(o2, &d));   // (the Q2_0 gate/up of STRATA_PF_FUSED_Q2N=1 too)
         d.occ_nt = ok2 ? o2 : 0;
         if (!ok2) std::fprintf(stderr, "prefill fused experts (native): STRATA_PF_FUSED_NT=256 is not available here\n");
     }
@@ -3408,8 +3422,18 @@ void experts_native(const WideBatch& b, const NativeGeom& g, int n_expert, int64
     const int64_t tiles = (n + kTileRows - 1) / kTileRows + (b.e1 - b.e0);
     const bool ws = d.ws;
     const int occ = ws ? 1 : d.occ_nt;
-    const unsigned g_gu = (unsigned) std::min<int64_t>(tiles * (GU_ROWS_N / weight_rows(2)), (int64_t) d.sms * occ);
-    const unsigned g_d = (unsigned) std::min<int64_t>(tiles * (D_ROWS_N / weight_rows(2)), (int64_t) d.sms * occ);
+    int occ_gu = occ, occ_d = occ;
+    if (!ws && per_format_occ_requested()) {   // the global min is poisoned by the one widest format
+        auto own_occ = [&](int t, bool gu) {
+            const int v = (t >= 0 && t < 64) ? d.occ_nt_type[t][gu ? 1 : 0] : 0;
+            return v > 0 ? v : occ;
+        };
+        occ_gu = own_occ(g.gu_type, true);
+        const int down_t = g.d_type == T_Q2_0 ? T_Q2_0 : T_IQ4_NL;
+        occ_d = own_occ(down_t, false);
+    }
+    const unsigned g_gu = (unsigned) std::min<int64_t>(tiles * (GU_ROWS_N / weight_rows(2)), (int64_t) d.sms * occ_gu);
+    const unsigned g_d = (unsigned) std::min<int64_t>(tiles * (D_ROWS_N / weight_rows(2)), (int64_t) d.sms * occ_d);
     switch (g.gu_type) {
         case T_IQ2_XXS: launch<T_IQ2_XXS, true>(ws, g_gu, b, g, tb, xa, src, ha, nullptr, s); break;
         case T_IQ2_XS: launch<T_IQ2_XS, true>(ws, g_gu, b, g, tb, xa, src, ha, nullptr, s); break;
