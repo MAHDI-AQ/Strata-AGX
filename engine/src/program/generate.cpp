@@ -17267,6 +17267,11 @@ int main(int argc, char** argv) {
                 }
 #endif
                 if (batch_mtp && !batch_df2 && sl.active) {
+                    if (strata::core::mtp_pair_t2_coupled_on() && slot_mtp[(size_t) b]->coupled() && sl.pen_n > 0) {
+                        const int64_t from = std::min<int64_t>((int64_t) sl.ids.size(),
+                                                               std::max<int64_t>(sl.reply0, (int64_t) sl.ids.size() - sl.pen_n));
+                        slot_mtp[(size_t) b]->set_draft_history(sl.ids.data() + from, (int64_t) sl.ids.size() - from, sl.x);
+                    }
                     static const bool pair_t2 = [] {
                         const char* v = std::getenv("STRATA_MTP_PAIR_T2");
                         return v != nullptr && std::atoi(v) != 0;
@@ -17311,6 +17316,11 @@ int main(int argc, char** argv) {
                             BSlot& sl1 = bs[(size_t) b1];
                             strata::core::MtpDrafter& d1 = *slot_mtp[(size_t) b1];
                             if (d0.can_pair_with(d1) && keep[b0] <= 2 && keep[b1] <= 2) {
+                                if (strata::core::mtp_pair_t2_coupled_on() && d1.coupled() && sl1.pen_n > 0) {
+                                    const int64_t from = std::min<int64_t>((int64_t) sl1.ids.size(),
+                                                                           std::max<int64_t>(sl1.reply0, (int64_t) sl1.ids.size() - sl1.pen_n));
+                                    d1.set_draft_history(sl1.ids.data() + from, (int64_t) sl1.ids.size() - from, sl1.x);
+                                }
                                 if (!d0.draft_pair(d1, 2, outb + first[t0], pos[first[t0]], keep[b0] - 1,
                                                    ver.final_R_all() + (size_t) first[t0] * stride,
                                                    sl0.draft.data(), 2, outb + first[t1], pos[first[t1]],
@@ -17878,6 +17888,15 @@ int main(int argc, char** argv) {
                 const char* v = std::getenv("STRATA_MTP_PAIR_T2");
                 return v != nullptr && std::atoi(v) != 0;
             }();
+            if (strata::core::mtp_pair_t2_coupled_on())
+                for (const Blk& blk : blks) {
+                    const BSlot& cb = bs[(size_t) blk.b];
+                    if (cb.active && !cb.rd_on && slot_mtp[(size_t) blk.b]->coupled() && cb.pen_n > 0) {
+                        const int64_t from = std::min<int64_t>((int64_t) cb.ids.size(),
+                                                               std::max<int64_t>(cb.reply0, (int64_t) cb.ids.size() - cb.pen_n));
+                        slot_mtp[(size_t) blk.b]->set_draft_history(cb.ids.data() + from, (int64_t) cb.ids.size() - from, cb.x);
+                    }
+                }
             std::vector<char> paired;
             if (pair_t2 && pm_drafts >= 1 && pm_drafts <= 8) {
                 paired.assign(blks.size(), 0);
@@ -19507,6 +19526,7 @@ int main(int argc, char** argv) {
                     }
                     const strata::kernels::SamplerParams rd_sp = request_sampling();
                     ver.set_slot_sampling(b, rd_sp);   // the request's own sampling, row by row
+                    if (batch_mtp && strata::core::mtp_pair_t2_coupled_on()) slot_mtp[(size_t) b]->set_draft_sampling(rd_sp);
                     if (!ver.set_slot_logit_bias(b, req_bias, err)) {   // and its own logit bias
                         std::printf("ERR %s\n", err.c_str());
                         return 1;
@@ -21538,6 +21558,8 @@ int main(int argc, char** argv) {
             ver.set_sampling(req_sp);
             if (pipe) ver_b.set_sampling(req_sp);   // (reaches the later stage's odd verifier)
             if (use_mtp) mtp.set_draft_sampling(req_sp);   // STRATA_SPEC_COUPLED=1: sampled drafts (a no-op otherwise)
+            if (use_mtp && strata::core::mtp_pair_t2_coupled_on())
+                for (auto& sd : slot_mtp) sd->set_draft_sampling(req_sp);   // the batch's proposing drafters
             const bool gated_proposal = use_mtp && mtp.prob() && strata::core::spec_gate_pick() &&
                 gated_proposal_usable(o.pipeline_windows < 2 && o.batch == 0 && n_stages == 1 && !multi_gpu && drive.d.remote_count == 0,
                                       o.lookup_chain, o.adapt_swaps, req_pcie_frac != 0.0 || o.pcie_frac_auto, spec_cost || req_df2, S,
@@ -23251,6 +23273,11 @@ int main(int argc, char** argv) {
                 // commit, outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
                 if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < cap_now())
                     mtp.set_draft_history(consumed.data() + pen_gen0, (int64_t) (consumed.size() - pen_gen0), outv[(size_t) a]);
+                if (use_mtp && strata::core::mtp_pair_t2_coupled_on() && hist_n > 0 && !eos)
+                    for (auto& sd : slot_mtp)
+                        if (sd->coupled())
+                            sd->set_draft_history(consumed.data() + pen_gen0,
+                                                  (int64_t) (consumed.size() - pen_gen0), outv[(size_t) a]);
                 generation = {};   // a skipped or failed production must not expose an older q view
 #if defined(STRATA_HAVE_DFLASH2)
                 // The request ends here, so no draft follows and the window's committed rows would never reach the drafter's ring or its log: every turn would
@@ -23722,6 +23749,8 @@ int main(int argc, char** argv) {
                 const auto tc1 = Clock::now();
                 if (cont) {
                     ver.set_slot_sampling(admit_slot, req_sp);   // the request's own sampling, row by row
+                    if (batch_mtp && strata::core::mtp_pair_t2_coupled_on())
+                        slot_mtp[(size_t) admit_slot]->set_draft_sampling(req_sp);
                     if (!ver.set_slot_logit_bias(admit_slot, req_bias, err)) {   // and its own logit bias
                         std::printf("ERR %s\n", err.c_str());
                         return 1;
@@ -23769,6 +23798,11 @@ int main(int argc, char** argv) {
                             if (!sl.ids.empty()) sfxs.append(sl.ids.data(), sl.ids.size());
                             if (sl.ids.empty() || sl.ids.back() != sl.x) sfxs.append(sl.x);
                             admit_prob = sl.dprob.data();
+                        }
+                        if (strata::core::mtp_pair_t2_coupled_on() && slot_mtp[(size_t) admit_slot]->coupled() && sl.pen_n > 0) {
+                            const int64_t from = std::min<int64_t>((int64_t) sl.ids.size(),
+                                                                   std::max<int64_t>(sl.reply0, (int64_t) sl.ids.size() - sl.pen_n));
+                            slot_mtp[(size_t) admit_slot]->set_draft_history(sl.ids.data() + from, (int64_t) sl.ids.size() - from, sl.x);
                         }
                         if (!slot_mtp[(size_t) admit_slot]->draft_first(1, ver.final_R_all(), sl.x,
                                                                         sl.p - 1, sl.draft.data(), err, admit_prob,

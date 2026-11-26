@@ -34,6 +34,9 @@
 
 namespace strata::core {
 
+// STRATA_MTP_PAIR_T2_COUPLED=1: allow a pair chain when both drafters are sampled-coupled.
+bool mtp_pair_t2_coupled_on();
+
 class NativeHead;
 
 class MtpDrafter {
@@ -196,9 +199,15 @@ public:
     bool chain_launch(int T, const int32_t* tokens, int64_t p, int a, const int32_t* force, int n_force, int n_out,
                       int n_early, std::string& err);
     /// STRATA_MTP_PAIR_T2=1: pair two same-device pipelined slot drafters into one T=2 asynchronous chain.
+    /// STRATA_SPEC_COUPLED allocates one inverse token map per drafter, so only presence must agree, not identity.
+    static bool dinv_compatible(const void* a, const void* b) {
+        return (a != nullptr) == (b != nullptr);
+    }
     bool can_pair_chain_with(const MtpDrafter& d1) const {
         return this != &d1 && device_ == d1.device_ &&
-               !coupled_active_ && !d1.coupled_active_ &&
+               n_dvocab_ == d1.n_dvocab_ && dvocab_ == d1.dvocab_ && dinv_compatible(dinv_, d1.dinv_) &&
+               (m_q_ != nullptr) == (d1.m_q_ != nullptr) &&
+               coupled_active_ == d1.coupled_active_ && (!coupled_active_ || mtp_pair_t2_coupled_on()) &&
                max_drafts_ >= 1 && max_drafts_ == d1.max_drafts_ &&
                max_t_ >= 4 && d1.max_t_ >= 4 && max_t_ == d1.max_t_ &&
                !floor_on_ && !d1.floor_on_ && !chain_live_ && !d1.chain_live_ &&
@@ -283,8 +292,10 @@ private:
                             std::string& err);
     struct PairGraph { const void* st1; int T0; int T1; bool coupled; cudaGraphExec_t exec; };
     std::vector<PairGraph> pair_exec_;
-    bool capture_pair_chain(MtpDrafter& d1, int T0, int T1, int n_out, cudaGraphExec_t& out_exec, std::string& err);
-    struct PairChainGraph { const void* d1; const void* st1; const void* win_R1; int T0; int T1; int n_out; cudaGraphExec_t exec; };
+    bool capture_pair_chain(MtpDrafter& d1, int T0, int T1, int n_out, bool coupled, cudaGraphExec_t& out_exec,
+                            std::string& err);
+    struct PairChainGraph { const void* d1; const void* st1; const void* win_R1; int T0; int T1; int n_out;
+                            bool coupled; cudaGraphExec_t exec; };
     std::vector<PairChainGraph> pair_chain_exec_;
     void norm_rope(float* data, const float* gamma, int rows, int cols, const int32_t* p, cudaStream_t cs);
     bool capture_prefill(int T, std::string& err);

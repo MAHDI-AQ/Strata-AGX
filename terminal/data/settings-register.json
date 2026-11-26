@@ -23276,6 +23276,39 @@
       "retired_in": ""
     },
     {
+      "name": "STRATA_MTP_PAIR_T2_COUPLED",
+      "backends": [
+        "cuda"
+      ],
+      "reads": [
+        {
+          "file": "engine/src/core/mtp.cpp",
+          "line": 199,
+          "backend": "cuda",
+          "fn": "getenv"
+        }
+      ],
+      "parse": "flag",
+      "default_state": "off",
+      "code_default": null,
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "first_commit": null,
+      "first_date": null,
+      "since": null,
+      "last_commit": null,
+      "last_date": null,
+      "status": "opt-in",
+      "owner": "core",
+      "note": "Allow T=2 paired MTP chains when both slots use sampled coupled drafting.",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
       "name": "STRATA_MTP_PREFILL_SYNC",
       "backends": [
         "cuda-hip",

@@ -193,6 +193,18 @@ bool mtp_pair_t2_on() {
 
 }  // namespace
 
+#if !defined(__HIPCC__) && !defined(__APPLE__)   // the coupled chain graphs use CUDA graph capture
+bool mtp_pair_t2_coupled_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_MTP_PAIR_T2_COUPLED");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
+#else
+bool mtp_pair_t2_coupled_on() { return false; }
+#endif
+
 MtpDrafter::~MtpDrafter() {
     if (cs_) cudaStreamSynchronize(cs_);
     for (auto& e : prefill_exec_) if (e) cudaGraphExecDestroy(e);
@@ -1602,7 +1614,7 @@ bool MtpDrafter::capture_pair_round(const MtpDrafter& d1, int T0, int T1, bool c
     return finish_capture(cs_, ok, out_exec, coupled ? "pair_round (coupled)" : "pair_round", err);
 }
 
-bool MtpDrafter::capture_pair_chain(MtpDrafter& d1, int T0, int T1, int n_out,
+bool MtpDrafter::capture_pair_chain(MtpDrafter& d1, int T0, int T1, int n_out, bool coupled,
                                     cudaGraphExec_t& out_exec, std::string& err) {
     using namespace strata::kernels;
     const int T = T0 + T1;
@@ -1668,9 +1680,15 @@ bool MtpDrafter::capture_pair_chain(MtpDrafter& d1, int T0, int T1, int n_out,
             if (!ok) err = "mtp: pair chain kept row copy failed";
         }
     }
+    if (ok && coupled) {
+        // Once per capture, not per output: both slots' sampling parameters and penalty rings come from their own
+        // mapped host buffers.  A paired launch carries no forced tokens, so the Philox counter stays row-derived.
+        coupled_draft_stage(m_cparams_, m_chist_, cparams_, cring_, kCoupledHistCap, cs_);
+        coupled_draft_stage(d1.m_cparams_, d1.m_chist_, d1.cparams_, d1.cring_, kCoupledHistCap, cs_);
+    }
     if (ok) {
         native_quantize_q8_1(mixed_, xq_, (int) N, 2, cs_);
-        coupled_rec_ = false;
+        coupled_rec_ = coupled;
         coupled_j_ = 0;
         ok = record_rest(sr0, cs_, err, 2, &d1.st_, d1.m_floor_, &d1);
     }
@@ -1685,7 +1703,7 @@ bool MtpDrafter::capture_pair_chain(MtpDrafter& d1, int T0, int T1, int n_out,
         g_mp.base = j < kMpGraphs ? j : -1;
         ok = record_front(2, sr, cs_, err, 1, &d1.st_);
         if (ok) {
-            coupled_rec_ = false;
+            coupled_rec_ = coupled;
             coupled_j_ = j;
             ok = record_rest(sr, cs_, err, 2, &d1.st_, d1.m_floor_, &d1);
         }
@@ -1696,7 +1714,15 @@ bool MtpDrafter::capture_pair_chain(MtpDrafter& d1, int T0, int T1, int n_out,
         }
         g_mp.base = -1;
     }
-    return finish_capture(cs_, ok, out_exec, "pair_chain", err);
+    if (!finish_capture(cs_, ok, out_exec, coupled ? "pair_chain (coupled)" : "pair_chain", err)) return false;
+    if (coupled) {
+        static bool noted = false;
+        if (!noted) {
+            noted = true;
+            std::fprintf(stderr, "strata mtp: pair_chain (coupled) graph captured - T=2 pair drafting uses this request's sampling parameters and penalty history (STRATA_MTP_PAIR_T2_COUPLED).\n");
+        }
+    }
+    return true;
 }
 
 bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
@@ -2372,7 +2398,7 @@ bool MtpDrafter::prepare_chain(std::string& err) {
         const int chain_n = std::min(max_t_ - 1, max_drafts_);
         for (int T = 1; T <= max_t_; ++T)
             if (!capture_chain(T, chain_n, false, err)) return false;
-        if (mtp_fused_chain_coupled_on() && coupled_ok_) {
+        if ((mtp_fused_chain_coupled_on() || mtp_pair_t2_coupled_on()) && coupled_ok_) {
             for (int T = 1; T <= max_t_; ++T)
                 if (!capture_round(T, true, err)) return false;
             for (int j = 1; j <= max_t_ - 2; ++j)
@@ -2465,8 +2491,15 @@ bool MtpDrafter::chain_pair_launch(MtpDrafter& d1, int T0, const int32_t* tok0, 
                                    int T1, const int32_t* tok1, int64_t p1, int a1, int n_out, std::string& err) {
     const OnDevice on_device(device_);
     if (!decode_ready(err) || !d1.decode_ready(err)) return false;
-    if (!mtp_pair_t2_on() || !can_pair_chain_with(d1) || window_R_ == nullptr || d1.window_R_ == nullptr) {
+    if ((!mtp_pair_t2_on() && !mtp_pair_t2_coupled_on()) || !can_pair_chain_with(d1) ||
+        coupled_active_ != d1.coupled_active_ || window_R_ == nullptr || d1.window_R_ == nullptr) {
         err = "mtp: paired chain is not available for these drafters";
+        return false;
+    }
+    if (coupled_active_ &&
+        (!coupled_ok_ || !d1.coupled_ok_ || cparams_ == nullptr || cscratch_ == nullptr || cring_ == nullptr ||
+         d1.cparams_ == nullptr || d1.cscratch_ == nullptr || d1.cring_ == nullptr)) {
+        err = "mtp: paired chain's coupled sampling is not set up";
         return false;
     }
     if (T0 < 1 || T0 > max_t_ || a0 < 0 || a0 >= T0 ||
@@ -2480,14 +2513,14 @@ bool MtpDrafter::chain_pair_launch(MtpDrafter& d1, int T0, const int32_t* tok0, 
     cudaGraphExec_t exec = nullptr;
     for (const auto& pg : pair_chain_exec_) {
         if (pg.d1 == &d1 && pg.st1 == &d1.st_ && pg.win_R1 == d1.window_R_ &&
-            pg.T0 == lT0 && pg.T1 == lT1 && pg.n_out == n_out) {
+            pg.T0 == lT0 && pg.T1 == lT1 && pg.n_out == n_out && pg.coupled == coupled_active_) {
             exec = pg.exec;
             break;
         }
     }
     if (!exec) {
-        if (!capture_pair_chain(d1, lT0, lT1, n_out, exec, err)) return false;
-        pair_chain_exec_.push_back({&d1, &d1.st_, d1.window_R_, lT0, lT1, n_out, exec});
+        if (!capture_pair_chain(d1, lT0, lT1, n_out, coupled_active_, exec, err)) return false;
+        pair_chain_exec_.push_back({&d1, &d1.st_, d1.window_R_, lT0, lT1, n_out, coupled_active_, exec});
     }
     const Clock::time_point t0 = Clock::now();
     const int64_t NH = g_->n_head;
