@@ -21358,6 +21358,12 @@ int main(int argc, char** argv) {
                     const char* v = std::getenv("STRATA_PIPED_READ_PIECE");
                     return v != nullptr ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 0;
                 }();
+                // Opt-in: apply the pre-read decode lead-in only to reads longer than this many tokens.
+                // Unset / 0 leaves the condition exactly as before.
+                static const int64_t lead_in_min_tokens = [] {
+                    const char* v = std::getenv("STRATA_PIPED_READ_LEAD_IN_MIN_TOKENS");
+                    return v != nullptr ? std::max<int64_t>(0, std::atoll(v)) : 0LL;
+                }();
                 static const int64_t byield_subchunk = [] {
                     const char* v = std::getenv("STRATA_BYIELD_SUBCHUNK");
                     return v != nullptr ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 0;
@@ -21412,7 +21418,7 @@ int main(int argc, char** argv) {
                 static Clock::time_point pr_prev_end{};
                 static bool pr_have_prev = false;
                 static double pr_prev_piece_ms = 0.0;   // the previous read's last full piece
-                if (pr_on) {
+                if (pr_on && (lead_in_min_tokens <= 0 || (b0 - a0) > lead_in_min_tokens)) {
                     const double lead =
                         pr_prev_piece_ms > 0.0
                             ? strata::program::piped_decode_budget_ms(pr_prev_piece_ms, decode_share, pr_cap, pr_floor)

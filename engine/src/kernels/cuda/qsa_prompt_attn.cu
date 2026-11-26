@@ -106,7 +106,7 @@ struct Smem {
     // after the scores (prompt_attn_kernel).  37.9 -> 29.2 KB: two blocks fit an SM's 64 KB on Turing instead of one.
     struct Rows { KElem k[CH][KROW]; VElem v[CH][VROW]; };
     struct SharedRows { union { KElem k[CH][KROW]; VElem v[CH][VROW]; }; };
-    typename std::conditional<KV_MODE == 1 && PF, SharedRows, Rows>::type kv;
+    typename std::conditional<(KV_MODE == 1 || KV_MODE == 4) && PF, SharedRows, Rows>::type kv;
     float ks[CH][NG];
     float vs[CH][NG];
     float s[16][CH + 1];
@@ -192,6 +192,34 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
     };
     if constexpr (PREFETCH) fetch(0);
 
+    // q4_0 row -> exact int8 codes + FP32 scale. Both gathers call this with the same item order and math.
+    auto q4_gather = [&](int c, int b, const uint8_t* base, int8_t* dst, float* scale) {
+        constexpr int BLKS = HD / QK4_0;
+        constexpr int BYTES = BLKS * (int) sizeof(block_q4_0);
+        const long long r = S.row[c];
+        uint4 lo = make_uint4(0, 0, 0, 0), hi = make_uint4(0, 0, 0, 0);
+        float d = 0.0f;
+        if (r >= 0) {
+            const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(base + r * BYTES) + b;
+            d = __half2float(__ushort_as_half(__ldg(&blk->d)));
+            const uint16_t* q16 = reinterpret_cast<const uint16_t*>(blk->qs);
+            uint32_t w[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                w[j] = (uint32_t) __ldg(q16 + 2 * j) | ((uint32_t) __ldg(q16 + 2 * j + 1) << 16);
+            // per byte: the low nibble minus 8 is element j, the high one minus 8 element j + 16
+            lo = make_uint4(__vsub4(w[0] & 0x0F0F0F0Fu, 0x08080808u), __vsub4(w[1] & 0x0F0F0F0Fu, 0x08080808u),
+                            __vsub4(w[2] & 0x0F0F0F0Fu, 0x08080808u), __vsub4(w[3] & 0x0F0F0F0Fu, 0x08080808u));
+            hi = make_uint4(__vsub4((w[0] >> 4) & 0x0F0F0F0Fu, 0x08080808u),
+                            __vsub4((w[1] >> 4) & 0x0F0F0F0Fu, 0x08080808u),
+                            __vsub4((w[2] >> 4) & 0x0F0F0F0Fu, 0x08080808u),
+                            __vsub4((w[3] >> 4) & 0x0F0F0F0Fu, 0x08080808u));
+        }
+        reinterpret_cast<uint4*>(dst)[0] = lo;
+        reinterpret_cast<uint4*>(dst)[1] = hi;
+        *scale = d;
+    };
+
     for (int c0 = 0; c0 < n; c0 += CH) {
         const int nh = min(CH, n - c0);
         if constexpr (PREFETCH) {
@@ -224,32 +252,19 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
             // 16-bit loads) become 32 exact int8 codes (element j in the low nibble of byte j, j + 16 in the high
             // one), its fp16 scale goes to ks/vs
             constexpr int BLKS = HD / QK4_0;
-            constexpr int BYTES = BLKS * (int) sizeof(block_q4_0);
-            for (int i = t; i < 2 * CH * BLKS; i += THREADS) {
-                const int kv = i / (CH * BLKS), rem = i % (CH * BLKS), c = rem / BLKS, b = rem % BLKS;
-                const long long r = S.row[c];
-                uint4 lo = make_uint4(0, 0, 0, 0), hi = make_uint4(0, 0, 0, 0);
-                float d = 0.0f;
-                if (r >= 0) {
-                    const block_q4_0* blk = reinterpret_cast<const block_q4_0*>((kv == 0 ? p.k_q4 : p.v_q4) + r * BYTES) + b;
-                    d = __half2float(__ushort_as_half(__ldg(&blk->d)));
-                    const uint16_t* q16 = reinterpret_cast<const uint16_t*>(blk->qs);
-                    uint32_t w[4];
-#pragma unroll
-                    for (int j = 0; j < 4; ++j)
-                        w[j] = (uint32_t) __ldg(q16 + 2 * j) | ((uint32_t) __ldg(q16 + 2 * j + 1) << 16);
-                    // per byte: the low nibble minus 8 is element j, the high one minus 8 element j + 16
-                    lo = make_uint4(__vsub4(w[0] & 0x0F0F0F0Fu, 0x08080808u), __vsub4(w[1] & 0x0F0F0F0Fu, 0x08080808u),
-                                    __vsub4(w[2] & 0x0F0F0F0Fu, 0x08080808u), __vsub4(w[3] & 0x0F0F0F0Fu, 0x08080808u));
-                    hi = make_uint4(__vsub4((w[0] >> 4) & 0x0F0F0F0Fu, 0x08080808u),
-                                    __vsub4((w[1] >> 4) & 0x0F0F0F0Fu, 0x08080808u),
-                                    __vsub4((w[2] >> 4) & 0x0F0F0F0Fu, 0x08080808u),
-                                    __vsub4((w[3] >> 4) & 0x0F0F0F0Fu, 0x08080808u));
+            if constexpr (PF) {
+                // shared K/V: only K is needed until the scores are done
+                for (int i = t; i < CH * BLKS; i += THREADS) {
+                    const int c = i / BLKS, b = i % BLKS;
+                    q4_gather(c, b, p.k_q4, &S.kv.k[c][b * QK4_0], &S.ks[c][b]);
                 }
-                int8_t* dst = kv == 0 ? &S.kv.k[c][b * QK4_0] : &S.kv.v[c][b * QK4_0];
-                reinterpret_cast<uint4*>(dst)[0] = lo;
-                reinterpret_cast<uint4*>(dst)[1] = hi;
-                (kv == 0 ? S.ks : S.vs)[c][b] = d;
+            } else {
+                for (int i = t; i < 2 * CH * BLKS; i += THREADS) {
+                    const int kv = i / (CH * BLKS), rem = i % (CH * BLKS), c = rem / BLKS, b = rem % BLKS;
+                    q4_gather(c, b, kv == 0 ? p.k_q4 : p.v_q4,
+                              kv == 0 ? &S.kv.k[c][b * QK4_0] : &S.kv.v[c][b * QK4_0],
+                              kv == 0 ? &S.ks[c][b] : &S.vs[c][b]);
+                }
             }
         } else {
             constexpr int KPIECES = HD * (int) sizeof(typename Smem<KV_MODE>::KElem) / 16;   // per K row
@@ -373,6 +388,13 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
                 *reinterpret_cast<uint4*>(reinterpret_cast<unsigned char*>(&S.kv.v[c][0]) + pc * 16) = pv[j];
             }
             if (c0 + CH < n) fetch(c0 + CH);   // the next chunk's rows, in flight while this one finishes
+        }
+        if constexpr (PF && KV_MODE == 4) {   // the scores are done with K: V goes over it before p.v
+            constexpr int BLKS = HD / QK4_0;
+            for (int i = t; i < CH * BLKS; i += THREADS) {
+                const int c = i / BLKS, b = i % BLKS;
+                q4_gather(c, b, p.v_q4, &S.kv.v[c][b * QK4_0], &S.vs[c][b]);
+            }
         }
         // online softmax: row t/8, 4 cells per thread, 8 threads per row (lanes 8r..8r+7 of a warp)
         {
@@ -2552,6 +2574,13 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
             return v != nullptr && v[0] == '1';
         }();
         if (q4_off || volta || (turing && !q4_tc) || pools.v_q4 == nullptr) return false;
+        // Opt-in: mode 4 shares its int8 K/V buffer (<32 KiB SMEM, 3 blocks/SM on sm_89).
+        // Unset / 0 keeps the exact baseline launch<4> path.
+        static const bool q4_shared_kv = [] {
+            const char* v = std::getenv("STRATA_QSA_PROMPT_ATTN_SHARED_KV");
+            return v != nullptr && v[0] == '1';
+        }();
+        if (q4_shared_kv) return launch<4, true>(q, pools, ids, steps, cap, s, attn, n_q, st);
         return launch<4>(q, pools, ids, steps, cap, s, attn, n_q, st);
     }
     if (pools.k_q != nullptr && pools.v_q4 != nullptr) {   // hybrid K8V4: int8 K + dequantized-q4 V
