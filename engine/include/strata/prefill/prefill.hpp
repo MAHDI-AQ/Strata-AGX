@@ -334,11 +334,21 @@ public:
         int64_t n = 0;
         int64_t pos0 = 0;
         std::vector<core::SessionState*> stage_ss;
+        // STRATA_BATCH_ADMIT only: report each emitted sub-chunk of THIS prompt.  `on_seg_chunk` gets the token
+        // ids [c0, c0+T); `on_seg_rows` additionally gets that chunk's final residuals and is called only on the
+        // last stage of a layer split.  Both are empty on every other path (one `if` per emitted sub-chunk).
+        std::function<void(int seg_idx, const int32_t* tok, int64_t n_tok)> on_seg_chunk;
+        std::function<bool(int seg_idx, const float* R, const int32_t* tok, int64_t n_tok, int64_t pos0, std::string& err)> on_seg_rows;
     };
     /// Several prompts in ONE layer-major pass (the streamed experts of a layer are read once for all of them).  Each
     /// prompt fills its own sessions; `on_chunk` / `on_stage_chunk` report the FIRST prompt only.  Returns false with `err`
     /// when the layer-major walk does not apply (then nothing was read; the caller reads the prompts one by one).
     bool run_multi(const std::vector<Seg>& segs, std::string& err);
+    /// STRATA_BATCH_ADMIT: the same single pass as `run_multi`, but each prompt goes straight into its own stage
+    /// sessions and `force_chunk_` is cleared across the stage chain for the duration of the read (restored after).
+    /// The fused expert layout is allowed here only; every other caller keeps the existing decline.  `ok_out[i]`
+    /// says whether segment i was read (false for a pre-validation failure, or for all segments if the pass declined).
+    bool run_batch_slots(const std::vector<Seg>& segs, std::vector<bool>& ok_out, std::string& err);
 
     bool layer_major_mid() const {
         const Prefill* p = this;
@@ -354,7 +364,7 @@ private:
     // the run, and the buffers given back after it.  `cap` (> 0): at most that many tokens (a layer split's stages
     // share one size); lm_prepare_chain sizes every stage of a split.
     int64_t lm_prepare(int64_t n, std::string& why, int64_t cap = 0);
-    int64_t lm_prepare_chain(int64_t n, std::string& why);
+    int64_t lm_prepare_chain(int64_t n, std::string& why, int64_t max_super = 0);
     void lm_release_chain();
     bool run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
     struct LmSub { int seg = 0; int64_t c0 = 0, T = 0, t0 = 0; };   ///< a sub-chunk: prompt, first token, tokens, row in the super-chunk
@@ -384,6 +394,7 @@ private:
     int64_t kva_floor_ = 0;             ///< kva_floor()
     bool pipe_chunked_ = false;         ///< a later stage: the chunks came from a --prefill-pipe plan (set likewise)
     int64_t force_chunk_ = 0;           ///< force_chunk, for the next run (0: none)
+    bool allow_fused_lm_ = false;       ///< run_batch_slots only: the fused expert layout is allowed for this read
     bool force_single_ = false, force_planned_ = false;
     bool bind_stage_helper(int64_t T);  // binds the helper's buffers for a one-chunk prompt of T tokens
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)

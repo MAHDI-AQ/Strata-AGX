@@ -1,7 +1,6 @@
 // Offline parity unit for STRATA_MTP_PAIR_T2_COUPLED: the paired T=2 chain and the two solo chains must feed the
 // coupled sampler the same Philox counter and penalty history for every output.  CPU-only, no model fixture.
 #include "strata/core/coupled_draft.hpp"
-#include "strata/core/mtp.hpp"
 #include "strata/kernels/sampler.hpp"
 
 #include <cstdio>
@@ -64,10 +63,12 @@ int main() {
 
     // STRATA_SPEC_COUPLED gives every MtpDrafter its own cudaMalloc'd dinv_, so two distinct non-null
     // pointers must still satisfy the pair-chain compatibility predicate (STRATA_MTP_PAIR_T2_COUPLED=1).
+    // MtpDrafter::dinv_compatible delegates to this same CUDA-free helper; testing it here keeps the CPU
+    // preset free of cuda_runtime.h while covering the exact predicate the pair check uses.
     int32_t dinv_a = 0, dinv_b = 0;
-    check(MtpDrafter::dinv_compatible(&dinv_a, &dinv_b), "distinct non-null dinv pointers are pair-compatible");
-    check(!MtpDrafter::dinv_compatible(nullptr, &dinv_b), "null and non-null dinv pointers are incompatible");
-    check(MtpDrafter::dinv_compatible(nullptr, nullptr), "both-null dinv pointers are pair-compatible");
+    check(coupled_dinv_compatible(&dinv_a, &dinv_b), "distinct non-null dinv pointers are pair-compatible");
+    check(!coupled_dinv_compatible(nullptr, &dinv_b), "null and non-null dinv pointers are incompatible");
+    check(coupled_dinv_compatible(nullptr, nullptr), "both-null dinv pointers are pair-compatible");
 
     std::printf("mtp_pair_t2_test: %d checks, %d failures\n", g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;

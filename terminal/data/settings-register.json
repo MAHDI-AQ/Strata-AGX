@@ -2179,6 +2179,105 @@
       "retired_in": ""
     },
     {
+      "name": "STRATA_BATCH_ADMIT",
+      "backends": [
+        "cuda-hip"
+      ],
+      "reads": [
+        {
+          "file": "engine/src/program/generate.cpp",
+          "line": 16592,
+          "backend": "cuda-hip",
+          "fn": "getenv"
+        }
+      ],
+      "parse": "flag",
+      "default_state": "off",
+      "code_default": null,
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "first_commit": "fd7ef9818",
+      "first_date": "2026-11-26",
+      "since": null,
+      "last_commit": "fd7ef9818",
+      "last_date": "2026-11-26",
+      "status": "opt-in",
+      "owner": "program",
+      "note": "Protocol-level cohort admission: opt-in multi-slot prompt read; unset or 0 keeps every default path byte-identical",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
+      "name": "STRATA_BATCH_ADMIT_MAX",
+      "backends": [
+        "cuda-hip"
+      ],
+      "reads": [
+        {
+          "file": "engine/src/program/generate.cpp",
+          "line": 16593,
+          "backend": "cuda-hip",
+          "fn": "getenv"
+        }
+      ],
+      "parse": "int",
+      "default_state": null,
+      "code_default": "8",
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "first_commit": "fd7ef9818",
+      "first_date": "2026-11-26",
+      "since": null,
+      "last_commit": "fd7ef9818",
+      "last_date": "2026-11-26",
+      "status": "opt-in",
+      "owner": "program",
+      "note": "Maximum number of slots in one BADMIT cohort; clamped to [2, 64], default 8",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
+      "name": "STRATA_BATCH_ADMIT_MAX_DELTA",
+      "backends": [
+        "cuda-hip"
+      ],
+      "reads": [
+        {
+          "file": "engine/src/program/generate.cpp",
+          "line": 16595,
+          "backend": "cuda-hip",
+          "fn": "getenv"
+        }
+      ],
+      "parse": "int",
+      "default_state": null,
+      "code_default": "2048",
+      "engine_sets": [],
+      "engine_defaults": [],
+      "launch_files": [],
+      "launch_sets": [],
+      "launch_reads": [],
+      "doc_mentions": [],
+      "first_commit": "fd7ef9818",
+      "first_date": "2026-11-26",
+      "since": null,
+      "last_commit": "fd7ef9818",
+      "last_date": "2026-11-26",
+      "status": "opt-in",
+      "owner": "program",
+      "note": "Maximum token count of a cold BGBD prompt (pfx=0); minimum 256, default 2048",
+      "retire_after": "",
+      "retired_in": ""
+    },
+    {
       "name": "STRATA_BATCH_ATTN_ROWS",
       "backends": [
         "cuda-hip",

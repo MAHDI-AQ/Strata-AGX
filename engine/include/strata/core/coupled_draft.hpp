@@ -54,6 +54,12 @@ namespace strata::core {
 /// The longest penalty window the coupled drafter mirrors (serve's kPenaltyWindowCap).
 inline constexpr int kCoupledHistCap = 4096;
 
+/// Pair-chain compatibility of the inverse-token maps: each drafter owns its own cudaMalloc'd map, so only
+/// presence must agree.  CUDA-free so the offline CPU test can exercise the predicate without cuda_runtime.h.
+inline bool coupled_dinv_compatible(const void* a, const void* b) {
+    return (a != nullptr) == (b != nullptr);
+}
+
 inline bool& coupled_draft_state() {
     static bool on = [] {
         const char* e = std::getenv("STRATA_SPEC_COUPLED");

@@ -714,6 +714,37 @@ static const char* pipe_dbg_env(const char* name) {
     return on ? std::getenv(name) : nullptr;
 }
 
+// STRATA_BATCH_ADMIT: BGBD carries an int32 binary payload exactly like BGEND, so the async reader must
+// consume its bytes as well.  One predicate for all four framing sites keeps them in step.
+static bool batch_binary_line(const std::string& l) {
+    return l.rfind("BGENB ", 0) == 0 || l.rfind("GENB ", 0) == 0 ||
+           l.rfind("BGEND ", 0) == 0 || l.rfind("BGBD ", 0) == 0;
+}
+
+// CRC32 of the first `n` int32 ids (little-endian bytes): the arithmetic BGEND has always used, lifted out
+// of the request path so a batch cohort's prefix check is bit-for-bit the same check.
+static uint32_t batch_crc32_prefix(const std::vector<int32_t>& ids, size_t n) {
+    static const std::array<uint32_t, 256> tab = []() {
+        std::array<uint32_t, 256> t{};
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; ++k) c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            t[i] = c;
+        }
+        return t;
+    }();
+    uint32_t h = 0xFFFFFFFFu;
+    const size_t n_check = std::min(n, ids.size());
+    for (size_t i = 0; i < n_check; ++i) {
+        const uint32_t uv = (uint32_t) ids[i];
+        h = tab[(h ^ (uv & 0xffu)) & 0xffu] ^ (h >> 8);
+        h = tab[(h ^ ((uv >> 8) & 0xffu)) & 0xffu] ^ (h >> 8);
+        h = tab[(h ^ ((uv >> 16) & 0xffu)) & 0xffu] ^ (h >> 8);
+        h = tab[(h ^ ((uv >> 24) & 0xffu)) & 0xffu] ^ (h >> 8);
+    }
+    return h ^ 0xFFFFFFFFu;
+}
+
 // The resident RAM mode and the adaptive tier.  A swap copies `in` (held in RAM) into the slot of `out` (held only
 // by that slot).  Before the slot is overwritten, `out`'s bytes are copied back from it into an exchange buffer, so
 // the CPU computes `out` from RAM while the swap is in flight; when the swap has landed, `commit_exchanges` moves
@@ -15738,7 +15769,7 @@ int main(int argc, char** argv) {
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 if (l == "STOP") { st->stop_req.store(true); continue; }
                 std::vector<int32_t> bin;
-                if (l.rfind("BGENB ", 0) == 0 || l.rfind("GENB ", 0) == 0 || l.rfind("BGEND ", 0) == 0) {
+                if (batch_binary_line(l)) {
                     const size_t bp = l.rfind(" bin=");
                     if (bp != std::string::npos) {
                         const size_t n_tok = (size_t) std::strtoull(l.c_str() + bp + 5, nullptr, 10);
@@ -15748,7 +15779,7 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
-                const bool is_bin_cmd = (l.rfind("BGENB ", 0) == 0 || l.rfind("GENB ", 0) == 0 || l.rfind("BGEND ", 0) == 0);
+                const bool is_bin_cmd = batch_binary_line(l);
                 std::lock_guard<std::mutex> lk(st->mu);
                 st->lines.push_back(std::move(l));
                 if (is_bin_cmd) st->bins.push_back(std::move(bin));
@@ -15766,7 +15797,7 @@ int main(int argc, char** argv) {
             if (in_lines.empty()) return false;
             out = std::move(in_lines.front());
             in_lines.pop_front();
-            if (out.rfind("BGENB ", 0) == 0 || out.rfind("GENB ", 0) == 0 || out.rfind("BGEND ", 0) == 0) {
+            if (batch_binary_line(out)) {
                 cur_bin = std::move(in_shared->bins.front());
                 in_shared->bins.pop_front();
             } else {
@@ -16556,6 +16587,13 @@ int main(int argc, char** argv) {
         const double df2_conf = [&] { const char* e = std::getenv("STRATA_BATCH_DF2_CONF"); return e != nullptr && e[0] != '\0' ? std::atof(e) : (o.draft_conf > 0.0 ? o.draft_conf : 0.35); }();
         const int df2_cap = [] { const char* e = std::getenv("STRATA_BATCH_DF2_MAXX"); return e != nullptr && e[0] != '\0' ? std::max(0, std::atoi(e)) : 99; }();
         const bool batch_df2_defer = [] { const char* e = std::getenv("STRATA_BATCH_DF2_DEFER"); return !(e != nullptr && e[0] == '0'); }();
+        // STRATA_BATCH_ADMIT (Phase 3, #112): strictly opt-in.  Unset/off keeps every path byte-identical; BADMIT is
+        // refused.  MAX clamps the cohort size to [2, 64] (default 8); MAX_DELTA bounds a cold prompt's binary payload.
+        const bool batch_admit_enabled = [] { const char* e = std::getenv("STRATA_BATCH_ADMIT"); return e != nullptr && e[0] != '\0' && e[0] != '0'; }();
+        const int batch_admit_max = [] { const char* e = std::getenv("STRATA_BATCH_ADMIT_MAX");
+            return e != nullptr && e[0] != '\0' ? std::clamp((int) std::atoi(e), 2, 64) : 8; }();
+        const int64_t batch_admit_max_delta = [] { const char* e = std::getenv("STRATA_BATCH_ADMIT_MAX_DELTA");
+            return e != nullptr && e[0] != '\0' ? std::max<int64_t>(256, (int64_t) std::atoll(e)) : 2048; }();
         // timing of the batch windows since the slots were last all idle (one stderr line then)
         double bt_run = 0, bt_commit = 0, bt_emit = 0;
         double bt_wait0 = 0, bt_pool0 = 0;
@@ -16614,7 +16652,7 @@ int main(int argc, char** argv) {
             out = std::move(in_lines.front());
             in_lines.pop_front();
             if (in_lines.empty()) in_has_lines.store(false, std::memory_order_release);
-            if (out.rfind("BGENB ", 0) == 0 || out.rfind("GENB ", 0) == 0 || out.rfind("BGEND ", 0) == 0) {
+            if (batch_binary_line(out)) {
                 cur_bin = std::move(in_shared->bins.front());
                 in_shared->bins.pop_front();
             } else {
@@ -17508,6 +17546,7 @@ int main(int argc, char** argv) {
         // STRATA_TRACE: the drain before the line in hand (an admission's first phase), and when the first rows came
         // after a batch admission (the pipeline's refill after BADM) or after a drain for another line (drain + refill)
         double line_drain_ms = 0.0, adm_drain_ms = 0.0;
+        double ba_drain_ms = 0.0;   // BADMIT only: the drain before this control line (independent of STRATA_TRACE)
         const char* rows_wait = nullptr;   // what the next rows are timed from (rows_wait_t)
         Clock::time_point rows_wait_t{};
         // STRATA_PIPED_CONCURRENT (read_part): while a prompt is read on a thread of its own, the slots' doorbells are
@@ -18416,6 +18455,7 @@ int main(int argc, char** argv) {
         bool kv_trim_done = false;
         for (;;) {
             line_drain_ms = 0.0;
+            ba_drain_ms = 0.0;
             strata::core::manifest::instance().flush_if_dirty("request");   // STRATA_MANIFEST: what the last request added (a no-op when off)
             // Between requests (nothing in flight): the park pools' upkeep, which the park and the prompt read leave alone
             const bool kv_idle_now = !batch_on() && !(piped && pipe_inflight()) && !strata::core::progress().busy.load();
@@ -18452,6 +18492,9 @@ int main(int argc, char** argv) {
                                                       return G.inflight; }) : 0;
                     const auto td = Clock::now();
                     if (!pipe_drain()) return 1;
+                    // BADMIT's trace needs the drain cost even without STRATA_TRACE.  A new variable keeps the
+                    // trace-only `line_drain_ms` (and the BGEN DONE line that reads it) byte-identical.
+                    ba_drain_ms = std::chrono::duration<double, std::milli>(Clock::now() - td).count();
                     if (pc.on()) pc.drain(line, in_flight, std::chrono::duration<double, std::milli>(Clock::now() - td).count());
                     if (trace) {   // STRATA_TRACE: what the drain before this line cost (BGEN: an admission's first phase)
                         line_drain_ms = std::chrono::duration<double, std::milli>(Clock::now() - td).count();
@@ -18519,6 +18562,336 @@ int main(int argc, char** argv) {
             if (!adapt_tick(true)) {
                 std::printf("ERR an adaptive refill failed\n");
                 return 1;
+            }
+            // ---- STRATA_BATCH_ADMIT: one control line and n BGBD tickets, read into their slots in ONE pass.
+            // pipe_drain() already ran at the top of this loop iteration (the single drain for every control line)
+            // and adapt_tick(true) just above ran once: neither is repeated per ticket.
+            if (line.rfind("BADMIT ", 0) == 0) {
+                const auto ba_t0 = Clock::now();
+                double ba_settle_ms = 0.0, ba_setup_ms = 0.0, ba_batch_ms = 0.0, ba_mtp_ms = 0.0;
+                int64_t ba_tok = 0;
+                auto badmit_err = [](const char* why) { std::printf("ERR BADMIT %s\n", why); };
+                if (!batch_admit_enabled) { badmit_err("disabled (set STRATA_BATCH_ADMIT=1)"); std::fflush(stdout); continue; }
+                const char* bp = line.c_str() + 7;
+                char* be = nullptr;
+                const long bcnt = std::strtol(bp, &be, 10);
+                if (be == bp || bcnt < 1 || bcnt > (long) batch_admit_max) {
+                    badmit_err("bad cohort size"); std::fflush(stdout); continue;
+                }
+                const size_t bn = (size_t) bcnt;
+                struct BaTicket {
+                    int b = -1;
+                    int64_t max_new = 0;
+                    int64_t pfx = 0;
+                    bool ckpt = true;          // BGBD's `ckpt=0|1` is a boolean flag, not a token offset
+                    uint64_t hash = 0;
+                    bool has_hash = false, ok = false;
+                    strata::kernels::SamplerParams sp{};
+                    std::vector<float> bias;
+                    std::vector<int64_t> all;   // full prompt ids: prefix + delta
+                    size_t delta = 0;          // number of ids read in this pass
+                    size_t chunks = 0;         // how many chunks the single pass emitted for this ticket
+                };
+                std::vector<BaTicket> tk(bn);
+                bool slots_bad = false;
+                for (size_t i = 0; i < bn; ++i) {
+                    while (*be == ' ') ++be;
+                    char* se = nullptr;
+                    const long b = std::strtol(be, &se, 10);
+                    if (se == be) { slots_bad = true; break; }
+                    be = se;
+                    if (b < 0 || b >= (long) bs.size() || bs[(size_t) b].active) slots_bad = true;
+                    tk[i].b = (int) b;
+                }
+                if (slots_bad) { badmit_err("a slot is missing or busy"); std::fflush(stdout); continue; }
+                for (size_t i = 0; i < bn && !slots_bad; ++i)
+                    for (size_t j = i + 1; j < bn; ++j)
+                        if (tk[i].b == tk[j].b) { slots_bad = true; break; }
+                if (slots_bad) { badmit_err("duplicate slot"); std::fflush(stdout); continue; }
+                // Take the n BGBD lines and their binaries together, under the reader's lock: a cohort is atomic.
+                std::vector<std::string> blines(bn);
+                std::vector<std::vector<int32_t>> bins(bn);
+                {
+                    std::unique_lock<std::mutex> lk(in_mu);
+                    auto ready = [&]() -> bool {
+                        size_t have = 0;
+                        for (const std::string& l : in_lines) {
+                            if (l.rfind("BGBD ", 0) != 0 || have == bn) break;
+                            ++have;
+                        }
+                        return have == bn;
+                    };
+                    in_cv.wait_for(lk, std::chrono::seconds(5), [&] { return ready() || in_eof; });
+                    if (!ready()) { badmit_err("missing BGBD lines"); std::fflush(stdout); continue; }
+                    for (size_t i = 0; i < bn; ++i) {
+                        blines[i] = std::move(in_lines.front()); in_lines.pop_front();
+                        bins[i] = std::move(in_shared->bins.front()); in_shared->bins.pop_front();
+                    }
+                    if (in_lines.empty()) in_has_lines.store(false, std::memory_order_release);
+                    cur_bin.clear();
+                }
+                for (size_t i = 0; i < bn; ++i) {
+                    BaTicket& t = tk[i];
+                    const std::string& s = blines[i];
+                    const char* ke = s.c_str() + 5;
+                    char* me = nullptr;
+                    // The server's producer writes `BGBD <slot> <max_new> <opts> ... bin=<n>`; the slot repeats the
+                    // one in BADMIT and must agree with it (a mismatch is a malformed cohort, not a silent mixup).
+                    const long line_slot = std::strtol(ke, &me, 10);
+                    bool bad = me == ke || line_slot != t.b;
+                    ke = me;
+                    t.max_new = std::strtoll(ke, &me, 10);
+                    bad = bad || me == ke || t.max_new < 1;
+                    float temp = 0.0f, top_p = 1.0f, min_p = 0.0f, rep = 1.0f, freq = 0.0f, present = 0.0f;
+                    int top_k = 20, pen_n = 0;
+                    unsigned long long seed = 0;
+                    std::string bias_text;
+                    while (!bad && me != nullptr && *me != '\0') {
+                        while (*me == ' ') ++me;
+                        const char* ks = me;
+                        while (*me != '\0' && *me != ' ') ++me;
+                        if (me == ks) break;
+                        const std::string kv(ks, (size_t) (me - ks));
+                        const size_t eq = kv.find('=');
+                        if (eq == std::string::npos) break;   // the ids start at the first token without '='
+                        const std::string k = kv.substr(0, eq), v = kv.substr(eq + 1);
+                        if (k == "pfx") t.pfx = std::max<int64_t>(0, std::atoll(v.c_str()));
+                        else if (k == "pfx_hash") { t.hash = std::strtoull(v.c_str(), nullptr, 16); t.has_hash = true; }
+                        else if (k == "ckpt") t.ckpt = std::atoi(v.c_str()) != 0;
+                        else if (k == "temperature") temp = std::strtof(v.c_str(), nullptr);
+                        else if (k == "top_p") top_p = std::strtof(v.c_str(), nullptr);
+                        else if (k == "top_k") top_k = std::atoi(v.c_str());
+                        else if (k == "min_p") min_p = std::strtof(v.c_str(), nullptr);
+                        else if (k == "penalty_last_n") pen_n = std::atoi(v.c_str());
+                        else if (k == "penalty_repeat") rep = std::strtof(v.c_str(), nullptr);
+                        else if (k == "penalty_freq") freq = std::strtof(v.c_str(), nullptr);
+                        else if (k == "penalty_present") present = std::strtof(v.c_str(), nullptr);
+                        else if (k == "seed") seed = std::strtoull(v.c_str(), nullptr, 10);
+                        else if (k == "logit_bias") bias_text = v;
+                        else if (k == "bin") break;
+                    }
+                    const std::vector<int32_t>& bin = bins[i];
+                    if (bad) { std::printf("ERR BADMIT_SLOT %d bad max_new\n", t.b); continue; }
+                    if (t.pfx > 0) {
+                        const std::vector<int32_t>& have = bs[(size_t) t.b].ids;
+                        if (!t.has_hash || (uint64_t) t.pfx > have.size() ||
+                            batch_crc32_prefix(have, (size_t) t.pfx) != t.hash) {
+                            std::printf("ERR BGEND_MISMATCH %d\n", t.b);   // discard only this ticket's bin
+                            continue;
+                        }
+                        t.all.assign(have.begin(), have.begin() + (size_t) t.pfx);
+                        t.all.insert(t.all.end(), bin.begin(), bin.end());
+                    } else {
+                        if (bin.empty() || (int64_t) bin.size() > batch_admit_max_delta) {
+                            std::printf("ERR BADMIT_SLOT %d bad cold prompt size\n", t.b); continue;
+                        }
+                        t.all.assign(bin.begin(), bin.end());
+                    }
+                    const int64_t n_i = (int64_t) t.all.size();
+                    t.delta = (size_t) (n_i - t.pfx);
+                    // A cold single-token prompt is valid (that token is the slot's first window); a warm ticket must
+                    // carry at least one new token.  Both fail cleanly with a per-slot ERR instead of crashing.
+                    if (n_i < 1 || (t.pfx > 0 && t.delta < 1)) {
+                        std::printf("ERR BADMIT_SLOT %d empty prompt\n", t.b); continue;
+                    }
+                    // `ckpt` is a boolean from the server (default on).  A warm prefix shorter than the slot's
+                    // live history needs a checkpoint; at the live boundary the sessions already hold the prefix.
+                    if (t.pfx > 0 && t.pfx < (int64_t) bs[(size_t) t.b].ids.size() && !t.ckpt) {
+                        std::printf("ERR BADMIT_SLOT %d checkpoint disabled\n", t.b); continue;
+                    }
+                    if (!bias_text.empty() &&
+                        !strata::core::parse_logit_bias(bias_text, (int) n_vocab, t.bias, err)) {
+                        std::printf("ERR BADMIT_SLOT %d %s\n", t.b, err.c_str()); continue;
+                    }
+                    t.sp.greedy = temp <= 0.0f;
+                    t.sp.temperature = temp; t.sp.top_p = top_p; t.sp.top_k = top_k;
+                    t.sp.seed = seed ? seed : (unsigned long long) std::chrono::steady_clock::now().time_since_epoch().count();
+                    t.sp.min_p = std::clamp(min_p, 0.0f, 1.0f);
+                    t.sp.penalty_last_n = std::max(pen_n, 0);
+                    t.sp.penalty_repeat = rep; t.sp.penalty_freq = freq; t.sp.penalty_present = present;
+                    t.sp.counter = 0;
+                    t.ok = true;
+                }
+                // `ba_parse_end` marks the end of header parsing: elapsed from ba_t0 is the parse phase; the
+                // settlement loop is timed on its own so a slow pmtp_settle is not hidden inside parse.
+                const auto ba_parse_end = Clock::now();
+                if (pmtp && !pmtp_settle()) { badmit_err("draft settlement failed"); std::fflush(stdout); continue; }
+                ba_settle_ms = std::chrono::duration<double, std::milli>(Clock::now() - ba_parse_end).count();
+                const auto ba_setup_t0 = Clock::now();
+                // Per-ticket session / drafter setup.  A failure here marks only that ticket as failed.
+                for (BaTicket& t : tk) {
+                    if (!t.ok) continue;
+                    const int b = t.b;
+                    const int64_t n_i = (int64_t) t.all.size();
+                    if (o.kv_resident > 0 && n_i > o.kv_resident) {
+                        if (!ensure_all_stages_host(b, n_i, err)) {
+                            std::printf("ERR BADMIT_SLOT %d %s\n", b, err.c_str()); t.ok = false; continue;
+                        }
+                        if (!kvg_ensure(n_i + 256, [] { cudaDeviceSynchronize(); })) {
+                            std::printf("ERR BADMIT_SLOT %d the K/V cannot grow\n", b); t.ok = false; continue;
+                        }
+                    }
+                    if (t.pfx == 0) {
+                        if (bs[(size_t) b].cached) park_slot(b);
+                        for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                            const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
+                            strata::core::session_zero(*bslot_ss[k][(size_t) b], g, nullptr, nullptr);
+                        }
+                    } else if (t.pfx < (int64_t) bs[(size_t) b].ids.size()) {
+                        // The prefix is older than the slot's live sessions: the checkpoint restore overwrites
+                        // them, so park the cached conversation first (exactly as the cold-prompt branch does).
+                        // At t.pfx == live history size nothing is overwritten and no park is needed.
+                        if (bs[(size_t) b].cached) park_slot(b);
+                        // Restore the matching checkpoint into every stage.  At t.pfx == live history size
+                        // there is nothing to restore - the sessions already hold [0 .. t.pfx) and only the
+                        // drafter's ring is rewound below.
+                        const ConvCheckpoint* cp = nullptr;
+                        for (const ConvCheckpoint& c : bs[(size_t) b].checks)
+                            if ((int64_t) c.ids.size() == t.pfx && c.stage_parts.size() == stages.size()) {
+                                cp = &c; break;
+                            }
+                        if (cp == nullptr) {
+                            std::printf("ERR BADMIT_SLOT %d no such checkpoint\n", b); t.ok = false; continue;
+                        }
+                        for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                            const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
+                            if (cudaDeviceSynchronize() != cudaSuccess ||
+                                !checkpoint_restore(k == 0 ? *cp : cp->stage_parts[k - 1],
+                                                    *bslot_ss[k][(size_t) b], g)) {
+                                std::printf("ERR BADMIT_SLOT %d checkpoint restore failed\n", b); t.ok = false; break;
+                            }
+                        }
+                        if (!t.ok) continue;
+                    }
+                    const strata::core::OnDevice on_mtp(slot_mtp[(size_t) b]->device());
+                    if (!slot_mtp[(size_t) b]->idle(err)) {
+                        std::printf("ERR BADMIT_SLOT %d %s\n", b, err.c_str()); t.ok = false; continue;
+                    }
+                    slot_mtp[(size_t) b]->kv_restore(t.pfx);
+                    slot_mtp[(size_t) b]->set_prompt_len(n_i);
+                    ver.set_slot_sampling(b, t.sp);
+                    if (batch_mtp && strata::core::mtp_pair_t2_coupled_on())
+                        slot_mtp[(size_t) b]->set_draft_sampling(t.sp);
+                    if (!ver.set_slot_logit_bias(b, t.bias, err)) {
+                        std::printf("ERR BADMIT_SLOT %d %s\n", b, err.c_str()); t.ok = false; continue;
+                    }
+                    if (plk) {
+                        strata::spec::SuffixDrafter& sx = slot_sfx[(size_t) b];
+                        sx.reset();
+                        const std::vector<int32_t> sfx(t.all.begin(), t.all.end());
+                        sx.append(sfx.data(), sfx.size());
+                    }
+                }
+                ba_setup_ms = std::chrono::duration<double, std::milli>(Clock::now() - ba_setup_t0).count();
+                // ONE layer-major pass for every readable ticket, straight into the slots' sessions.
+                std::vector<strata::prefill::Prefill::Seg> segs;
+                std::vector<size_t> seg_owner;
+                for (size_t i = 0; i < bn; ++i) {
+                    BaTicket& t = tk[i];
+                    if (!t.ok || t.delta < 2) continue;   // n_i == pfx+1: the last token is the slot's first window
+                    strata::prefill::Prefill::Seg sg;
+                    sg.tokens = t.all.data() + (size_t) t.pfx;
+                    // The last prompt token is NOT read here: it is sl.x, evaluated by the first slot window in
+                    // pump().  Prefilling it as well would double-evaluate it and push it twice into sl.ids.
+                    sg.n = (int64_t) t.delta - 1;
+                    ba_tok += sg.n;
+                    sg.pos0 = t.pfx;
+                    for (size_t k = 0; k < bslot_ss.size(); ++k) sg.stage_ss.push_back(bslot_ss[k][(size_t) t.b].get());
+                    // The token callback reports each emitted chunk; keep a per-ticket count so a failed pass can
+                    // be diagnosed without touching another ticket's state.
+                    sg.on_seg_chunk = [&tk, i](int, const int32_t*, int64_t) { ++tk[i].chunks; };
+                    sg.on_seg_rows = [&, i](int, const float* R, const int32_t*, int64_t n_tok,
+                                            int64_t pos, std::string& ce) -> bool {
+                        BaTicket& u = tk[i];
+                        if (!u.ok || R == nullptr || n_tok < 1) return true;
+                        // MTP prefill takes the token at cell+1 for each residual row.  With the last prompt
+                        // token excluded from this read, pos + n_tok <= n_i - 1 keeps every next-token lookup
+                        // inside u.all (the same shape as the request path's `nxt`).
+                        std::vector<int32_t> nxt((size_t) n_tok);
+                        for (int64_t j = 0; j < n_tok; ++j)
+                            nxt[(size_t) j] = (int32_t) u.all[(size_t) (pos + j + 1)];
+                        const auto mtp_t0 = Clock::now();
+                        const bool mtp_ok = slot_mtp[(size_t) u.b]->prefill(R, nxt.data(), n_tok, pos, ce, false);
+                        ba_mtp_ms += std::chrono::duration<double, std::milli>(Clock::now() - mtp_t0).count();
+                        if (!mtp_ok) {
+                            ce = ce.empty() ? "batch admit: slot MTP prefill failed" : ce;
+                            u.ok = false;   // only this ticket falls back
+                        }
+                        return true;
+                    };
+                    seg_owner.push_back(i);
+                    segs.push_back(std::move(sg));
+                }
+                const auto ba_batch_t0 = Clock::now();
+                if (!segs.empty()) {
+                    std::vector<bool> ok_out;
+                    std::string pe;
+                    if (!sp.run_batch_slots(segs, ok_out, pe))
+                        std::fprintf(stderr, "strata batch: batch admit read declined: %s\n", pe.c_str());
+                    for (size_t j = 0; j < seg_owner.size() && j < ok_out.size(); ++j)
+                        if (!ok_out[j]) tk[seg_owner[j]].ok = false;
+                }
+                ba_batch_ms = std::chrono::duration<double, std::milli>(Clock::now() - ba_batch_t0).count();
+                // BSTOP lines that arrived with this cohort, applied before the first window.
+                {
+                    std::lock_guard<std::mutex> lk(in_mu);
+                    for (const std::string& l : in_lines)
+                        if (l.rfind("BSTOP ", 0) == 0) {
+                            const int b = std::atoi(l.c_str() + 6);
+                            if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
+                        }
+                }
+                const double ba_ms = std::chrono::duration<double, std::milli>(Clock::now() - ba_t0).count();
+                for (BaTicket& t : tk) {
+                    if (!t.ok) { std::printf("BADM %d 0\n", t.b); continue; }
+                    BSlot& sl = bs[(size_t) t.b];
+                    std::vector<ConvCheckpoint> kept;
+                    for (ConvCheckpoint& c : sl.checks) {
+                        if ((int64_t) c.ids.size() <= t.pfx) kept.push_back(std::move(c));
+                        else if (ckpt_pool.on()) ckpt_pool.give(std::move(c));
+                    }
+                    const bool was_cvec = sl.cvec;
+                    const bool was_img = sl.img;
+                    const int64_t n_i = (int64_t) t.all.size();
+                    sl = BSlot{};
+                    // pump() evaluates sl.x in the slot's first window and pushes it onto sl.ids there, so the
+                    // stored history must stop at n_i - 1 and x must be read from t.all, not from sl.ids.
+                    sl.ids.assign(t.all.begin(), t.all.begin() + (size_t) (n_i - 1));
+                    sl.checks = std::move(kept);
+                    sl.cvec = was_cvec;
+                    sl.img = was_img;
+                    sl.active = true;
+                    sl.x = (int32_t) t.all[(size_t) (n_i - 1)];
+                    sl.p = n_i - 1;
+                    sl.produced = 0;
+                    sl.max_new = t.max_new;
+                    sl.t0 = Clock::now();
+                    sl.rd_on = false;
+                    sl.rd_ck = -1;   // batch admission sets the slot at the last prompt token; no read is pending
+                    sl.reply0 = n_i - 1;
+                    sl.pen_n = t.sp.penalty_last_n > 0 &&
+                               (t.sp.penalty_repeat != 1.0f || t.sp.penalty_freq != 0.0f || t.sp.penalty_present != 0.0f)
+                               ? std::min(t.sp.penalty_last_n, kPenaltyWindowCap) : 0;
+                    // draft_ready stays false: the slot's first window produces its first proposal (as in slot_read).
+                    std::printf("DONE 0 %lld %.1f 0.0 length 0 0 %lld 0 0 0 0 0.0 %lld 0 chunk=0 experts_streamed=0\n",
+                                (long long) n_i, ba_ms, (long long) t.pfx, (long long) t.delta);
+                    std::printf("BADM %d 1\n", t.b);
+                }
+                // One initialization pass for all newly admitted slots, then one advance.
+                for (BaTicket& t : tk)
+                    if (t.ok) { bs[(size_t) t.b].draft_ready = false; bs[(size_t) t.b].n_drafts = 1; }
+                const auto ba_pump_t0 = Clock::now();
+                if (!(piped ? pump(true) : batch_step())) return 1;
+                const double ba_pump_ms = std::chrono::duration<double, std::milli>(Clock::now() - ba_pump_t0).count();
+                const double ba_total_ms = ba_drain_ms +
+                    std::chrono::duration<double, std::milli>(Clock::now() - ba_t0).count();
+                std::fprintf(stderr, "strata batch: BADMIT n=%zu segs=%zu tok=%lld drain=%.1f settle=%.1f setup=%.1f batch=%.1f (mtp=%.1f) pump=%.1f total=%.1f\n",
+                             bn, segs.size(), (long long) ba_tok, ba_drain_ms, ba_settle_ms, ba_setup_ms,
+                             ba_batch_ms, ba_mtp_ms, ba_pump_ms, ba_total_ms);
+                std::fflush(stderr);
+                std::fflush(stdout);
+                admit_slot = -1;
+                continue;
             }
             admit_slot = -1;
             bool bdelta = false;
@@ -19024,26 +19397,8 @@ int main(int argc, char** argv) {
             std::string pe;
             bool ids_ok = false;
             if (bdelta) {
-                static const auto crc32_tab = []() {
-                    std::array<uint32_t, 256> tab{};
-                    for (uint32_t i = 0; i < 256; ++i) {
-                        uint32_t c = i;
-                        for (int k = 0; k < 8; ++k) c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-                        tab[i] = c;
-                    }
-                    return tab;
-                }();
                 const auto& sids = bs[(size_t) admit_slot].ids;
-                uint32_t h = 0xFFFFFFFFu;
-                const size_t n_check = std::min(bdelta_pfx, sids.size());
-                for (size_t i = 0; i < n_check; ++i) {
-                    const uint32_t uv = (uint32_t) sids[i];
-                    h = crc32_tab[(h ^ (uv & 0xffu)) & 0xffu] ^ (h >> 8);
-                    h = crc32_tab[(h ^ ((uv >> 8) & 0xffu)) & 0xffu] ^ (h >> 8);
-                    h = crc32_tab[(h ^ ((uv >> 16) & 0xffu)) & 0xffu] ^ (h >> 8);
-                    h = crc32_tab[(h ^ ((uv >> 24) & 0xffu)) & 0xffu] ^ (h >> 8);
-                }
-                h ^= 0xFFFFFFFFu;
+                const uint32_t h = batch_crc32_prefix(sids, bdelta_pfx);
                 if (!bdelta_has_hash || bdelta_pfx == 0 || bdelta_pfx > sids.size() || (uint64_t) h != bdelta_hash) {
                     cur_bin.clear();
                     std::printf("ERR BGEND_MISMATCH\n");

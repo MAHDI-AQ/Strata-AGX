@@ -139,6 +139,31 @@ One user alone is unchanged (73-74 tok/s). Each slot's session takes VRAM from t
 where the experts do not all fit, 16 slots cost the single-user speed (see docs above on what a slot costs).
 
 
+
+## Cohort admission (`STRATA_BATCH_ADMIT`, server, opt-in)
+
+The server can send several prompt admissions to the engine in one exchange instead of admitting each request on
+its own. This is a server-side switch and is **off by default**: with `STRATA_BATCH_ADMIT` unset or `0` the existing
+serial admission path and its wire traffic are unchanged. Cohort admission needs an engine that understands the
+`BADMIT` and `BGBD` lines; against an older engine each member falls back to the serial `BGENB` admission.
+
+| Server env var | Default | What it does |
+| --- | --- | --- |
+| `STRATA_BATCH_ADMIT` | `0` | `1` enables cohort admission. |
+| `STRATA_BATCH_ADMIT_WINDOW_MS` | `12` | How long a request holding the control lines waits for other recent arrivals to join its cohort. `0` removes the wait. |
+| `STRATA_BATCH_ADMIT_MAX` | `8` | Largest cohort, clamped to `2..64` and to the engine's slot count. |
+| `STRATA_BATCH_ADMIT_MAX_DELTA` | `2048` | Largest prompt or uncached delta a cohort member may send, clamped to at least `256`. Longer requests use the serial path. |
+
+A lone request with no other recent arrival takes the control lines without waiting and is admitted exactly as
+before: no admission ticket, no cohort header. When requests arrive close together, the one that gets the control
+lines becomes the leader. It claims one distinct free slot per member, writes one `BADMIT <n> <slot>...` line
+followed by the `n` `BGBD` frames, reads every member's `BADM` result, and releases the control lines once. The engine prints a partial `DONE` line immediately before each `BADM`; that line is admission bookkeeping, not an outcome, and the server waits for the `BADM`. A member
+whose slot already holds a matching prefix sends only the uncached tokens (`pfx=` is the held prefix length, with
+its hash); a member with no usable prefix sends its whole short prompt as `pfx=0`. If fewer than two members
+qualify, no `BADMIT` is written and every request takes the serial path. A member whose prefix check fails is
+retried alone with the full prompt, without disturbing the other slots. A client that disconnects mid-cohort sends
+`BSTOP` for its slot; that slot stays claimed until its `BDONE` arrives.
+
 ### What a slot costs, and what setup recommends
 
 Every slot's session takes VRAM that the expert cache would otherwise hold: 0.56 GiB at a 32K context with 8-bit

@@ -521,10 +521,24 @@ except ValueError:
 ADMIT_MAX_WAIT_S = _timeout_env("STRATA_ADMIT_MAX_WAIT_S", 30.0) or 0.0
 ADMIT_FIFO = os.environ.get("STRATA_ADMIT_FIFO", "0").strip() == "1"
 
+# STRATA_BATCH_ADMIT (strictly opt-in, default OFF): protocol-level cohort admission.  When off,
+# none of the values below are read by a request and the wire path is byte-identical to baseline.
+try:
+    BATCH_ADMIT = os.environ.get("STRATA_BATCH_ADMIT", "0").strip() == "1"
+    BATCH_ADMIT_WINDOW_MS = max(0, int(os.environ.get("STRATA_BATCH_ADMIT_WINDOW_MS") or 12))
+    BATCH_ADMIT_MAX = max(2, min(64, int(os.environ.get("STRATA_BATCH_ADMIT_MAX") or 8)))
+    BATCH_ADMIT_MAX_DELTA = max(256, int(os.environ.get("STRATA_BATCH_ADMIT_MAX_DELTA") or 2048))
+except ValueError:
+    BATCH_ADMIT = False
+    BATCH_ADMIT_WINDOW_MS = 12
+    BATCH_ADMIT_MAX = 8
+    BATCH_ADMIT_MAX_DELTA = 2048
+
 
 def _refresh_env_settings() -> None:
     """Re-read module-level STRATA_* globals after _main() injects cfg['env'] into os.environ."""
     global ADMIT_SHORT_FIRST, ADMIT_MAX_WAIT_S, ADMIT_FIFO
+    global BATCH_ADMIT, BATCH_ADMIT_WINDOW_MS, BATCH_ADMIT_MAX, BATCH_ADMIT_MAX_DELTA
     global STREAM_WRITE_TIMEOUT_S, ENGINE_STALL_S, VISION_READY_S, VISION_ENCODE_S, ENGINE_READY_S, PEER_STALL_S, START_RETRIES
     global COALESCE_PREFILL, COALESCE_TOKENS, COALESCE_WAIT_MS, COALESCE_MIN_REQS, COALESCE_BURST_MS
     try:
@@ -533,6 +547,16 @@ def _refresh_env_settings() -> None:
         ADMIT_SHORT_FIRST = 0
     ADMIT_MAX_WAIT_S = _timeout_env("STRATA_ADMIT_MAX_WAIT_S", 30.0) or 0.0
     ADMIT_FIFO = os.environ.get("STRATA_ADMIT_FIFO", "0").strip() == "1"
+    try:
+        BATCH_ADMIT = os.environ.get("STRATA_BATCH_ADMIT", "0").strip() == "1"
+        BATCH_ADMIT_WINDOW_MS = max(0, int(os.environ.get("STRATA_BATCH_ADMIT_WINDOW_MS") or 12))
+        BATCH_ADMIT_MAX = max(2, min(64, int(os.environ.get("STRATA_BATCH_ADMIT_MAX") or 8)))
+        BATCH_ADMIT_MAX_DELTA = max(256, int(os.environ.get("STRATA_BATCH_ADMIT_MAX_DELTA") or 2048))
+    except ValueError:
+        BATCH_ADMIT = False
+        BATCH_ADMIT_WINDOW_MS = 12
+        BATCH_ADMIT_MAX = 8
+        BATCH_ADMIT_MAX_DELTA = 2048
     STREAM_WRITE_TIMEOUT_S = float(os.environ.get("STRATA_STREAM_WRITE_TIMEOUT_S", "60") or 0)
     ENGINE_STALL_S = _timeout_env("STRATA_ENGINE_STALL_S", 90.0)
     VISION_READY_S = _timeout_env("STRATA_VISION_READY_S", 300.0)
@@ -1188,6 +1212,34 @@ class _RequestOwned:
         self._store(obj)[self.name] = value
 
 
+class AdmitTicket:
+    """STRATA_BATCH_ADMIT: one waiting request's place in a cohort.  Created and read under
+    `StrataEngine.slot_cv`; `ready_ev` is the only cross-thread wakeup a follower needs.  The leader
+    owns the control lines and sets `outcome` for every ticket before signalling it, so a follower
+    never touches `ctl` or the shared control queues itself."""
+    __slots__ = ("entry", "cancel", "prompt", "plen", "opts", "session_id", "max_new", "slot",
+                 "held_crc", "pfx", "delta_prev_len", "delta_prev_crc", "born", "state",
+                 "ready_ev", "outcome")
+
+    def __init__(self, entry, cancel, prompt, plen, opts, session_id, max_new, born):
+        self.entry = entry
+        self.cancel = cancel
+        self.prompt = prompt
+        self.plen = plen
+        self.opts = opts
+        self.session_id = session_id
+        self.max_new = max_new
+        self.slot = None
+        self.held_crc = 0
+        self.pfx = 0
+        self.delta_prev_len = 0
+        self.delta_prev_crc = None
+        self.born = born
+        self.state = "waiting"
+        self.ready_ev = threading.Event()
+        self.outcome = None
+
+
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
@@ -1486,6 +1538,7 @@ class StrataEngine:
             self.ctl = threading.Lock()                 # one admission or solo request on the control lines at a time
             self._ctl_owner = None
             self._ctl_fifo_q = collections.deque()
+            self._admit_tickets: list[AdmitTicket] = []
         self._ctl_held = False
         self._ctl_erred = False                         # #1059: the control lines ended on an ERR
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
@@ -2277,22 +2330,454 @@ class StrataEngine:
             return oldest
         return eligible[0]
 
-    def _take_control(self, cancel, plen: int, after_epoch: int | None = None, new: bool = False, prompt=None):
+    # ---- STRATA_BATCH_ADMIT: cohort admission (all of this is dead code when the flag is off) ----
+
+    def _set_admit_outcome(self, ticket, outcome: str) -> None:
+        """Publish one member's outcome; the leader is the only thread that calls this."""
+        with self.slot_cv:
+            if ticket.outcome is None:
+                ticket.outcome = outcome
+            ticket.ready_ev.set()
+            self.slot_cv.notify_all()
+
+    def _free_admit_slot(self, ticket) -> None:
+        """Give back a claimed cohort slot when its request is not continuing (BADM 0 / fallback)."""
+        with self.slot_cv:
+            if ticket.slot is not None:
+                self.slot_busy[ticket.slot] = False
+                self.slot_claims.discard(ticket.slot)
+                if ticket.slot < len(self.slot_live):
+                    self.slot_live[ticket.slot] = None
+                ticket.slot = None
+            self.slot_cv.notify_all()
+
+    def _send_batch_admit(self, records) -> None:
+        """Write `BADMIT n ...` and the n BGBD frames + binary arrays as ONE wlock section/flush.
+
+        `records` is an ordered list of (slot, header_without_bin, ids).  Exactly like BGENB/BGEND,
+        each frame's header is one text line followed by its int32 array; the whole batch is one
+        write so no other request can interleave a frame between the BADMIT and its payloads."""
+        try:
+            parts = [(int(slot), str(head), array.array("i", ids)) for slot, head, ids in records]
+            chunks = [(f"BADMIT {len(parts)} " + " ".join(str(s) for s, _, _ in parts) + "\n").encode("utf-8")]
+            for _slot, head, arr in parts:
+                chunks.append((f"{head} bin={len(arr)}\n").encode("utf-8"))
+                chunks.append(memoryview(arr))
+            with self.wlock:
+                if self.log:
+                    try:
+                        self.log.write("[strata engine cmd] BADMIT " + " ".join(h for _, h, _ in parts) + "\n")
+                        self.log.flush()
+                    except Exception:
+                        pass
+                for chunk in chunks:
+                    self.proc.stdin.buffer.write(chunk)
+                self.proc.stdin.buffer.flush()
+        except (OSError, AttributeError, ValueError):
+            if getattr(self, "closing", False):
+                raise EngineClosing("This Strata server is closing.") from None
+            raise EngineDied("The inference engine died while a batch admission was being sent.") from None
+
+    def _quarantine_admit_drain(self, tickets, born: int, lines_q, stopped_slots=None) -> None:
+        """A closed leader hands its unfinished cohort here: drain the BADMs the engine still owes,
+        stop/free the slots and wake any follower still waiting, then release ctl exactly once.
+
+        A per-slot ERR is NOT an outcome: generate.cpp still owes BADM <slot> 0 after it.  Only a
+        whole-cohort ERR cancels the whole pending set without a BADM."""
+        stopped = set(stopped_slots or ())
+
+        def work():
+            pending = {t.slot: t for t in tickets if t.slot is not None}
+            deadline = time.monotonic() + max(10.0, float(ENGINE_STALL_S or 30.0))
+            try:
+                while pending and time.monotonic() < deadline and self.alive():
+                    try:
+                        line = lines_q.get(timeout=0.5)
+                    except queue.Empty:
+                        continue
+                    if line is None:
+                        break
+                    f = line.split()
+                    if line.startswith("BADM "):
+                        try:
+                            slot = int(f[1])
+                        except (IndexError, ValueError):
+                            continue
+                        t = pending.pop(slot, None)     # consume it: nobody may read it as their own
+                        if len(f) > 2 and f[2] == "1":
+                            if t is not None and slot not in stopped:
+                                self._release_slot_when_done(slot, None, born)
+                        elif t is not None and slot not in stopped:
+                            self._free_admit_slot(t)    # a refused slot never started: no BSTOP
+                        continue
+                    if line.startswith(("ERR BADMIT_SLOT", "ERR BGEND_MISMATCH")):
+                        continue                        # its BADM 0 is still coming
+                    if line.startswith("ERR"):
+                        for t in list(pending.values()):
+                            pending.pop(t.slot)
+                            if t.slot not in stopped:
+                                self._free_admit_slot(t)
+                for t in list(pending.values()):
+                    if t.slot not in stopped:
+                        self._free_admit_slot(t)
+            finally:
+                for t in tickets:
+                    if t.outcome is None:
+                        self._set_admit_outcome(t, "serial")
+                self._release_control()                 # the ownership was handed to this thread
+
+        threading.Thread(target=work, daemon=True, name="strata-admit-quarantine").start()
+
+    def _drain_admit_outcomes(self, chosen, born, lines_q, ownership=None):
+        """Leader-only: read every cohort member's BADM from `self.lines` while holding ctl.
+
+        Per-slot ERRs (BGEND_MISMATCH / BADMIT_SLOT) are NOT outcomes: generate.cpp always emits
+        BADM <slot> 0 after them, so the line must be consumed before ctl is handed on.  A retried
+        member is re-sent as its own BGBD cohort only after that BADM, keeping its slot claimed.
+        `yield None` is the same 10 s heartbeat the other control waits use.  A closed or stalled
+        leader hands its pending BADMs, slots and ctl to the quarantine thread."""
+        pending = {t.slot: t for t in chosen}
+        cancelled_slots: set[int] = set()
+        retried: set[int] = set()
+        want_retry: set[int] = set()
+        retry_tickets: list = []
+        last_rx = beat = time.monotonic()
+        limit = max(10.0, float(ENGINE_STALL_S or 30.0))
+
+        def finish_retries():
+            """Send queued cold retries, now that every earlier BADM has been consumed."""
+            keep = []
+            for t in retry_tickets:
+                if t.cancel.is_set() or t.slot in cancelled_slots:
+                    self._free_admit_slot(t)
+                    self._set_admit_outcome(t, "cancel")
+                else:
+                    keep.append(t)
+            retry_tickets.clear()
+            want_retry.clear()
+            for t in keep:
+                retried.add(t.slot)
+                t.pfx = 0
+                t.held_crc = 0
+                t.delta_prev_len = 0
+                t.delta_prev_crc = None
+                pending[t.slot] = t
+            if keep:
+                self._send_batch_admit([(t.slot,
+                    f"BGBD {t.slot} {t.max_new}{t.opts} pfx=0 pfx_hash=00000000", t.prompt) for t in keep])
+
+        try:
+            while pending or retry_tickets:
+                if not self.alive() or self.gen != born:
+                    for t in list(pending.values()) + list(retry_tickets):
+                        self._set_admit_outcome(t, "engine_died")
+                    raise EngineDied("the engine stopped while a batch admission was being read")
+                for t in list(pending.values()):
+                    if t.cancel.is_set() and t.slot not in cancelled_slots:
+                        cancelled_slots.add(t.slot)
+                        # One BSTOP, registered once; the slot is freed at its BDONE.  Keep the
+                        # ticket in pending: its BADM is still owed on the control lines.
+                        self._release_slot_when_done(t.slot, None, born)
+                        self._set_admit_outcome(t, "cancel")
+                if not pending:
+                    finish_retries()
+                    if not pending:
+                        return
+                try:
+                    line = lines_q.get(timeout=0.5)
+                except queue.Empty:
+                    if time.monotonic() - last_rx >= limit:
+                        for t in retry_tickets:         # un-sent: no BADM is owed for these
+                            self._free_admit_slot(t)
+                            self._set_admit_outcome(t, "serial")
+                        retry_tickets.clear()
+                        want_retry.clear()
+                        if pending:
+                            if ownership is not None:
+                                ownership["handed"] = True
+                            self._quarantine_admit_drain(list(pending.values()), born, lines_q, cancelled_slots)
+                        return
+                    if time.monotonic() - beat >= 10.0:
+                        beat = time.monotonic()
+                        yield None
+                    continue
+                last_rx = beat = time.monotonic()
+                if line is None:
+                    for t in list(pending.values()) + list(retry_tickets):
+                        self._set_admit_outcome(t, "engine_died")
+                    raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                f = line.split()
+                if line.startswith("BADM "):
+                    try:
+                        slot = int(f[1])
+                    except (IndexError, ValueError):
+                        continue
+                    status = f[2] if len(f) > 2 else "0"
+                    t = pending.pop(slot, None)
+                    if t is None:
+                        continue
+                    if t.cancel.is_set() or slot in cancelled_slots:
+                        if status != "1":
+                            self._free_admit_slot(t)
+                        self._set_admit_outcome(t, "cancel")
+                    elif status == "1":
+                        self._set_admit_outcome(t, "cohort")
+                    elif slot in want_retry and slot not in retried:
+                        retry_tickets.append(t)         # keep the slot claimed for the retry
+                    else:
+                        self._free_admit_slot(t)
+                        self._set_admit_outcome(t, "serial")
+                elif line.startswith("ERR BGEND_MISMATCH"):
+                    slot = next((int(x) for x in f[1:] if x.isdigit()), None)
+                    t = pending.get(slot)
+                    if t is not None and slot not in cancelled_slots and slot not in retried \
+                            and len(t.prompt) <= BATCH_ADMIT_MAX_DELTA:
+                        want_retry.add(slot)            # no pop/free/outcome: BADM 0 follows
+                elif line.startswith("ERR BADMIT_SLOT"):
+                    continue                            # its BADM 0 is still coming
+                elif line.startswith("ERR"):
+                    self._raise_if_fatal_gpu(line)
+                    for t in retry_tickets:
+                        self._free_admit_slot(t)
+                        self._set_admit_outcome(t, "serial")
+                    retry_tickets.clear()
+                    want_retry.clear()
+                    for t in list(pending.values()):
+                        pending.pop(t.slot)
+                        if t.slot not in cancelled_slots:
+                            self._free_admit_slot(t)
+                        self._set_admit_outcome(t, "serial")
+                    return
+                elif line.startswith("DONE"):
+                    # One partial DONE immediately precedes each cohort member's BADM.
+                    try:
+                        self._parse_done(line)
+                    except (ValueError, IndexError):
+                        pass
+                    self._last_done = line
+                    continue
+        except GeneratorExit:
+            for t in retry_tickets:
+                self._free_admit_slot(t)
+                self._set_admit_outcome(t, "serial")
+            retry_tickets.clear()
+            if ownership is not None:
+                ownership["handed"] = True
+            self._quarantine_admit_drain(list(pending.values()), born, lines_q, cancelled_slots)
+            raise
+
+    def _admit_cohort(self, lead, born, lines_q, ownership=None):
+        """Leader-only generator: form a cohort under slot_cv, claim distinct slots in ONE block,
+        write BADMIT+BGBD atomically, then drain all outcomes.  Caller holds ctl and releases it
+        exactly once after this returns.  Returns True when the leader's own slot was admitted."""
+        window = BATCH_ADMIT_WINDOW_MS / 1000.0
+        started = time.monotonic()
+        deadline = started + window
+        while True:
+            with self.slot_cv:
+                cand = [t for t in self._admit_tickets
+                        if t.state == "waiting" and not t.cancel.is_set() and t.prompt is not None]
+                now = time.monotonic()
+                recent = sum(1 for ts in self.arrivals if now - ts <= window)
+                enough = len(cand) >= min(BATCH_ADMIT_MAX, max(1, self.batch))
+                if enough or now >= deadline or (len(cand) < 2 and self.waiting == 0 and recent < 2):
+                    break
+                self.slot_cv.wait(timeout=min(0.05, max(0.001, deadline - now)))
+        if ADMIT_SHORT_FIRST > 0:
+            cand.sort(key=lambda t: (0 if t.plen <= ADMIT_SHORT_FIRST else 1, t.born))
+        window_ms = (time.monotonic() - started) * 1000.0
+        claimed_at = time.monotonic()
+        chosen: list = []
+        chosen_slots: set[int] = set()
+        with self.slot_cv:
+            for t in cand[:BATCH_ADMIT_MAX]:
+                eff = self._estimate_uncached_len(t.prompt, session_id=t.session_id)
+                if eff > BATCH_ADMIT_MAX_DELTA and len(t.prompt) > BATCH_ADMIT_MAX_DELTA:
+                    continue
+                try:
+                    allow_steal = os.environ.get("STRATA_STRICT_SESSION_LEASE") != "1"
+                except Exception:
+                    allow_steal = True
+                slot = self.pick_slot(t.prompt, session_id=t.session_id, allow_lease_steal=allow_steal,
+                                      allow_nvme_promote=False)
+                if slot is None or slot in chosen_slots:
+                    continue
+                held = list(self.slot_held[slot]) if self.slot_held[slot] else []
+                pfx = len(held) if held and t.prompt[:len(held)] == held else 0
+                if len(t.prompt) - pfx > BATCH_ADMIT_MAX_DELTA:
+                    continue                            # no claim: leave t for the serial BGENB fallback
+                chosen_slots.add(slot)
+                self.slot_busy[slot] = True
+                self.slot_claims.add(slot)
+                setattr(t.cancel, "_strata_slot", slot)
+                if t.session_id:
+                    setattr(t.cancel, "_strata_session_id", t.session_id)
+                t.slot = slot
+                t.pfx = pfx
+                t.held_crc = self._get_slot_held_crc(slot, held) if pfx else 0
+                t.delta_prev_len = pfx
+                t.delta_prev_crc = t.held_crc if pfx else None
+                t.state = "claimed"
+                chosen.append(t)
+            if len(chosen) < 2:
+                for t in chosen:
+                    self.slot_busy[t.slot] = False
+                    self.slot_claims.discard(t.slot)
+                    setattr(t.cancel, "_strata_slot", None)
+                    t.slot = None
+                    self._admit_tickets.remove(t)
+                    self._set_admit_outcome(t, "serial")
+                for t in list(self._admit_tickets):
+                    self._admit_tickets.remove(t)
+                    self._set_admit_outcome(t, "serial")
+                    if getattr(t.cancel, "_strata_admit_ticket", None) is t:
+                        t.cancel._strata_admit_ticket = None
+                self.slot_cv.notify_all()
+                return False
+            records = []
+            for t in chosen:
+                head = f"BGBD {t.slot} {t.max_new}{t.opts}"
+                head += f" pfx={t.pfx} pfx_hash={t.held_crc:08x}"
+                ids = t.prompt[t.pfx:] if t.pfx else t.prompt
+                records.append((t.slot, head, ids))
+                self._admit_tickets.remove(t)
+                t.state = "sent"
+                self.slot_live[t.slot] = {"slot": t.slot, "request_id": getattr(t.cancel, "_strata_request_id", None),
+                                          "state": "reading", "prompt_tokens": len(t.prompt), "prompt_read": 0,
+                                          "generated": 0, "started": time.time(), "first_token": None,
+                                          "max_tokens": int(t.max_new) if t.max_new else None}
+                setattr(t.cancel, "_strata_held_count", len(t.prompt))
+            # Members that did not qualify (cancel, over-long delta, no free slot) must not wait
+            # for an outcome nobody will publish: send them straight back to the serial path.
+            for t in list(self._admit_tickets):
+                self._admit_tickets.remove(t)
+                self._set_admit_outcome(t, "serial")
+                if getattr(t.cancel, "_strata_admit_ticket", None) is t:
+                    t.cancel._strata_admit_ticket = None
+            self.slot_cv.notify_all()
+        claim_ms = (time.monotonic() - claimed_at) * 1000.0
+        for t in chosen:                                # a previous request's BT/BDONE must not be read as this one's
+            while not self.slot_q[t.slot].empty():
+                self.slot_q[t.slot].get_nowait()
+        sent_at = time.monotonic()
+        self._send_batch_admit(records)
+        send_ms = (time.monotonic() - sent_at) * 1000.0
+        with self.slot_cv:
+            for t in chosen:
+                self._set_slot_held(t.slot, [])
+        drained_at = time.monotonic()
+        yield from self._drain_admit_outcomes(chosen, born, lines_q, ownership)
+        drain_ms = (time.monotonic() - drained_at) * 1000.0
+        # One line per formed cohort (n >= 2 here): the Stage-2 TTFT breakdown.
+        note = (f"[strata batch admit] n={len(chosen)} slots={[t.slot for t in chosen]} "
+                f"pfx={[t.pfx for t in chosen]} deltas={[len(t.prompt) - t.pfx for t in chosen]} "
+                f"window_ms={window_ms:.2f} claim_ms={claim_ms:.2f} "
+                f"send_ms={send_ms:.2f} drain_ms={drain_ms:.2f}")
+        if getattr(self, "log", None) is not None:
+            try:
+                self.log.write(note + "\n")
+                self.log.flush()
+            except Exception:
+                print(note, flush=True)
+        else:
+            print(note, flush=True)
+        return lead.outcome == "cohort"
+
+    def _take_control(self, cancel, plen: int, after_epoch: int | None = None, new: bool = False, prompt=None,
+                      max_new: int = 1, admit_opts: str = ""):
         """Waits for the control lines (one prompt read at a time), yielding None heartbeats; False when cancelled.
         `after_epoch`: a request whose read gave way lets the requests waiting then go first.
         `new`: the request's first admission (STRATA_ADMIT_SHORT_FIRST orders only these)."""
+        # A later leg of the same request reuses this cancel Event.  A ticket from an earlier
+        # cohort must never make it look already admitted: that would skip the BGEN and leak ctl.
+        cancel._strata_admit_ticket = None
+        born = getattr(self, "gen", 0)
+        cohort_claimed = False
+        ticket = None
+        lines_q = getattr(self, "lines", None)
+        # STRATA_BATCH_ADMIT c=1 fast path: no other recent arrival and nobody waiting.  No cohort,
+        # no AdmitTicket, no BADMIT, no slot_cv wait - the solo/serial wire path is unchanged.
+        if (BATCH_ADMIT and not ADMIT_FIFO and new
+                and prompt is not None and lines_q is not None):
+            now = time.monotonic()
+            with self.slot_cv:
+                recent = sum(1 for t in self.arrivals if now - t <= BATCH_ADMIT_WINDOW_MS / 1000.0)
+                waiting = self.waiting
+            if waiting == 0 and recent < 2 and self.ctl.acquire(blocking=False):
+                if cancel.is_set():
+                    self.ctl.release()
+                    return False
+                if not self.alive() and not getattr(self, "starting", False):
+                    self.ctl.release()
+                    raise EngineDied("the engine stopped while this request waited; it was not sent")
+                with self.slot_cv:
+                    self.arrivals.append(time.monotonic())
+                    self.ctl_epoch += 1
+                    self.slot_cv.notify_all()
+                return True
         entry = [plen, time.monotonic(), new, prompt, cancel, after_epoch]  # (length, arrival, ordered, prompt, cancel, after_epoch)
         use_fifo = ADMIT_FIFO
         with self.slot_cv:
             self.waiting += 1
             self.wait_lens.append(entry)
             self.arrivals.append(entry[1])
+            if (BATCH_ADMIT and not ADMIT_FIFO and new
+                    and prompt is not None and lines_q is not None):
+                ticket = AdmitTicket(entry, cancel, list(prompt), plen, admit_opts,
+                                     getattr(cancel, "_strata_session_id", None), max_new, born)
+                self._admit_tickets.append(ticket)
+                setattr(cancel, "_strata_admit_ticket", ticket)
+                self.slot_cv.notify_all()
+
             if use_fifo:
                 fifo_q = self.__dict__.setdefault("_ctl_fifo_q", collections.deque())
                 fifo_q.append(entry)
         beat = time.monotonic()
         try:
             while True:
+                # STRATA_BATCH_ADMIT: a cohort member never blocks in ctl.acquire(timeout=...).
+                # The leader acquired ctl nonblocking; followers sleep on their ticket's event and
+                # wake only when the leader has published every outcome.  A fallback member drops
+                # its ticket and joins the normal serial path below.
+                if ticket is not None:
+                    outcome = ticket.outcome
+                    if outcome == "cohort":
+                        with self.slot_cv:
+                            if ticket in self._admit_tickets:
+                                self._admit_tickets.remove(ticket)
+                            self.ctl_epoch += 1
+                            self.slot_cv.notify_all()
+                        cohort_claimed = True
+                        return True
+                    if outcome == "cancel":
+                        return False
+                    if outcome == "engine_died":
+                        raise EngineDied("the engine stopped while this request waited; it was not sent")
+                    if outcome == "serial":
+                        if getattr(cancel, "_strata_admit_ticket", None) is ticket:
+                            cancel._strata_admit_ticket = None
+                        ticket = None
+                    elif self.ctl.acquire(blocking=False):
+                        ownership = {"handed": False}  # a closed drain may hand ctl to quarantine
+                        try:
+                            yield from self._admit_cohort(ticket, born, lines_q, ownership)
+                        finally:
+                            if not ownership["handed"]:
+                                self._release_control()   # exactly once, by the leader
+                        continue
+                    else:
+                        ticket.ready_ev.wait(timeout=0.25)   # bounded: cancel / engine death still checked
+                        if cancel.is_set():
+                            return False
+                        if not self.alive() and not getattr(self, "starting", False):
+                            raise EngineDied("the engine stopped while this request waited; it was not sent")
+                        deadline = getattr(cancel, "_strata_queue_deadline", None)
+                        if deadline is not None and time.monotonic() >= deadline:
+                            raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
+                        if time.monotonic() - beat >= 10.0:
+                            beat = time.monotonic()
+                            yield None
+                        continue
                 deadline = getattr(cancel, "_strata_queue_deadline", None)
                 if deadline is not None and time.monotonic() >= deadline:
                     raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
@@ -2369,6 +2854,15 @@ class StrataEngine:
                     fifo_q.remove(entry)
                 if use_fifo or (previous_waiting > 1 and self.waiting <= 1) or (new and ADMIT_SHORT_FIRST > 0):
                     # a waiter that leaves (cancelled, closed) can make another one the next in turn: tell it
+                    self.slot_cv.notify_all()
+                if ticket is not None:
+                    if ticket in self._admit_tickets:
+                        self._admit_tickets.remove(ticket)
+                    if ticket.outcome is None:
+                        ticket.outcome = "serial"
+                        ticket.ready_ev.set()
+                    if not cohort_claimed and getattr(cancel, "_strata_admit_ticket", None) is ticket:
+                        cancel._strata_admit_ticket = None
                     self.slot_cv.notify_all()
         with self.slot_cv:
             self.ctl_epoch += 1
@@ -2585,16 +3079,29 @@ class StrataEngine:
         if session_id:
             setattr(cancel, "_strata_session_id", session_id)
         eff_plen = self._estimate_uncached_len(prompt, session_id=session_id)
-        ok = yield from self._take_control(cancel, eff_plen, new=True,
-                                           prompt=prompt if (COALESCE_PREFILL > 1 and not embeddings) else None)
+        admit_opts = ""
+        if BATCH_ADMIT and not embeddings and not want_lp:
+            admit_opts = (f"{leg_keys()}{self.pen_from_key(orig_len, len(prompt))}"
+                          f"{' slot_read=1' if self.slot_read else ''}")
+        ok = yield from self._take_control(
+            cancel, eff_plen, new=True,
+            prompt=prompt if ((COALESCE_PREFILL > 1 or BATCH_ADMIT) and not embeddings and not want_lp) else None,
+            max_new=left, admit_opts=admit_opts)
         if not ok:
             self._release_preslot(cancel)
             return
-        holding, born = True, self.gen                  # (the engine it now has the control lines of)
+        admit_ticket = getattr(cancel, "_strata_admit_ticket", None)
+        cancel._strata_admit_ticket = None          # consumed by this leg; a later leg starts clean
+        in_cohort = bool(admit_ticket is not None and admit_ticket.outcome == "cohort")
+        skip_take = in_cohort
+        holding = not in_cohort                         # leader released ctl once; followers never held it
+        born = self.gen                                 # (the engine that took the control lines)
         lines_q, sq = getattr(self, "lines", None), getattr(self, "slot_q", None)           # #4451: ... and its queues; a restart makes new ones, and a request
         #                                                 of the old process must never read (or answer on) the new ones
         btrace("ctl acquired")
         slot, gen0, reserved = None, None, None
+        if in_cohort:                                   # slot already claimed by the cohort leader
+            slot = admit_ticket.slot
         pre = getattr(cancel, "_strata_preslot", None)
         if pre is not None:                             # STRATA_COALESCE_PREFILL: a request before this one read the prompt into this slot
             slot, cancel._strata_preslot = pre, None
@@ -2606,12 +3113,13 @@ class StrataEngine:
         try:
             while True:   # a request in a slot that is left alone goes back to the solo path
                 eff_plen = self._estimate_uncached_len(prompt, session_id=session_id)
-                if not holding:
+                if not holding and not skip_take:
                     ok = yield from self._take_control(cancel, eff_plen)
                     if not ok:
                         return
                     holding, born = True, self.gen                  # (the engine it now has the control lines of)
                     lines_q, sq = getattr(self, "lines", None), getattr(self, "slot_q", None)           # (it holds no slot of the engine before: nothing to lose)
+                skip_take = False
                 with self.slot_cv:
                     alone = not any(self.slot_busy) and self.waiting == 0
                 solo_allowed = (os.environ.get("STRATA_PARALLEL_SOLO") != "0" and
@@ -2761,132 +3269,158 @@ class StrataEngine:
                             holding = True
                             raise EngineDied("the engine restarted while this request waited for it; it was not completed")
                         holding, born = True, self.gen                  # (the engine it now has the control lines of)
-                    while not sq[slot].empty():
-                        sq[slot].get_nowait()
-                    pf = self.pen_from_key(orig_len, len(prompt))
-                    sr = " slot_read=1" if self.slot_read else ""    # (the engine may answer without a token: adm_from)
-                    head = (f"BGENI {slot} {left}{leg_keys()}{pf} {embeddings}" if embeddings
-                            else f"BGEN {slot} {left}{leg_keys()}{pf}{sr}")
-                    live = {"slot": slot, "request_id": getattr(cancel, "_strata_request_id", None),
-                            "state": "reading", "prompt_tokens": len(prompt), "prompt_read": 0, "generated": 0,
-                            "started": time.time(), "first_token": None,
-                            "max_tokens": int(max_new) if max_new else None}
-                    deadline = getattr(cancel, "_strata_queue_deadline", None)
-                    if deadline is not None and time.monotonic() >= deadline:
-                        raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
-                    self.slot_live[slot] = live
-                    setattr(cancel, "_strata_held_count", len(prompt))
-                    self._last_done = None                  # (#879: this admission's DONE decides below)
-                    if COALESCE_PREFILL > 1 and not embeddings:
-                        self._coalesce(cancel, prompt, eff_plen)
-                    held_snap = list(self.slot_held[slot]) if self.slot_held[slot] else []
-                    can_delta = (
-                        not embeddings
-                        and os.environ.get("STRATA_BINARY_IPC", "0") == "1"
-                        and os.environ.get("STRATA_IPC_DELTA", "0") == "1"
-                        and array.array("i").itemsize == 4
-                        and len(held_snap) > 0
-                        and len(prompt) > len(held_snap)
-                        and prompt[:len(held_snap)] == held_snap
-                    )
-                    delta_prev_len = 0
-                    delta_prev_crc = None
-                    if can_delta:
-                        h = self._get_slot_held_crc(slot, held_snap)
-                        delta_prev_len = len(held_snap)
-                        delta_prev_crc = h
-                        dhead = head.replace("BGEN ", "BGEND ", 1) + f" pfx={len(held_snap)} pfx_hash={h:08x}"
-                        self._send_bin(dhead, prompt[len(held_snap):])
-                    elif not embeddings and os.environ.get("STRATA_BINARY_IPC", "0") == "1" and array.array("i").itemsize == 4:
-                        self._send_bin(head.replace("BGEN ", "BGENB ", 1), prompt)
-                    else:
-                        self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
-                    if deadline is not None:
-                        cancel._strata_queue_deadline = None
-                    started = getattr(cancel, "_strata_queue_started", None)
-                    if started is not None:
-                        started()
-                    self._set_slot_held(slot, [])           # the admission overwrites what the slot held
-                    adm_from = len(out)                     # (the admission's own token comes after these)
-                    admission_pending, admission_before = True, self.last
-                    phase = "admit"
-                    self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
-                    self._ctl_erred = False
-                    asked = False
-
-                    def ask():        # as give_way above, for the slot this admission reads into
-                        nonlocal asked
-                        if (not asked and not embeddings and yields < self.YIELDS_MAX and
-                                self._shorter_waiting(max(1, eff_plen - (self.progress[0] if self.progress else 0)))):
-                            self._send_for(born, f"BYIELD {slot}")
-                            asked = True
-
-                    def note_progress():
-                        # the terminal layer's live prompt counter (the batch admission path)
-                        if self.progress and live["state"] == "reading":
-                            live["prompt_read"] = self.progress[0]
-                    try:
-                        for x in self._control(cancel, pending.append, on_quiet=lambda: (ask(), note_progress()),
-                                               want_lp=want_lp, **({"lines_q": lines_q} if lines_q is not None else {})):
-                            while pending:
-                                t = pending.pop(0)
-                                out.append(t)
-                                yield t
-                            if x is None:
-                                ask()
-                                note_progress()
-                                yield None
-                    except ValueError as e:
-                        if can_delta and "BGEND_MISMATCH" in str(e):
-                            self._ctl_erred = False
+                    if not in_cohort:
+                        while not sq[slot].empty():
+                            sq[slot].get_nowait()
+                        pf = self.pen_from_key(orig_len, len(prompt))
+                        sr = " slot_read=1" if self.slot_read else ""    # (the engine may answer without a token: adm_from)
+                        head = (f"BGENI {slot} {left}{leg_keys()}{pf} {embeddings}" if embeddings
+                                else f"BGEN {slot} {left}{leg_keys()}{pf}{sr}")
+                        live = {"slot": slot, "request_id": getattr(cancel, "_strata_request_id", None),
+                                "state": "reading", "prompt_tokens": len(prompt), "prompt_read": 0, "generated": 0,
+                                "started": time.time(), "first_token": None,
+                                "max_tokens": int(max_new) if max_new else None}
+                        deadline = getattr(cancel, "_strata_queue_deadline", None)
+                        if deadline is not None and time.monotonic() >= deadline:
+                            raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
+                        self.slot_live[slot] = live
+                        setattr(cancel, "_strata_held_count", len(prompt))
+                        self._last_done = None                  # (#879: this admission's DONE decides below)
+                        if COALESCE_PREFILL > 1 and not embeddings:
+                            self._coalesce(cancel, prompt, eff_plen)
+                        held_snap = list(self.slot_held[slot]) if self.slot_held[slot] else []
+                        can_delta = (
+                            not embeddings
+                            and os.environ.get("STRATA_BINARY_IPC", "0") == "1"
+                            and os.environ.get("STRATA_IPC_DELTA", "0") == "1"
+                            and array.array("i").itemsize == 4
+                            and len(held_snap) > 0
+                            and len(prompt) > len(held_snap)
+                            and prompt[:len(held_snap)] == held_snap
+                        )
+                        delta_prev_len = 0
+                        delta_prev_crc = None
+                        if can_delta:
+                            h = self._get_slot_held_crc(slot, held_snap)
+                            delta_prev_len = len(held_snap)
+                            delta_prev_crc = h
+                            dhead = head.replace("BGEN ", "BGEND ", 1) + f" pfx={len(held_snap)} pfx_hash={h:08x}"
+                            self._send_bin(dhead, prompt[len(held_snap):])
+                        elif not embeddings and os.environ.get("STRATA_BINARY_IPC", "0") == "1" and array.array("i").itemsize == 4:
                             self._send_bin(head.replace("BGEN ", "BGENB ", 1), prompt)
-                            try:
-                                for x in self._control(cancel, pending.append, on_quiet=lambda: (ask(), note_progress()),
-                                                       want_lp=want_lp, **({"lines_q": lines_q} if lines_q is not None else {})):
-                                    while pending:
-                                        t = pending.pop(0)
-                                        out.append(t)
-                                        yield t
-                                    if x is None:
-                                        ask()
-                                        note_progress()
-                                        yield None
-                                e = None
-                            except ValueError as e2:
-                                e = e2
-                        if e is not None:
-                            if not (self._ctl_erred and str(e).startswith("BGEN:") and left >= 1 and not cancel.is_set()):
-                                raise
-                            refused += 1
-                            print(f"[strata] parallel: the engine refused slot {slot} ({e}); trying another slot "
-                                  f"({refused}/{self.BGEN_REFUSALS_MAX}) (issue #1994)", flush=True)
-                            if refused > self.BGEN_REFUSALS_MAX:
-                                raise GpuBusy("the engine's batch slots are not free right now; try again in a moment",
-                                          retry_after=5) from e
-                            self.slot_live[slot] = None
-                            self._set_slot_held(slot, [])
-                            phase = "none"
-                            self._ctl_erred = False
-                            self._park_slot(slot)
-                            slot = None
-                            continue
-                    cont = bool(self._ctl_result and self._ctl_result[1])
-                    admission_pending = cont
-                    phase = "slot" if cont else "none"
-                    while pending:
-                        t = pending.pop(0)
-                        out.append(t)
-                        yield t
-                    if not cont and self._done_finish() == "nonfinite":   # #879
-                        raise EngineNonFinite("the engine's logits became non-finite (#879)")
-                    if not cont:
-                        self._raise_if_closed_under(self._done_finish(), cancel)   # #6055
-                    if not cont and self._yielded is not None and self._yielded[0] == slot and not cancel.is_set():
-                        yielded_legs.append(self.last)
-                        continue                            # gave way: again once the shorter request is in
-                    break
-                self._release_control()
-                holding = False
+                        else:
+                            self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
+                        if deadline is not None:
+                            cancel._strata_queue_deadline = None
+                        started = getattr(cancel, "_strata_queue_started", None)
+                        if started is not None:
+                            started()
+                        self._set_slot_held(slot, [])           # the admission overwrites what the slot held
+                        adm_from = len(out)                     # (the admission's own token comes after these)
+                        admission_pending, admission_before = True, self.last
+                        phase = "admit"
+                        self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
+                        self._ctl_erred = False
+                        asked = False
+
+                        def ask():        # as give_way above, for the slot this admission reads into
+                            nonlocal asked
+                            if (not asked and not embeddings and yields < self.YIELDS_MAX and
+                                    self._shorter_waiting(max(1, eff_plen - (self.progress[0] if self.progress else 0)))):
+                                self._send_for(born, f"BYIELD {slot}")
+                                asked = True
+
+                        def note_progress():
+                            # the terminal layer's live prompt counter (the batch admission path)
+                            if self.progress and live["state"] == "reading":
+                                live["prompt_read"] = self.progress[0]
+                        try:
+                            for x in self._control(cancel, pending.append, on_quiet=lambda: (ask(), note_progress()),
+                                                   want_lp=want_lp, **({"lines_q": lines_q} if lines_q is not None else {})):
+                                while pending:
+                                    t = pending.pop(0)
+                                    out.append(t)
+                                    yield t
+                                if x is None:
+                                    ask()
+                                    note_progress()
+                                    yield None
+                        except ValueError as e:
+                            if can_delta and "BGEND_MISMATCH" in str(e):
+                                self._ctl_erred = False
+                                self._send_bin(head.replace("BGEN ", "BGENB ", 1), prompt)
+                                try:
+                                    for x in self._control(cancel, pending.append, on_quiet=lambda: (ask(), note_progress()),
+                                                           want_lp=want_lp, **({"lines_q": lines_q} if lines_q is not None else {})):
+                                        while pending:
+                                            t = pending.pop(0)
+                                            out.append(t)
+                                            yield t
+                                        if x is None:
+                                            ask()
+                                            note_progress()
+                                            yield None
+                                    e = None
+                                except ValueError as e2:
+                                    e = e2
+                            if e is not None:
+                                if not (self._ctl_erred and str(e).startswith("BGEN:") and left >= 1 and not cancel.is_set()):
+                                    raise
+                                refused += 1
+                                print(f"[strata] parallel: the engine refused slot {slot} ({e}); trying another slot "
+                                      f"({refused}/{self.BGEN_REFUSALS_MAX}) (issue #1994)", flush=True)
+                                if refused > self.BGEN_REFUSALS_MAX:
+                                    raise GpuBusy("the engine's batch slots are not free right now; try again in a moment",
+                                              retry_after=5) from e
+                                self.slot_live[slot] = None
+                                self._set_slot_held(slot, [])
+                                phase = "none"
+                                self._ctl_erred = False
+                                self._park_slot(slot)
+                                slot = None
+                                continue
+                        cont = bool(self._ctl_result and self._ctl_result[1])
+                        admission_pending = cont
+                        phase = "slot" if cont else "none"
+                        while pending:
+                            t = pending.pop(0)
+                            out.append(t)
+                            yield t
+                        if not cont and self._done_finish() == "nonfinite":   # #879
+                            raise EngineNonFinite("the engine's logits became non-finite (#879)")
+                        if not cont:
+                            self._raise_if_closed_under(self._done_finish(), cancel)   # #6055
+                        if not cont and self._yielded is not None and self._yielded[0] == slot and not cancel.is_set():
+                            yielded_legs.append(self.last)
+                            continue                            # gave way: again once the shorter request is in
+                        break
+                    else:
+                        # The leader wrote this member's BGBD and drained its BADM.  Enter directly at
+                        # phase="slot"; this thread never touches ctl or the shared control lines.
+                        delta_prev_len = admit_ticket.delta_prev_len
+                        delta_prev_crc = admit_ticket.delta_prev_crc
+                        adm_from = len(out)
+                        admission_pending = True
+                        phase = "slot"
+                        self._ctl_mode, self._ctl_result, self._yielded = "batch", (0, True), None
+                        self._ctl_erred = False
+                        cont = True
+                        live = {"slot": slot, "request_id": getattr(cancel, "_strata_request_id", None),
+                                "state": "reading", "prompt_tokens": len(prompt), "prompt_read": 0,
+                                "generated": 0, "started": time.time(), "first_token": None,
+                                "max_tokens": int(max_new) if max_new else None}
+                        self.slot_live[slot] = live
+                        admission_before = self.last
+                        deadline = getattr(cancel, "_strata_queue_deadline", None)
+                        if deadline is not None:
+                            cancel._strata_queue_deadline = None
+                        started = getattr(cancel, "_strata_queue_started", None)
+                        if started is not None:
+                            started()
+                        break
+                if holding:
+                    self._release_control()
+                    holding = False
                 if not cont:
                     return
                 # slot_read: a turn read in the slot itself has no admission token - the slot's first BT is the reply's first
@@ -2988,6 +3522,7 @@ class StrataEngine:
                             break
                         return
         finally:
+            cancel._strata_admit_ticket = None      # no cohort ticket may outlive its leg
             # a consumer that left early (or an error): keep the engine and this server in step
             btrace("finally phase", phase, "slot", slot, "holding", holding)
             same = self.gen == born                     # #4451: the slot state below is this engine's; after a restart it is the NEW
@@ -3134,9 +3669,12 @@ class StrataEngine:
             return 0
         return i
 
-    def pick_slot(self, prompt: list[int], session_id: str | None = None, allow_lease_steal: bool = True) -> int | None:
+    def pick_slot(self, prompt: list[int], session_id: str | None = None, allow_lease_steal: bool = True,
+                  allow_nvme_promote: bool = True) -> int | None:
         """A free slot for `prompt` (the caller holds slot_cv): direct lease affinity if session_id is active,
-        else unleased free slot, prioritizing longest held prefix. None: every slot is busy."""
+        else unleased free slot, prioritizing longest held prefix. None: every slot is busy.
+        `allow_nvme_promote=False` (cohort admission) keeps a slow NVMe promotion out of the slot_cv
+        critical section; the request is admitted cold into a free slot instead of stalling the cohort."""
         if hasattr(self, "session_leases"):
             self.session_leases.cleanup_expired()
 
@@ -3194,7 +3732,7 @@ class StrataEngine:
 
             # Check Tier 2 (RAM) or Tier 3 (NVMe)
             tier, sdata = self.session_leases.get_session_tier(session_id)
-            if tier == "nvme":
+            if tier == "nvme" and allow_nvme_promote:
                 active_leases = self.session_leases.get_leased_slots() if hasattr(self, "session_leases") else {}
                 unleased_free = [b for b in free if b not in active_leases or (session_id and active_leases[b] == session_id)]
                 if not unleased_free and not allow_lease_steal:

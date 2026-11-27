@@ -19,6 +19,7 @@
 //   * all 512 routed experts live in VRAM (708 MB) and run through the grouped hit kernels.
 #pragma once
 
+#include "strata/core/coupled_draft.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/pinned_ring.hpp"
 #include "strata/core/session.hpp"
@@ -200,9 +201,7 @@ public:
                       int n_early, std::string& err);
     /// STRATA_MTP_PAIR_T2=1: pair two same-device pipelined slot drafters into one T=2 asynchronous chain.
     /// STRATA_SPEC_COUPLED allocates one inverse token map per drafter, so only presence must agree, not identity.
-    static bool dinv_compatible(const void* a, const void* b) {
-        return (a != nullptr) == (b != nullptr);
-    }
+    static bool dinv_compatible(const void* a, const void* b) { return coupled_dinv_compatible(a, b); }
     bool can_pair_chain_with(const MtpDrafter& d1) const {
         return this != &d1 && device_ == d1.device_ &&
                n_dvocab_ == d1.n_dvocab_ && dvocab_ == d1.dvocab_ && dinv_compatible(dinv_, d1.dinv_) &&

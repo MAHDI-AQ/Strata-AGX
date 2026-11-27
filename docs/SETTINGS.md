@@ -10,7 +10,7 @@ debugging and are kept in `terminal/data/settings-register.json`.
 A number or a word is set like any environment variable, for example `STRATA_KVA=1`. In the Terminal, `strata launch --set NAME=value`
 puts it in the model's run configuration.
 
-## Switches you can turn on (376)
+## Switches you can turn on (380)
 
 Off unless you set them. The last column says where each one is described.
 
@@ -34,6 +34,9 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_ATTN_SPLIT_HEAD` | number | NVIDIA and AMD | - |
 | `STRATA_AUX_CPUS` | text | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_AUX_STAGER` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md), [README.md](bench-results/2026-10-08-community-2x-rtx3080-20gb-ud-q4-k-xl-512k-pool/README.md) |
+| `STRATA_BATCH_ADMIT` | on / off | NVIDIA and AMD | - |
+| `STRATA_BATCH_ADMIT_MAX` | number | NVIDIA and AMD | - |
+| `STRATA_BATCH_ADMIT_MAX_DELTA` | number | NVIDIA and AMD | - |
 | `STRATA_BATCH_DECODE_SHARE` | number | NVIDIA and AMD, Intel Arc | [BATCHING.md](BATCHING.md) |
 | `STRATA_BATCH_DOORBELL` | text | NVIDIA and AMD | [SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md](SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md) |
 | `STRATA_BATCH_GRAPH_CAP` | number | NVIDIA and AMD | [SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md](SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md) |

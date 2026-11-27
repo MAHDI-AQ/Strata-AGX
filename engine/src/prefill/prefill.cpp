@@ -8393,7 +8393,9 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
             if (f.tail_off || mmq::fp4_activations(f.gu_type)) { why = "an NVFP4 layer"; return 0; }
         }
     }
-    if (m.fused_bufs) { why = "the fused expert layout"; return 0; }
+    // STRATA_BATCH_ADMIT (#112): the layer-major walk has its own fused-layer path (lm_fused_layer / lb.xa); the
+    // chunk-major `m.fused_bufs` flag only barred it here.  Only run_batch_slots lifts the bar for this read.
+    if (m.fused_bufs && !allow_fused_lm_) { why = "the fused expert layout"; return 0; }
     if (!m.GU || !m.Dm || (n_mmq > 0 && !m.ids_identity)) { why = "the MoE buffers are missing"; return 0; }
     // (an explicit STRATA_PREFILL_LM_TOKENS may be one chunk: the A/B against the default path, experts aside)
     const int64_t min_s = (lm_force_ || lm_force_env()) ? 1 : (lm_tokens_env() > 0 ? m.T : 2 * m.T);   // (lm_force_: run_multi - several prompts, however short)
@@ -8492,7 +8494,9 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
 }
 
 // A layer split: every stage gets the same super-chunk (the smallest any of them fits), re-sized until they agree.
-int64_t Prefill::lm_prepare_chain(int64_t n, std::string& why) {
+// `max_super` (0 by default): cap the super-chunk so a layer split can overlap several of them instead of
+// reading a whole cohort in one serial pass.  Every existing caller passes 0 and keeps its exact sizing.
+int64_t Prefill::lm_prepare_chain(int64_t n, std::string& why, int64_t max_super) {
     // a later stage's hand_in_ still points at the last chunk a chunk-major prompt handed it (run_impl never clears it):
     // with no hand-off in flight that is stale, not in use (a short prompt first would otherwise turn layer-major off
     // for every later prompt)
@@ -8507,7 +8511,7 @@ int64_t Prefill::lm_prepare_chain(int64_t n, std::string& why) {
         p->hand_ev_ = nullptr;
         p->hand_pieces_ = 0;
     }
-    int64_t cap = 0;
+    int64_t cap = max_super;
     for (int round = 0; round < 4; ++round) {
         bool same = true;
         for (Prefill* p = this; p != nullptr; p = p->next_) {
@@ -8588,6 +8592,65 @@ bool Prefill::run_multi(const std::vector<Seg>& segs, std::string& err) {
     return ok;
 }
 
+// STRATA_BATCH_ADMIT: one layer-major pass for a whole cohort, each prompt straight into its own stage sessions.
+// force_chunk_ is cleared on every stage for the duration of the read (a --prefill-pipe plan must not re-chunk this
+// pass) and restored by the guard; the fused expert layout is allowed here only.  Nothing here runs unless the
+// caller opted in, so every other path keeps its byte-identical behaviour.
+bool Prefill::run_batch_slots(const std::vector<Seg>& segs, std::vector<bool>& ok_out, std::string& err) {
+    err.clear();
+    ok_out.assign(segs.size(), false);
+    if (segs.empty()) { err = "prefill: no prompt"; return false; }
+    std::vector<Seg> use;
+    std::vector<size_t> owner;
+    for (size_t i = 0; i < segs.size(); ++i) {
+        const Seg& sg = segs[i];
+        if (sg.tokens == nullptr || sg.n < 1) continue;   // only this ticket falls back
+        ok_out[i] = true;
+        owner.push_back(i);
+        use.push_back(sg);
+    }
+    if (use.empty()) { err = "prefill: no readable batch slot prompt"; return false; }
+    struct BatchGuard {
+        std::vector<std::pair<Prefill*, int64_t>> saved;
+        explicit BatchGuard(Prefill* h) {
+            for (Prefill* q = h; q != nullptr; q = q->next_) {
+                saved.emplace_back(q, q->force_chunk_);
+                q->force_chunk_ = 0;
+                q->allow_fused_lm_ = true;
+            }
+        }
+        ~BatchGuard() {
+            for (auto& e : saved) { e.first->force_chunk_ = e.second; e.first->allow_fused_lm_ = false; }
+        }
+    } guard(this);
+    int64_t total = 0;
+    for (const Seg& sg : use) total += sg.n;
+    std::string why;
+    if (has_hand_in() || !impl_) { err = "prefill: batch slot read declined (chunk hand-off in use)"; return false; }
+    if (!tap_layers_.empty()) { err = "prefill: batch slot read declined (the DFlash2 prompt taps are for one prompt)"; return false; }
+    for (Prefill* q = this; q != nullptr; q = q->next_) q->lm_force_ = true;
+    struct ForceOff { Prefill* h; ~ForceOff() { for (Prefill* q = h; q != nullptr; q = q->next_) q->lm_force_ = false; } } force_off{this};
+    // A layer split with m.T = 2048 would otherwise size ONE super-chunk for the whole cohort and run all
+    // stages serially.  Cap it to ~4 balanced super-chunks so consecutive ones overlap across the stages.
+    // `lm_force_` lets lm_prepare accept a non-multiple-of-m.T cap; single-stage and short reads stay as before.
+    int64_t max_super = 0;
+    if (next_ != nullptr && total > 256) {
+        int64_t max_seg = 0;
+        for (const Seg& sg : use)
+            if (sg.n <= 512) max_seg = std::max(max_seg, sg.n);
+        max_super = std::clamp<int64_t>(std::max<int64_t>((total + 3) / 4, std::max<int64_t>(256, max_seg)), 256, 512);
+        max_super = std::min<int64_t>(max_super, total);
+    }
+    if (lm_prepare_chain(total, why, max_super) <= 0) { err = "prefill: batch slot read declined: " + why; return false; }
+    bool ok = lm_run(use, 0, nullptr, err);
+    std::string drain_err;
+    if (!drain_pipeline(drain_err) && ok) { ok = false; err = drain_err; }
+    for (Prefill* q = this; q != nullptr; q = q->next_) q->lm_mid_ = false;
+    lm_release_chain();
+    if (!ok) for (size_t i : owner) ok_out[i] = false;
+    return ok;
+}
+
 bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<LmSub>* given_super, std::string& err) {
     err.clear();
     Impl& m = *impl_;
@@ -8600,6 +8663,11 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
     };
     core::SessionState* ssp = ss_of(0);
     const bool multi = segs.size() > 1;
+    // STRATA_BATCH_ADMIT: a per-segment report must sync the stream too (the rows are only finished after l == LE).
+    const bool last_stage = next_ == nullptr;
+    bool any_seg_cb = false;
+    for (const Seg& sg : segs)
+        if (sg.on_seg_chunk || (last_stage && sg.on_seg_rows)) { any_seg_cb = true; break; }
     int64_t n = 0;                       // all the prompts' tokens
     for (const Seg& sg : segs) n += sg.n;
     const int64_t pos0 = segs[0].pos0;   // (only the progress line's)
@@ -9274,7 +9342,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                             std::fclose(f);
                         }
                     }
-                    if (on_chunk || on_stage_chunk) {
+                    if (on_chunk || on_stage_chunk || any_seg_cb) {
                         if (cudaStreamSynchronize(cs) != cudaSuccess) {
                             err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError());
                             return false;
@@ -9283,6 +9351,19 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                         if (sub.seg == 0) {   // (the reports are the first prompt's; the others only fill their sessions)
                             if (on_stage_chunk && !lm_mid_ && !on_stage_chunk(p0 + T, err)) return false;
                             if (on_chunk && !on_chunk(m.R, T, p0, err)) return false;
+                        }
+                        // The batch-admit callbacks report EVERY segment, once per emitted sub-chunk.  Both callbacks
+                        // take int32 ids while `Seg::tokens` is int64_t: convert explicitly (a reinterpret_cast would
+                        // expose the alternating zero high words of every id).
+                        const Seg& sgb = segs[(size_t) sub.seg];
+                        if (sgb.on_seg_chunk || (last_stage && sgb.on_seg_rows)) {
+                            std::vector<int32_t> tokb((size_t) sub.T);
+                            for (int64_t j = 0; j < sub.T; ++j)
+                                tokb[(size_t) j] = (int32_t) sgb.tokens[(size_t) (sub.c0 + j)];
+                            if (sgb.on_seg_chunk) sgb.on_seg_chunk(sub.seg, tokb.data(), sub.T);
+                            if (last_stage && sgb.on_seg_rows &&
+                                !sgb.on_seg_rows(sub.seg, m.R, tokb.data(), sub.T, p0, err))
+                                return false;
                         }
                     }
                     continue;
