@@ -110,8 +110,13 @@ void fill_selection(int32_t* ids, int64_t cap, int width, int shape, std::mt1993
         for (auto& x : v) x = (int32_t) (rng() % (uint32_t) kCells);
         std::sort(v.begin(), v.begin() + w);
         std::copy(v.begin(), v.end(), ids);
-    } else {
+    } else if (shape == 2) {
         for (int64_t j = 0; j < cap; ++j) ids[j] = (int32_t) (rng() % (uint32_t) kCells);
+    } else {
+        // -1 sentinel: unresident cells are skipped (cell >= 0 in the kernel),
+        // including at chunk boundaries; split and fused paths must agree.
+        for (int64_t j = 0; j < cap; ++j)
+            ids[j] = (j % 17 == 0) ? -1 : (int32_t) (rng() % (uint32_t) kCells);
     }
 }
 
@@ -354,45 +359,64 @@ int main(int argc, char** argv) {
             for (auto& rb : row_bufs) free_q4_buffers(rb);
         }
 
-        // Verify fused rot_q=true, rot_out=true step path against unfused fwht + chunks_only + merge_only + fwht + gate
+        // Verify fused rot_q=true, rot_out=true paths against unfused fwht + chunks_only + merge_only + fwht + gate.
+        // n_q=1 exercises qsa_decode_attn_step; n_q=2/4 exercise qsa_decode_attn_batch. All use -1 sentinel ids.
         for (int64_t cap : {(int64_t) 2051, (int64_t) 32768}) {
-            std::vector<float> hq((size_t) (NH * HD)), hq_full((size_t) (NH * 2 * HD));
-            for (auto& x : hq) x = nd(rng);
-            for (auto& x : hq_full) x = nd(rng);
-            ck(cudaMemcpy(d_q, hq.data(), hq.size() * 4, cudaMemcpyHostToDevice), "q rot");
-            ck(cudaMemcpy(d_q_full, hq_full.data(), hq_full.size() * 4, cudaMemcpyHostToDevice), "qfull rot");
-            std::vector<int32_t> hid((size_t) cap);
-            fill_selection(hid.data(), cap, (int) cap, 0, rng);
-            std::vector<int32_t> hst((size_t) k::kStepCount, 0);
-            hst[k::kStepWidth] = (int32_t) cap;
-            ck(cudaMemcpy(d_ids, hid.data(), hid.size() * 4, cudaMemcpyHostToDevice), "ids rot");
-            ck(cudaMemcpy(d_steps, hst.data(), hst.size() * 4, cudaMemcpyHostToDevice), "steps rot");
+            for (int n_q : {1, 2, 4}) {
+                const size_t qf = (size_t) (n_q * NH * HD);
+                std::vector<float> hq(qf), hq_full(qf * 2);
+                for (auto& x : hq) x = nd(rng);
+                for (auto& x : hq_full) x = nd(rng);
+                ck(cudaMemcpy(d_q, hq.data(), qf * 4, cudaMemcpyHostToDevice), "q rot");
+                ck(cudaMemcpy(d_q_full, hq_full.data(), qf * 2 * 4, cudaMemcpyHostToDevice), "qfull rot");
+                std::vector<int32_t> hid((size_t) (n_q * cap));
+                std::vector<int32_t> hst((size_t) (n_q * k::kStepCount), 0);
+                for (int z = 0; z < n_q; ++z) {
+                    fill_selection(hid.data() + (size_t) z * cap, cap, (int) cap, 3, rng);
+                    hst[(size_t) z * k::kStepCount + k::kStepWidth] = (int32_t) cap;
+                }
+                ck(cudaMemcpy(d_ids, hid.data(), hid.size() * 4, cudaMemcpyHostToDevice), "ids rot");
+                ck(cudaMemcpy(d_steps, hst.data(), hst.size() * 4, cudaMemcpyHostToDevice), "steps rot");
 
-            const size_t sb = (size_t) k::qsa_decode_attn_scratch_floats(cap, s) * 4;
-            ck(cudaMemsetAsync(d_scratch, 0xFF, sb, stream), "nan scratch rot ref");
-            float* d_q_rot = dalloc<float>((size_t) (NH * HD));
-            ck(cudaMemcpyAsync(d_q_rot, d_q, (size_t) (NH * HD) * 4, cudaMemcpyDeviceToDevice, stream), "copy q_rot");
-            k::fwht256_inplace_cuda(d_q_rot, NH, stream);
-            k::qsa_decode_attn_chunks_only(d_q_rot, pools, d_ids, d_steps, cap, s, d_scratch, 1, 0, stream);
-            k::qsa_decode_attn_merge_only(d_steps, cap, s, d_scratch, d_ref, 1, 1, stream);
-            k::fwht256_inplace_cuda(d_ref, NH, stream);
-            k::native_qsa_gate_apply(d_ref, d_q_full, d_gated_ref, (int) NH, (int) HD, stream);
+                const size_t sb = (size_t) k::qsa_decode_attn_scratch_floats(cap, s) * (size_t) n_q * 4;
+                ck(cudaMemsetAsync(d_scratch, 0xFF, sb, stream), "nan scratch rot ref");
+                float* d_q_rot = dalloc<float>(qf);
+                ck(cudaMemcpyAsync(d_q_rot, d_q, qf * 4, cudaMemcpyDeviceToDevice, stream), "copy q_rot");
+                for (int z = 0; z < n_q; ++z) {
+                    const size_t qo = (size_t) z * (size_t) NH * (size_t) HD;
+                    k::fwht256_inplace_cuda(d_q_rot + qo, NH, stream);
+                    k::qsa_decode_attn_chunks_only(d_q_rot + qo, pools, d_ids + (size_t) z * cap,
+                                                   d_steps + (size_t) z * k::kStepCount, cap, s,
+                                                   d_scratch + (size_t) z * scr_floats, 1, 0, stream);
+                    k::qsa_decode_attn_merge_only(d_steps + (size_t) z * k::kStepCount, cap, s,
+                                                  d_scratch + (size_t) z * scr_floats, d_ref + qo, 1, 1, stream);
+                    k::fwht256_inplace_cuda(d_ref + qo, NH, stream);
+                    k::native_qsa_gate_apply(d_ref + qo, d_q_full + (size_t) z * (size_t) NH * 2 * (size_t) HD,
+                                             d_gated_ref + qo, (int) NH, (int) HD, stream);
+                }
 
-            ck(cudaMemsetAsync(d_scratch, 0xFF, sb, stream), "nan scratch rot got");
-            k::qsa_decode_attn_step(d_q, pools, d_ids, d_steps, cap, s, d_scratch, d_got, stream,
-                                    d_q_full, d_gated_got, /*rot_q=*/true, /*rot_out=*/true);
-            ck(cudaStreamSynchronize(stream), "rot sync");
-            const auto href_g = download(d_gated_ref, (size_t) (NH * HD));
-            const auto hgot_g = download(d_gated_got, (size_t) (NH * HD));
-            const DiffStats dsr = compare_vecs(href_g, hgot_g);
-            // Fused in-register FWHT matches standalone fwht256_inplace_cuda within 1e-5 (same tolerance as test_qsa_sm89_attention_audit)
-            if (dsr.nonfinite != 0 || dsr.max_abs >= 1e-5f || dsr.nonzero == 0) {
-                std::printf("FAIL rot step shift=%zu cap=%lld: max_abs=%.3e nonfinite=%zu nz=%zu\n",
-                            shift, (long long) cap, dsr.max_abs, dsr.nonfinite, dsr.nonzero);
-                ++failed;
+                ck(cudaMemsetAsync(d_scratch, 0xFF, sb, stream), "nan scratch rot got");
+                if (n_q == 1) {
+                    k::qsa_decode_attn_step(d_q, pools, d_ids, d_steps, cap, s, d_scratch, d_got, stream,
+                                            d_q_full, d_gated_got, /*rot_q=*/true, /*rot_out=*/true);
+                } else {
+                    k::qsa_decode_attn_batch(d_q, pools, d_ids, d_steps, cap, s, d_scratch, d_got, n_q, stream,
+                                             d_q_full, d_gated_got, /*rot_q=*/true, /*rot_out=*/true);
+                }
+                ck(cudaStreamSynchronize(stream), "rot sync");
+                const auto href_g = download(d_gated_ref, qf);
+                const auto hgot_g = download(d_gated_got, qf);
+                const DiffStats dsr = compare_vecs(href_g, hgot_g);
+                // Fused in-register FWHT matches standalone fwht256_inplace_cuda within 1e-5 (same tolerance as test_qsa_sm89_attention_audit)
+                if (dsr.nonfinite != 0 || dsr.max_abs >= 1e-5f || dsr.nonzero == 0) {
+                    std::printf("FAIL rot %s shift=%zu cap=%lld n_q=%d: max_abs=%.3e nonfinite=%zu nz=%zu\n",
+                                n_q == 1 ? "step" : "batch", shift, (long long) cap, n_q,
+                                dsr.max_abs, dsr.nonfinite, dsr.nonzero);
+                    ++failed;
+                }
+                ++cases;
+                ck(cudaFree(d_q_rot), "free q_rot");
             }
-            ++cases;
-            ck(cudaFree(d_q_rot), "free q_rot");
         }
         free_q4_buffers(buf);
     }
