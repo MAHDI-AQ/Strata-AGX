@@ -1,4 +1,4 @@
-// tests/program/batch_admit_test.cpp - STRATA_BATCH_ADMIT wire/framing parity (CPU only, no GPU, no daemon).
+// src/program/batch_admit_test.cpp - STRATA_BATCH_ADMIT wire/framing parity (CPU only, no GPU, no daemon).
 //
 // The two pure helpers below mirror generate.cpp's batch_binary_line/batch_crc32_prefix byte for byte; this
 // target exists so a framing or CRC regression is caught at compile+unit-test time, before any GPU run.

@@ -559,7 +559,7 @@ if(STRATA_BUILD_TESTS)
   target_link_libraries(aux_cpus_test PRIVATE Threads::Threads)
   add_test(NAME aux_cpus_test COMMAND aux_cpus_test)
   # STRATA_BATCH_ADMIT: offline wire/framing/CRC/Seg-callback parity (no GPU, no daemon).
-  add_executable(batch_admit_test tests/program/batch_admit_test.cpp)
+  add_executable(batch_admit_test src/program/batch_admit_test.cpp)
   target_include_directories(batch_admit_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_compile_features(batch_admit_test PRIVATE cxx_std_17)
   target_link_libraries(batch_admit_test PRIVATE Threads::Threads)
