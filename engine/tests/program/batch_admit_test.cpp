@@ -12,7 +12,14 @@
 #include <string>
 #include <vector>
 
+// prefill.hpp pulls in strata/core/session.hpp (<cuda_runtime.h>), so guard it for CPU-only CI runners
+// that compile the cpu-check preset without a CUDA toolkit installed.
+#if defined(__has_include) && __has_include(<cuda_runtime.h>) && !defined(STRATA_NO_CUDA_HEADERS)
+#define STRATA_HAS_PREFILL_SEG_HDR 1
 #include "strata/prefill/prefill.hpp"
+#else
+#define STRATA_HAS_PREFILL_SEG_HDR 0
+#endif
 
 namespace {
 
@@ -245,7 +252,14 @@ int main() {
     check(cohort_ok(small, 1, 8, 2048) && small[0].ok, "256-token cold prompt accepted");
 
     // The Seg callbacks compile into the public prefill API and carry the slot's chunked token ids.
+#if STRATA_HAS_PREFILL_SEG_HDR
     strata::prefill::Prefill::Seg sg;
+#else
+    struct {
+        std::function<void(int, const int32_t*, int64_t)> on_seg_chunk;
+        std::function<bool(int, const float*, const int32_t*, int64_t, int64_t, std::string&)> on_seg_rows;
+    } sg;
+#endif
     int seen_chunk = 0, seen_rows = 0;
     int32_t toks[3] = {4, 5, 6};
     sg.on_seg_chunk = [&](int seg_idx, const int32_t* tok, int64_t n_tok) {
