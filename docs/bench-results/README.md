@@ -4,7 +4,7 @@ Raw results and short reports from measurement runs, one folder per run, named b
 the Strata version, hardware and method of its own day, and none is a statement about a later release. Current numbers are in the
 [docs](../README.md) and the [README](../../README.md); how to measure is in [BENCHMARK_PROTOCOL.md](../BENCHMARK_PROTOCOL.md).
 
-This page is built by `python tools/bench_results_index.py` (`--check` fails when a folder is missing from it). 143 folders and 4 loose files, 2189 files in all.
+This page is built by `python tools/bench_results_index.py` (`--check` fails when a folder is missing from it). 143 folders and 5 loose files, 2190 files in all.
 
 
 ## 2026-09
@@ -170,6 +170,7 @@ This page is built by `python tools/bench_results_index.py` (`--check` fails whe
 | File |
 | --- |
 | [2026-11-27-badmit-stage2.md](2026-11-27-badmit-stage2.md) |
+| [2026-11-27-phase2-inc.md](2026-11-27-phase2-inc.md) |
 | [COMMUNITY.md](COMMUNITY.md) |
 | [exchange-rotation-ab.json](exchange-rotation-ab.json) |
 | [exchange-rotation-token-ids.json](exchange-rotation-token-ids.json) |
