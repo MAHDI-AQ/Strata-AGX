@@ -10,7 +10,7 @@ debugging and are kept in `terminal/data/settings-register.json`.
 A number or a word is set like any environment variable, for example `STRATA_KVA=1`. In the Terminal, `strata launch --set NAME=value`
 puts it in the model's run configuration.
 
-## Switches you can turn on (380)
+## Switches you can turn on (382)380)
 
 Off unless you set them. The last column says where each one is described.
 
@@ -247,6 +247,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_PF_FUSED_PER_FORMAT_OCC` | on / off | NVIDIA and AMD | - |
 | `STRATA_PF_FUSED_Q2N` | on / off | NVIDIA and AMD | [release-notes-0.2.7.md](release-notes-0.2.7.md), [DETAILS.md](DETAILS.md) |
 | `STRATA_PF_FUSED_SM75` | on / off | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
+| `STRATA_PF_FUSED_SMEM_LB` | on / off | NVIDIA and AMD | - |
 | `STRATA_PF_FUSED_WS` | on / off | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_PF_GROUP_SCRATCH` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_PF_HCDOWN_CUDA` | on / off | NVIDIA | - |
@@ -276,6 +277,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_PIPED_MTP` | on / off | NVIDIA and AMD | [release-notes-0.2.7.md](release-notes-0.2.7.md), [BATCHING.md](BATCHING.md) |
 | `STRATA_PIPED_READ_LEAD_IN_MIN_TOKENS` | number | NVIDIA and AMD | - |
 | `STRATA_PIPED_READ_PIECE` | number | NVIDIA and AMD | [BATCHING.md](BATCHING.md) |
+| `STRATA_PIPED_SPEC_COST` | on / off | NVIDIA and AMD | - |
 | `STRATA_PIPED_SUFFIX` | on / off | NVIDIA and AMD | [SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md](SM89-ARCHITECTURE-AND-UPSTREAM-SYNC.md), [AGENTS.md](../AGENTS.md) |
 | `STRATA_PIPELINE_AUTO` | text | NVIDIA and AMD, Intel Arc | [MULTI_GPU.md](MULTI_GPU.md) |
 | `STRATA_PIPELINE_DEBUG` | on / off | NVIDIA and AMD, Intel Arc | [MULTI_GPU.md](MULTI_GPU.md) |
