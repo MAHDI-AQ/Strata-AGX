@@ -881,8 +881,8 @@ template <> __device__ __forceinline__ void kq_lean_expand<T_Q6_K>(const uint32_
 #endif
 
 template <int NT> using BatchOf = std::conditional_t<NT == THREADS, Batch, WideBatch>;
-template <int WT, bool GU, int WW, int NT = THREADS, bool F16 = false, bool LB2 = true>
-__global__ void __launch_bounds__(NT, !LB2 || NT == THREADS ? 1 : 2)
+template <int WT, bool GU, int WW, int NT = THREADS, bool F16 = false>
+__global__ void __launch_bounds__(NT, NT == THREADS ? 1 : 2)
 native_kernel(const BatchOf<NT> b, const NativeGeom geo, const Tables tb, const uint8_t* __restrict__ act,
               const int32_t* __restrict__ src, uint8_t* __restrict__ out, float* __restrict__ dm) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
@@ -2337,14 +2337,6 @@ bool nt256_requested() {
     static const bool on = [] { const char* v = std::getenv("STRATA_PF_FUSED_NT"); return v != nullptr && std::atoi(v) == 256; }();
     return on || f16c_requested();
 }
-// STRATA_PF_FUSED_SMEM_LB=1 (Phase 3, opt-in): the NT=256 native kernel drops its minBlocksPerMultiprocessor=2
-// hint.  On a high-shared-memory format (IQ2_S) that already runs one block per SM, the hint only forces the
-// compiler to cap registers at 128 and spill to local memory; without it the same math keeps those values in
-// registers.  Unset / 0 keeps the original __launch_bounds__(256, 2) instantiation byte-identically.
-bool smem_lb_requested() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_PF_FUSED_SMEM_LB"); return v != nullptr && v[0] == '1'; }();
-    return on;
-}
 bool ws_requested() {
     static const bool on = [] { const char* v = std::getenv("STRATA_PF_FUSED_WS"); return v != nullptr && v[0] == '1'; }();
     return on;
@@ -2815,8 +2807,6 @@ void launch(bool ws, unsigned grid, const WideBatch& b, const NativeGeom& g, con
         native_ws_kernel<T, GU><<<grid, WS_THREADS, ws_smem_bytes(T), s>>>(b, g, tb, a, src, o, dm);
     else if (f16c_requested())
         native_kernel<T, GU, 2, 256, true><<<grid, 256, smem_bytes(T, 2, host_astages(), 256, true, GU), s>>>(b, g, tb, a, src, o, dm);
-    else if (smem_lb_requested())
-        native_kernel<T, GU, 2, 256, false, false><<<grid, 256, smem_bytes(T, 2, host_astages(), 256, false, GU), s>>>(b, g, tb, a, src, o, dm);
     else
 #else
     (void) ws;

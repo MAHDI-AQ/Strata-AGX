@@ -16276,9 +16276,6 @@ int main(int argc, char** argv) {
         static const bool draft_keep_off = std::getenv("STRATA_DRAFT_KEEP") != nullptr && std::atoi(std::getenv("STRATA_DRAFT_KEEP")) == 0;   // diagnostic: do not keep the idle drafter current
         int64_t draft_req_count = 0;
         const bool spec_cost = [] { const char* v = std::getenv("STRATA_SPEC_COST"); return v != nullptr && v[0] == '1'; }();   // cost-aware MTP window (A/B arm)
-        // STRATA_PIPED_SPEC_COST=1 (Phase 3, opt-in): run the cost-aware DraftPolicy on the --batch-mtp slots too.
-        // Unset / 0 leaves the batch path on its existing --spec-min-p rule and its own lookup policy.
-        const bool piped_spec_cost = [] { const char* v = std::getenv("STRATA_PIPED_SPEC_COST"); return v != nullptr && v[0] == '1'; }();
         strata::spec::DraftPolicy::ChainState chain_st;
         int chain_rows = 1;   // the window the cost-aware rule kept in the MTP chain just drafted
         policy.set_robust(spec_cost);
@@ -17600,11 +17597,6 @@ int main(int argc, char** argv) {
                     }
             }
         }
-        // The batch slots' cost policy.  It is declared before the chain lambda so the opt-in
-        // STRATA_PIPED_SPEC_COST path can price the proposals; with that flag unset its only reader is the
-        // existing lookup rule below, so the default path is unchanged.
-        strata::spec::DraftPolicy bpolicy(std::max(2, pmtp_rows_per_slot));
-        bpolicy.set_robust(true);   // (a round that waited for something else counts little, it does not price a size out)
         // the chain of slot b has landed: its proposals are the slot's next drafts (1), still drafting (0), or an error (-1)
         auto pmtp_poll_draft = [&](int b, bool wait) -> int {
             if (!pm_drafting[(size_t) b]) return 1;
@@ -17622,16 +17614,12 @@ int main(int argc, char** argv) {
             const float* prob = slot_mtp[(size_t) b]->chain_prob();
             sl.n_drafts = 1;
             sl.draft[0] = tok[0];
-            if (spec_cost || piped_spec_cost) {
+            if (spec_cost) {
                 // Same keep_draft the solo path installs with set_chain_rule. It chooses how many proposals
                 // this group verifies. Unset: the --spec-min-p loop below, including a 0.50 cutoff, is unchanged.
-                // STRATA_PIPED_SPEC_COST=1 prices the batch window with the batch slots' own policy and gives
-                // it the slot's context position, exactly as the solo path gives its policy one.
-                strata::spec::DraftPolicy& dp = piped_spec_cost ? bpolicy : policy;
-                if (piped_spec_cost) bpolicy.set_context(sl.p);
                 strata::spec::DraftPolicy::ChainState st;
                 for (int j = 0; j < pm_drafts; ++j)
-                    if (!dp.keep_draft(st, j, prob[j], 1 + pm_drafts)) break;
+                    if (!policy.keep_draft(st, j, prob[j], 1 + pm_drafts)) break;
                 sl.n_drafts = st.kept < 0 ? 0 : st.kept > pm_drafts ? pm_drafts : st.kept;
                 for (int j = 0; j < sl.n_drafts; ++j) sl.draft[(size_t) j] = tok[j];
             } else {
@@ -17640,7 +17628,7 @@ int main(int argc, char** argv) {
                 ++sl.n_drafts;
             }
             }
-            if (piped_suffix || piped_spec_cost)
+            if (piped_suffix)
                 for (int j = 0; j < sl.n_drafts && j < (int) sl.dprob.size(); ++j)
                     sl.dprob[(size_t) j] = prob[j];
             sl.draft_ready = true;
@@ -17659,6 +17647,8 @@ int main(int argc, char** argv) {
                                  "rows, the prompt lookup's drafts where they promise more than the draft layer's\n",
                          pmtp_rows_per_slot);
         }
+        strata::spec::DraftPolicy bpolicy(std::max(2, pmtp_rows_per_slot));
+        bpolicy.set_robust(true);   // (a round that waited for something else counts little, it does not price a size out)
         int64_t bt_lk_windows = 0, bt_lk_drafts = 0, bt_lk_ok = 0;
         int64_t bt_rd_rows = 0, bt_rd_turns = 0;   // STRATA_SLOT_READ: prompt rows the slots read themselves, turns read
         int rd_ck_pending = 0;                      // ... and slots whose read stands at its turn boundary (rd_ck_due)
@@ -17782,12 +17772,6 @@ int main(int argc, char** argv) {
                 if (!blk.rd) {
                     bt_accepted += blk.keep - 1;
                     bt_tokens += blk.n - 1;   // (proposals checked)
-                }
-                if (piped_spec_cost && !blk.rd && sl.n_drafts > 0) {
-                    // Calibrate the batch policy's per-probability acceptance rate with the same window the
-                    // keep_draft rule chose.  The solo path does this in its own loop; the default batch path
-                    // never enters this branch.
-                    bpolicy.observe_probs(sl.dprob.data(), sl.n_drafts, std::max(0, blk.keep - 1));
                 }
                 if (plk && !blk.rd) {
                     // The policy's sample: the window's size and what it kept, in the slot's time since its last verdict

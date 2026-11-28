@@ -28474,41 +28474,6 @@
       "retired_in": ""
     },
     {
-      "name": "STRATA_PF_FUSED_SMEM_LB",
-      "backends": [
-        "cuda-hip"
-      ],
-      "reads": [
-        {
-          "file": "engine/src/prefill/moe_fused_iq.cu",
-          "line": 2345,
-          "backend": "cuda-hip",
-          "fn": "getenv"
-        }
-      ],
-      "parse": "flag",
-      "default_state": "off",
-      "code_default": null,
-      "engine_sets": [],
-      "engine_defaults": [],
-      "launch_files": [],
-      "launch_sets": [],
-      "launch_reads": [],
-      "doc_mentions": [
-        "docs/SETTINGS.md:250"
-      ],
-      "first_commit": "",
-      "first_date": "2026-11-28",
-      "since": null,
-      "last_commit": "",
-      "last_date": "2026-11-28",
-      "status": "opt-in",
-      "owner": "prefill",
-      "note": "[Phase 3] opt-in: drop the minBlocksPerMultiprocessor=2 hint on the NT=256 native kernel so an occupancy-1 IQ2_S instance keeps registers (STACK 40 -> 0); unset keeps the baseline instantiation.",
-      "retire_after": "",
-      "retired_in": ""
-    },
-    {
       "name": "STRATA_PF_FUSED_TILE",
       "backends": [
         "cuda-hip"
@@ -31178,41 +31143,6 @@
       "status": "opt-in",
       "owner": "program",
       "note": "[auto] documented for users (docs/BATCHING.md:328), 1 more",
-      "retire_after": "",
-      "retired_in": ""
-    },
-    {
-      "name": "STRATA_PIPED_SPEC_COST",
-      "backends": [
-        "cuda-hip"
-      ],
-      "reads": [
-        {
-          "file": "engine/src/program/generate.cpp",
-          "line": 16281,
-          "backend": "cuda-hip",
-          "fn": "getenv"
-        }
-      ],
-      "parse": "flag",
-      "default_state": "off",
-      "code_default": null,
-      "engine_sets": [],
-      "engine_defaults": [],
-      "launch_files": [],
-      "launch_sets": [],
-      "launch_reads": [],
-      "doc_mentions": [
-        "docs/SETTINGS.md:280"
-      ],
-      "first_commit": "",
-      "first_date": "2026-11-28",
-      "since": null,
-      "last_commit": "",
-      "last_date": "2026-11-28",
-      "status": "opt-in",
-      "owner": "program",
-      "note": "[Phase 3] opt-in: run the cost-aware DraftPolicy (set_context / keep_draft / observe_probs) on --batch-mtp slots; unset keeps the --spec-min-p batch rule byte-identically.",
       "retire_after": "",
       "retired_in": ""
     },

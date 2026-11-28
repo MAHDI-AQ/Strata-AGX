@@ -31,20 +31,23 @@
 
 **Measured Coordinate:** `4× RTX 4090` (`96 GB` VRAM, Ada `sm_89`) · `Qwen3.8-Flash-Next IQ3_S` · `512K` max context · `8` concurrent agent slots
 
-### Head-to-Head: Vanilla Native (`v0.2.16 / 58ee32277`) vs Strata-AGX (`ab410e06`)
+### Verified showcase — 2026-11-28 (`4573e5df`, Phase 1+2 retained)
 
-| Workload / Metric | Vanilla Native | Strata-AGX | Improvement |
+Vanilla figures are the historical Nov-25 reference (not re-measured); Strata-AGX figures are fresh
+from the full qualification battery in [docs/bench-results/2026-11-28-phase3-final-qualification.md](docs/bench-results/2026-11-28-phase3-final-qualification.md).
+
+| Workload / Metric | Vanilla Native (historical) | Strata-AGX `4573e5df` (verified) | Result |
 | --- | --- | --- | --- |
-| **8×65K Agentic Burst** (`burst65`) | `11.74` turns/min | **`246.72`** turns/min | **`+2,001.5%`** (`21.0×`) |
-| ↳ Burst TTFT p50 / Decode / Cold Prefill | `34.90 s` / `9.71` / `12,366` | **`1.42 s`** / **`244.92`** / **`16,145`** tok/s | **`-95.9%`** TTFT · **`25.2×`** dec · **`+30.6%`** PF |
-| **8×196K Agentic Burst** (`burst196`) | `3.88` turns/min | **`236.48`** turns/min | **`+5,994.8%`** (`60.9×`) |
-| ↳ Burst TTFT p50 / p95 | `69.78 s` / `192.72 s` | **`1.59 s`** / **`1.81 s`** | **`-97.7%`** p50 · **`-99.1%`** p95 |
-| ↳ Agg Decode / Cold Prefill | `2.87` / `13,016` tok/s | **`162.21`** / **`17,077`** tok/s | **`56.5×`** dec · **`+31.2%`** PF |
-| **400K Deep Context Needle** (cold / warm) | N/A (`270K` context cap) | **`Exact`** (`33.32 s` / `0.49 s`) | `512K` session support |
-| **Fleet Rotation** (`I-7`, `2×20×65K`) | `1,428.5` / `1,426.1 ms` | **`552.8`** / **`552.5 ms`** | **`-61.3%`** rotation latency |
-| **262K Prompt Hydration** (`SD_r262144_c4`) | `6,702.8` tok/s | **`16,077.7`** tok/s | **`2.40×`** |
-| **`agx_fast_gate`** (`c1` / `c4` / `c8` / `MPD`) | — | **`204.2`** / **`640.1`** / **`791.3`** / **`394.4`** tok/s | `8/8` needles · `0` leaks |
-**2026-11-26 prefill profile (current `a1156dd97`):** `burst65` cold prefill p50 `3779.64 ms` (`-5.97%`); `burst196` cold prefill p50 `10947.96 ms` (`-4.89%`) and warm TTFT p50 `1375.16 ms` (`-13.28%`); `8/8` needles and `0` Xids across `burst65`, `burst196` and `agx_fast_gate`.
+| **8×65K Agentic Burst** (`burst65`) | `11.74` turns/min | **`344.66`** turns/min | `644.30 ms` warm p50 · `953.35 ms` p95 · `251.32` agg-dec tok/s |
+| **8×196K Agentic Burst** (`burst196`) | `3.88` turns/min | **`233.88`** turns/min | `1038.25 ms` warm p50 · `1521.04 ms` p95 · `190.88` agg-dec tok/s |
+| **400K Deep Context Needle** (cold / warm) | N/A (`270K` context cap) | **`Exact`** (`26.97 s` / `0.42 s`) | `401,600` tokens · `988 MiB` min free VRAM |
+| **Fleet Rotation** (`I-7`, `2×20×45K`) | `1,428.5` / `1,426.1 ms` (65K) | **`536.2` / `536.4 ms`** | `40/40` · `0` leaks · `32/40` evictions |
+| **`agx_fast_gate --slots 8`** | — | **`8/8` needles** | `0` leaks · `512 / 32768` rungs · `0` Xids |
+| **Isolation** | — | **`8/8`** across bursts, fast-gate and P7 | `0` cross-session leaks |
+
+**Quality (same run):** `Suite A 5/5` (`KL_mean 0.00000`, `dPPL +0.000%`, `0` nonfinite) · `Suite B 100%` think-greedy / `98.61%` sampled / `95.83%` nothink (`62.5%` determinism) · `Suite C 16/16` coding, `12/12` tools, `23/23` repo, `36/36` long-ctx · `Suite D 8/8` (`MTP alpha 0.5892–0.6708`) · `Challenge-20 18/20` · `EvalPlus 12/12` · `7-Pillar P2 119/120, P3 100/100/100, P4 4/4, P6 8/8 (256/256), P7 8/8` · `post400k smoke 100.0%` (`0%` contamination) · `native_expert_parity 0/4,915,200` bits differ · `0` Xids. Phase 3's three opt-in levers were measured and rejected; the served binary and recipe are unchanged by them.
+
+**2026-11-26 prefill profile (then-current `a1156dd97`):** `burst65` cold prefill p50 `3779.64 ms` (`-5.97%`); `burst196` cold prefill p50 `10947.96 ms` (`-4.89%`) and warm TTFT p50 `1375.16 ms` (`-13.28%`); `8/8` needles and `0` Xids across `burst65`, `burst196` and `agx_fast_gate`.
 
 **2026-11-26 piped-read / prompt-attention profile (`4x RTX 4090`, `Qwen3.8-Flash-Next IQ3_S`; opt-in `STRATA_PIPED_READ_LEAD_IN_MIN_TOKENS`, `STRATA_QSA_PROMPT_ATTN_SHARED_KV`, `STRATA_PF_FUSED_PER_FORMAT_OCC`, `STRATA_PF_FP8_PAD_SMALL_T=1`):** `burst65` c=8 warm p50 `913.19 ms` (vs `1352.58 ms` baseline / `1230.99 ms` prior served, `-25.8%` to `-32.5%`), cold p50 `3645.04 ms`, warm p95 `1329.71 ms`, `280.31` TPM, `8/8` needles, `1724 MiB` min free VRAM; `burst196` c=8 cold p50 `10558.74 ms`, warm p50 `1274.78 ms`, `237.48` TPM (`+6.3%` vs `223.38`), `8/8` needles. `400K` exact match `31.32 s` cold / `0.45 s` warm. Quality: `Suite A 5/5` · `Suite B 100% / 0.9583` · `Suite C1..C4 all pass` · `Suite D 8/8` · `Challenge-20 14/20` · `7-Pillar P2 119/120, P3 100/93.8/100, P4 4/4, P6 8/8 (256/256), P7 32/32`.
 
